@@ -449,10 +449,14 @@ def delete_device(device_id: str, conn: sqlite3.Connection = Depends(get_conn)):
     if row is None:
         raise HTTPException(status_code=404, detail="기기를 찾을 수 없습니다.")
     conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
-    # 미완료 작업은 공유 대기열로 되돌린다.
+    # 미완료 작업(대기 포함)과 스케줄을 공유 대기열로 되돌린다.
     conn.execute(
         """UPDATE tasks SET device_id = NULL, status = 'pending', claimed_at = NULL
-           WHERE device_id = ? AND status IN ('assigned','running')""",
+           WHERE device_id = ? AND status IN ('pending','assigned','running')""",
+        (device_id,),
+    )
+    conn.execute(
+        "UPDATE schedules SET device_id = NULL WHERE device_id = ?",
         (device_id,),
     )
     db.log(conn, f"기기 삭제: {device_id}", "warning")
