@@ -168,3 +168,7 @@ class RemoteSettings(BaseModel):
     call_gap_sec: Optional[int] = Field(default=None, ge=0, le=600)
     sms_forward_enabled: Optional[bool] = None
     mms_forward_enabled: Optional[bool] = None
+    # 통화 중 동작(발신할 때 폰이 적용)
+    call_recording_enabled: Optional[bool] = None  # 통화 녹음(기본 끔)
+    call_mute_volume: Optional[bool] = None  # 통화 볼륨 0(기본 켬)
+    call_mute_mic: Optional[bool] = None  # 내 소리 차단 = 마이크 음소거(기본 켬)

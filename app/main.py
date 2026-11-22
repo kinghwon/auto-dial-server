@@ -114,6 +114,10 @@ def remote_config(conn: sqlite3.Connection, device_id: str | None = None) -> dic
         "call_gap_sec": _setting_int(settings, "call_gap_sec", 3, 0, 600),
         "sms_forward_enabled": settings.get("sms_forward_enabled", "1") == "1",
         "mms_forward_enabled": settings.get("mms_forward_enabled", "1") == "1",
+        # 통화 중 동작: 녹음(기본 끔) · 통화 볼륨 0(기본 켬) · 내 소리 차단(기본 켬)
+        "call_recording_enabled": settings.get("call_recording_enabled", "0") == "1",
+        "call_mute_volume": settings.get("call_mute_volume", "1") == "1",
+        "call_mute_mic": settings.get("call_mute_mic", "1") == "1",
         "device_enabled": True,
     }
     if device_id:
@@ -849,14 +853,23 @@ def save_remote_settings(payload: RemoteSettings, conn: sqlite3.Connection = Dep
         db.set_setting(conn, "sms_forward_enabled", "1" if payload.sms_forward_enabled else "0")
     if payload.mms_forward_enabled is not None:
         db.set_setting(conn, "mms_forward_enabled", "1" if payload.mms_forward_enabled else "0")
+    if payload.call_recording_enabled is not None:
+        db.set_setting(conn, "call_recording_enabled", "1" if payload.call_recording_enabled else "0")
+    if payload.call_mute_volume is not None:
+        db.set_setting(conn, "call_mute_volume", "1" if payload.call_mute_volume else "0")
+    if payload.call_mute_mic is not None:
+        db.set_setting(conn, "call_mute_mic", "1" if payload.call_mute_mic else "0")
     cfg = remote_config(conn)
     db.log(
         conn,
-        "원격 기기 설정 저장: 확인 {}초 · 간격 {}초 · SMS 전달 {} · MMS 전달 {}".format(
+        "원격 기기 설정 저장: 확인 {}초 · 간격 {}초 · SMS 전달 {} · MMS 전달 {} · 통화 녹음 {} · 통화 볼륨 0 {} · 내 소리 차단 {}".format(
             cfg["poll_interval_sec"],
             cfg["call_gap_sec"],
             "ON" if cfg["sms_forward_enabled"] else "OFF",
             "ON" if cfg["mms_forward_enabled"] else "OFF",
+            "ON" if cfg["call_recording_enabled"] else "OFF",
+            "ON" if cfg["call_mute_volume"] else "OFF",
+            "ON" if cfg["call_mute_mic"] else "OFF",
         ),
     )
     return {"ok": True, "remote": cfg}

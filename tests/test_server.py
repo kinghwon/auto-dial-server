@@ -504,6 +504,10 @@ DEFAULT_REMOTE = {
     "call_gap_sec": 3,
     "sms_forward_enabled": True,
     "mms_forward_enabled": True,
+    # 통화 중 동작 기본값: 녹음 끔 · 통화 볼륨 0 켬 · 내 소리 차단 켬
+    "call_recording_enabled": False,
+    "call_mute_volume": True,
+    "call_mute_mic": True,
     "device_enabled": True,
 }
 
@@ -573,6 +577,9 @@ def test_remote_settings_partial_update_keeps_other_values(client):
         {"call_gap_sec": -1},
         {"call_gap_sec": 601},
         {"sms_forward_enabled": "maybe"},
+        {"call_recording_enabled": "maybe"},
+        {"call_mute_volume": "maybe"},
+        {"call_mute_mic": "maybe"},
     ],
 )
 def test_remote_settings_rejects_out_of_range(client, payload):
@@ -595,6 +602,63 @@ def test_remote_config_clamps_corrupted_values(client):
     remote = client.get("/api/settings").json()["remote"]
     assert remote["poll_interval_sec"] == 5   # 기본값으로 복구
     assert remote["call_gap_sec"] == 600      # 상한으로 제한
+
+
+def test_call_audio_defaults(client):
+    """기본값: 녹음 끄기 · 통화 볼륨 0 켜기 · 내 소리 차단 켜기."""
+    remote = client.get("/api/settings").json()["remote"]
+    assert remote["call_recording_enabled"] is False
+    assert remote["call_mute_volume"] is True
+    assert remote["call_mute_mic"] is True
+
+    conn = _conn()
+    settings = db.get_settings(conn)
+    conn.close()
+    assert settings["call_recording_enabled"] == "0"
+    assert settings["call_mute_volume"] == "1"
+    assert settings["call_mute_mic"] == "1"
+
+
+def test_call_audio_settings_save_and_reach_device(client):
+    """통화 중 동작 3가지를 저장하면 하트비트·폴링 config 로 폰에 내려간다."""
+    client.post("/api/devices", json={"device_id": "DEV-AUDIO", "name": "통화폰"})
+
+    saved = client.post(
+        "/api/settings/remote",
+        json={"call_recording_enabled": True, "call_mute_volume": False, "call_mute_mic": False},
+    )
+    assert saved.status_code == 200, saved.text
+    expected = {**DEFAULT_REMOTE, "call_recording_enabled": True, "call_mute_volume": False, "call_mute_mic": False}
+    assert saved.json()["remote"] == expected
+
+    heartbeat = client.post("/api/devices/DEV-AUDIO/heartbeat").json()
+    assert heartbeat["config"] == expected
+    poll = client.get("/api/tasks/poll", params={"device_id": "DEV-AUDIO"}).json()
+    assert poll["config"] == expected
+
+    conn = _conn()
+    settings = db.get_settings(conn)
+    conn.close()
+    assert settings["call_recording_enabled"] == "1"
+    assert settings["call_mute_volume"] == "0"
+    assert settings["call_mute_mic"] == "0"
+
+
+def test_call_audio_partial_update_keeps_other_values(client):
+    client.post("/api/settings/remote", json={"call_recording_enabled": True})
+    remote = client.get("/api/settings").json()["remote"]
+    assert remote["call_recording_enabled"] is True
+    assert remote["call_mute_volume"] is True
+    assert remote["call_mute_mic"] is True
+    # 기존 설정도 그대로 유지된다.
+    assert remote["poll_interval_sec"] == 5
+    assert remote["sms_forward_enabled"] is True
+
+    # 통화 설정만 되돌려도 나머지는 유지된다.
+    client.post("/api/settings/remote", json={"call_recording_enabled": False})
+    remote = client.get("/api/settings").json()["remote"]
+    assert remote["call_recording_enabled"] is False
+    assert remote["call_mute_volume"] is True
 
 
 def test_remote_settings_change_is_logged(client):

@@ -270,6 +270,18 @@
             <label class="switch"><input type="checkbox" id="rcMms"> MMS·LMS 수신 전달</label>
             <div class="help">장문·사진·통신사/은행 문자의 전달 여부입니다.</div>
           </div>
+          <div class="field">
+            <label class="switch"><input type="checkbox" id="rcRec"> 통화 녹음</label>
+            <div class="help">발신 통화를 폰 안(앱 전용 폴더 recordings)에 저장합니다. 안드로이드 10 이상에서는 통화 녹음이 OS 차단으로 무음이 될 수 있습니다.</div>
+          </div>
+          <div class="field">
+            <label class="switch"><input type="checkbox" id="rcMuteVol"> 통화 볼륨 0</label>
+            <div class="help">발신하는 동안 폰의 통화 볼륨을 0으로 낮춥니다. 통화가 끝나면 원래 볼륨으로 되돌립니다.</div>
+          </div>
+          <div class="field">
+            <label class="switch"><input type="checkbox" id="rcMuteMic"> 내 소리 차단</label>
+            <div class="help">마이크를 음소거해 이 폰의 소리(주변 소음)가 상대에게 들리지 않게 합니다. 통화가 끝나면 원래대로 되돌립니다.</div>
+          </div>
         </div>
         <div class="btn-row" style="margin-top:16px">
           <button class="btn primary" onclick="saveRemoteSettings()">저장</button>
@@ -747,8 +759,13 @@ async function loadRemoteSettings(force = false) {
     $("rcGap").value = remote.call_gap_sec ?? 3;
     $("rcSms").checked = remote.sms_forward_enabled !== false;
     $("rcMms").checked = remote.mms_forward_enabled !== false;
+    $("rcRec").checked = remote.call_recording_enabled === true;
+    $("rcMuteVol").checked = remote.call_mute_volume !== false;
+    $("rcMuteMic").checked = remote.call_mute_mic !== false;
     state.remoteDirty = false;
-    $("rcStatus").textContent = `현재 서버 값 · 확인 ${remote.poll_interval_sec ?? 5}초 · 발신 간격 ${remote.call_gap_sec ?? 3}초 · SMS ${remote.sms_forward_enabled !== false ? "전달" : "안 함"} · MMS ${remote.mms_forward_enabled !== false ? "전달" : "안 함"}`;
+    const yn = (value, onText, offText) => (value ? (onText || "켬") : (offText || "끔"));
+    $("rcStatus").textContent = `현재 서버 값 · 확인 ${remote.poll_interval_sec ?? 5}초 · 발신 간격 ${remote.call_gap_sec ?? 3}초 · SMS ${remote.sms_forward_enabled !== false ? "전달" : "안 함"} · MMS ${remote.mms_forward_enabled !== false ? "전달" : "안 함"}` +
+      ` · 녹음 ${yn(remote.call_recording_enabled === true)} · 통화 볼륨 0 ${yn(remote.call_mute_volume !== false)} · 내 소리 차단 ${yn(remote.call_mute_mic !== false)}`;
   } catch (e) {
     $("rcStatus").textContent = "서버 설정을 불러오지 못했습니다: " + e.message;
   }
@@ -767,6 +784,9 @@ async function saveRemoteSettings() {
         call_gap_sec: gap,
         sms_forward_enabled: $("rcSms").checked,
         mms_forward_enabled: $("rcMms").checked,
+        call_recording_enabled: $("rcRec").checked,
+        call_mute_volume: $("rcMuteVol").checked,
+        call_mute_mic: $("rcMuteMic").checked,
       }),
     });
     state.remoteDirty = false;
@@ -1117,7 +1137,7 @@ function startAutoRefresh() {
   startClock();
   resetScheduleForm();
   toggleTypeFields();
-  ["rcPoll", "rcGap", "rcSms", "rcMms"].forEach((id) => $(id).addEventListener("input", markRemoteDirty));
+  ["rcPoll", "rcGap", "rcSms", "rcMms", "rcRec", "rcMuteVol", "rcMuteMic"].forEach((id) => $(id).addEventListener("input", markRemoteDirty));
   const hash = (location.hash || "").replace("#", "");
   if (hash && document.getElementById("pane-" + hash)) {
     document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === hash));

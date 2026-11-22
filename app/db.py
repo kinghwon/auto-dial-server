@@ -125,6 +125,10 @@ DEFAULT_SETTINGS = {
     # 앱(폰)에 내려보내는 원격 동작 설정. APK 재설치 없이 대시보드에서 바꿀 수 있다.
     "poll_interval_sec": "5",
     "call_gap_sec": "3",
+    # 통화 중 동작: 녹음(기본 끔) · 통화 볼륨 0(기본 켬) · 내 소리 차단/마이크 음소거(기본 켬)
+    "call_recording_enabled": "0",
+    "call_mute_volume": "1",
+    "call_mute_mic": "1",
 }
 
 
