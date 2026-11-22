@@ -81,17 +81,58 @@ def expand_tasks(
 
 
 def create_run(conn, schedule_row, scheduled_for: datetime, source: str = "scheduled") -> int | None:
-    """스케줄 하나를 실행(run)으로 확장해 tasks 를 만든다."""
+    """스케줄 하나를 실행(run)으로 확장해 tasks 를 만든다.
+
+    발신 기기를 여러 대 지정했으면 **각 기기마다 같은 발신량**을 따로 만든다.
+    예) 기기 2대 × 총 10회 → 기기당 10건, 합쳐 20건 (랜덤 순서는 기기마다 따로 섞는다).
+    기기 지정이 없으면 예전처럼 한 묶음을 공유 대기열(device_id = NULL)에 넣는다.
+    """
     numbers = db.json_list(schedule_row["numbers"])
     total_calls = schedule_row["total_calls"] if "total_calls" in schedule_row.keys() else None
-    pairs = expand_tasks(
-        numbers,
-        schedule_row["repeat_count"],
-        schedule_row["order_mode"] or "sequence",
-        total_calls=total_calls,
-    )
-    if not pairs:
+    order_mode = schedule_row["order_mode"] or "sequence"
+    raw_targets = schedule_row["target_device_ids"] if "target_device_ids" in schedule_row.keys() else None
+    target_ids = db.json_list(raw_targets)
+    if not target_ids and schedule_row["device_id"]:
+        target_ids = [schedule_row["device_id"]]
+
+    batches: list[tuple[str | None, list[tuple[str, int]]]] = []
+    if target_ids:
+        for device_id in target_ids:
+            batches.append(
+                (
+                    device_id,
+                    expand_tasks(
+                        numbers,
+                        schedule_row["repeat_count"],
+                        order_mode,
+                        total_calls=total_calls,
+                    ),
+                )
+            )
+    else:
+        batches.append(
+            (
+                schedule_row["device_id"] or None,
+                expand_tasks(
+                    numbers,
+                    schedule_row["repeat_count"],
+                    order_mode,
+                    total_calls=total_calls,
+                ),
+            )
+        )
+
+    total_tasks = sum(len(pairs) for _, pairs in batches)
+    if total_tasks == 0:
         db.log(conn, f"스케줄 #{schedule_row['id']} 에 발신할 번호가 없습니다.", "warning")
+        return None
+    if total_tasks > config.MAX_TOTAL_CALLS:
+        # API 에서 이미 막지만, 예전에 등록된 스케줄·직접 DB 수정에도 대비해 한 번 더 지킨다.
+        db.log(
+            conn,
+            f"스케줄 #{schedule_row['id']} 발신량 {total_tasks}건이 상한({config.MAX_TOTAL_CALLS}건)을 넘어 실행하지 않았습니다.",
+            "warning",
+        )
         return None
 
     created = iso(now())
@@ -104,29 +145,32 @@ def create_run(conn, schedule_row, scheduled_for: datetime, source: str = "sched
                 schedule_row["name"] or f"스케줄 {schedule_row['id']}",
                 schedule_row["type"],
                 iso(scheduled_for),
-                len(pairs),
+                total_tasks,
                 created,
             ),
         )
         run_id = int(cursor.lastrowid)
 
         task_rows = []
-        for seq, (number, repeat_index) in enumerate(pairs, start=1):
-            task_rows.append(
-                (
-                    run_id,
-                    schedule_row["id"],
-                    schedule_row["name"] or f"스케줄 {schedule_row['id']}",
-                    schedule_row["type"],
-                    number,
-                    seq,
-                    repeat_index,
-                    schedule_row["max_call_duration_sec"],
-                    schedule_row["sms_body"],
-                    schedule_row["device_id"] or None,
-                    created,
+        seq = 0
+        for device_id, pairs in batches:
+            for number, repeat_index in pairs:
+                seq += 1
+                task_rows.append(
+                    (
+                        run_id,
+                        schedule_row["id"],
+                        schedule_row["name"] or f"스케줄 {schedule_row['id']}",
+                        schedule_row["type"],
+                        number,
+                        seq,
+                        repeat_index,
+                        schedule_row["max_call_duration_sec"],
+                        schedule_row["sms_body"],
+                        device_id,
+                        created,
+                    )
                 )
-            )
         conn.executemany(
             """INSERT INTO tasks(run_id, schedule_id, schedule_name, type, phone_number, seq, repeat_index,
                                  max_call_duration_sec, sms_body, device_id, status, created_at)
@@ -137,9 +181,10 @@ def create_run(conn, schedule_row, scheduled_for: datetime, source: str = "sched
             "UPDATE schedules SET run_count = run_count + 1, last_run_at = ? WHERE id = ?",
             (created, schedule_row["id"]),
         )
+        device_text = f"기기 {len(target_ids)}대 × {total_tasks // len(target_ids)}건" if target_ids else "공유 대기열"
         db.log(
             conn,
-            f"스케줄 '{schedule_row['name']}' 실행 생성: {len(pairs)}건 ({source})",
+            f"스케줄 '{schedule_row['name']}' 실행 생성: {total_tasks}건 ({device_text}, {source})",
         )
     return run_id
 

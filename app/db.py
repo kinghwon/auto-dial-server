@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     start_at               TEXT NOT NULL,
     recurrence             TEXT NOT NULL DEFAULT 'once',
     device_id              TEXT,
+    target_device_ids      TEXT NOT NULL DEFAULT '[]',
     status                 TEXT NOT NULL DEFAULT 'active',
     next_run_at            TEXT,
     last_run_at            TEXT,
@@ -172,6 +173,19 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
         # 총 발신 횟수(지정 시 번호 개수 × 반복 횟수 대신 사용). 기존 스케줄은 NULL = 기존 방식 유지.
         conn.execute("ALTER TABLE schedules ADD COLUMN total_calls INTEGER")
         added.append("schedules.total_calls")
+    if "target_device_ids" not in schedule_columns:
+        # 발신 기기 여러 대 지정(JSON 배열). 기존 스케줄의 device_id 는 그대로 두고 배열에도 옮겨 담는다.
+        conn.execute("ALTER TABLE schedules ADD COLUMN target_device_ids TEXT NOT NULL DEFAULT '[]'")
+        added.append("schedules.target_device_ids")
+        # 기존 스케줄(운영 중 #2 등)이 쓰던 지정 기기를 잃지 않도록 손실 없이 채워 넣는다.
+        legacy = conn.execute(
+            "SELECT id, device_id FROM schedules WHERE device_id IS NOT NULL AND TRIM(device_id) <> ''"
+        ).fetchall()
+        for row in legacy:
+            conn.execute(
+                "UPDATE schedules SET target_device_ids = ? WHERE id = ?",
+                (json.dumps([row["device_id"]], ensure_ascii=False), row["id"]),
+            )
 
     device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
     if "phone_number" not in device_columns:

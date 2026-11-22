@@ -91,6 +91,27 @@ class DeviceUpdate(BaseModel):
 
 ORDER_MODES = ("sequence", "grouped", "random")
 
+# 한 스케줄에 동시에 지정할 수 있는 발신 기기 수
+MAX_TARGET_DEVICES = 50
+
+
+def clean_device_ids(values: list[str] | None) -> list[str]:
+    """발신 기기 ID 목록. 빈 값은 버리고, 중복은 한 번만 남긴다."""
+    cleaned: list[str] = []
+    for item in values or []:
+        value = str(item).strip()
+        if not value:
+            continue
+        if "/" in value or "\\" in value:
+            raise ValueError("기기 ID 를 올바르게 입력하세요. (/ 또는 \\ 제외)")
+        if len(value) > 64:
+            raise ValueError("기기 ID 는 64자까지입니다.")
+        if value not in cleaned:
+            cleaned.append(value)
+    if len(cleaned) > MAX_TARGET_DEVICES:
+        raise ValueError(f"한 스케줄에 지정할 수 있는 기기는 {MAX_TARGET_DEVICES}대까지입니다.")
+    return cleaned
+
 
 class ScheduleBase(BaseModel):
     """스케줄 생성/수정에서 같이 쓰는 번호·시각 검증기."""
@@ -105,7 +126,7 @@ class ScheduleBase(BaseModel):
     def _sms_body(cls, value: str | None) -> str | None:
         return value.strip() if isinstance(value, str) else value
 
-    @field_validator("device_id", check_fields=False)
+    @field_validator("device_id", "target_device_id", check_fields=False)
     @classmethod
     def _device(cls, value: str | None) -> str | None:
         if value is None:
@@ -126,7 +147,12 @@ class ScheduleCreate(ScheduleBase):
     sms_body: Optional[str] = Field(default=None, max_length=2000)
     start_at: str
     recurrence: Literal["once", "daily", "weekly", "monthly"] = "once"
+    # 발신 기기 한 대(예전 형식). 여러 대를 고를 때는 target_device_ids 를 쓴다.
     device_id: Optional[str] = Field(default=None, max_length=64)
+    # 예전 이름 호환용 별칭(device_id 와 같은 뜻).
+    target_device_id: Optional[str] = Field(default=None, max_length=64)
+    # 발신 기기 여러 대. 각 기기에서 같은 횟수만큼 발신한다. 비우면 전체 기기 자동 배분.
+    target_device_ids: Optional[list[str]] = None
 
     @field_validator("start_at")
     @classmethod
@@ -150,6 +176,20 @@ class ScheduleCreate(ScheduleBase):
         if not self.name.strip():
             label = "전화" if self.type == "call" else "문자"
             self.name = f"{label} 발신 {self.start_at[5:16].replace('T', ' ')}"
+        # 발신 기기: 목록이 있으면 그 목록을, 없으면 device_id 한 대를 목록으로 옮긴다.
+        ids = clean_device_ids(self.target_device_ids)
+        if not ids:
+            single = (self.device_id or self.target_device_id or "").strip()
+            ids = clean_device_ids([single]) if single else []
+        self.target_device_ids = ids
+        self.device_id = ids[0] if len(ids) == 1 else None
+        self.target_device_id = self.device_id
+        per_device = self.total_calls if self.total_calls is not None else len(self.numbers) * max(1, self.repeat_count)
+        if len(ids) > 1 and per_device * len(ids) > config.MAX_TOTAL_CALLS:
+            raise ValueError(
+                f"기기 {len(ids)}대 × {per_device}회 = {per_device * len(ids)}건은 한 번에 발신할 수 있는 "
+                f"최대 {config.MAX_TOTAL_CALLS}건을 넘습니다. 기기 수나 총 발신 횟수를 줄이세요."
+            )
         return self
 
 
@@ -167,6 +207,8 @@ class ScheduleUpdate(ScheduleBase):
     start_at: Optional[str] = None
     recurrence: Optional[Literal["once", "daily", "weekly", "monthly"]] = None
     device_id: Optional[str] = Field(default=None, max_length=64)
+    target_device_id: Optional[str] = Field(default=None, max_length=64)
+    target_device_ids: Optional[list[str]] = None
     status: Optional[Literal["active", "paused", "finished"]] = None
 
     @field_validator("start_at")
@@ -182,6 +224,22 @@ class ScheduleUpdate(ScheduleBase):
     def _require_change(self):
         if not self.model_fields_set:
             raise ValueError("수정할 항목을 하나 이상 보내야 합니다.")
+        return self
+
+    @model_validator(mode="after")
+    def _sync_target_devices(self):
+        """기기 지정은 target_device_ids(목록) 로 통일한다. device_id 는 한 대일 때만 채운다."""
+        provided = self.model_fields_set
+        if not ({"target_device_ids", "target_device_id", "device_id"} & provided):
+            return self
+        if "target_device_ids" in provided:
+            ids = clean_device_ids(self.target_device_ids)
+        else:
+            single = (self.device_id or self.target_device_id or "").strip()
+            ids = clean_device_ids([single]) if single else []
+        self.target_device_ids = ids
+        self.device_id = ids[0] if len(ids) == 1 else None
+        self.target_device_id = self.device_id
         return self
 
 

@@ -2292,3 +2292,354 @@ def test_dashboard_sms_tab_has_receiver_number_column(client):
     device_header = html.split('id="devicesTable"', 1)[1].split("</thead>", 1)[0]
     assert device_header.count("</th>") == 7
     assert 'emptyRow(7, "등록된 기기가 없습니다.' in html
+
+
+# --------------------------------------------------------------------------
+# 22. 스케줄 다중 기기 선택(기기당 같은 횟수) · 기기명/번호 표시
+# --------------------------------------------------------------------------
+def _register_device(client: TestClient, device_id: str, name: str, phone_number: str = "") -> str:
+    response = client.post(
+        "/api/devices", json={"device_id": device_id, "name": name, "phone_number": phone_number}
+    )
+    assert response.status_code == 200, response.text
+    return device_id
+
+
+def _tasks_in_run(client: TestClient, run_id: int) -> list[dict]:
+    tasks = client.get("/api/tasks", params={"limit": 1000}).json()["tasks"]
+    picked = [task for task in tasks if task["run_id"] == run_id]
+    return sorted(picked, key=lambda task: task["seq"])
+
+
+def test_create_schedule_with_multiple_target_devices(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+
+    schedule = make_schedule(client, total_calls=3, target_device_ids=["DEV-A", "DEV-B", "DEV-A"])
+
+    # 중복은 한 번만, 한 대가 아니면 device_id 는 비운다.
+    assert schedule["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert schedule["device_id"] is None
+    assert schedule["target_device_count"] == 2
+    # 기기마다 같은 횟수(3회)를 따로 발신 → 합계 6건
+    assert schedule["tasks_per_device"] == 3
+    assert schedule["tasks_per_run"] == 6
+
+    devices = {d["device_id"]: d for d in schedule["target_devices"]}
+    assert devices["DEV-A"]["name"] == "갤럭시 A"
+    assert devices["DEV-A"]["phone_number"] == "010-1111-2222"
+    assert devices["DEV-B"]["name"] == "갤럭시 B"
+    assert devices["DEV-B"]["phone_number"] == "010-3333-4444"
+    assert all(d["online"] for d in schedule["target_devices"])
+
+
+def test_schedule_single_device_id_is_backwards_compatible(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+
+    schedule = make_schedule(client, device_id="DEV-A")
+
+    assert schedule["device_id"] == "DEV-A"
+    assert schedule["target_device_ids"] == ["DEV-A"]
+    assert schedule["tasks_per_device"] == schedule["tasks_per_run"] == 6
+    assert schedule["target_devices"][0]["name"] == "갤럭시 A"
+
+
+def test_schedule_accepts_target_device_id_alias(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+
+    schedule = make_schedule(client, target_device_id="DEV-A")
+
+    assert schedule["target_device_ids"] == ["DEV-A"]
+    assert schedule["device_id"] == "DEV-A"
+
+
+def test_schedule_without_devices_stays_auto_share(client):
+    schedule = make_schedule(client)
+
+    assert schedule["target_device_ids"] == []
+    assert schedule["target_devices"] == []
+    assert schedule["device_id"] is None
+    # 자동 배분은 예전처럼 1묶음만 만든다.
+    assert schedule["tasks_per_run"] == 6
+
+
+def test_update_schedule_switches_between_auto_and_devices(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(client, total_calls=2)
+    assert schedule["target_device_ids"] == []
+
+    body = client.patch(
+        f"/api/schedules/{schedule['id']}", json={"target_device_ids": ["DEV-A", "DEV-B"]}
+    ).json()["schedule"]
+    assert body["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert body["device_id"] is None
+    assert body["tasks_per_device"] == 2
+    assert body["tasks_per_run"] == 4
+
+    body = client.patch(
+        f"/api/schedules/{schedule['id']}", json={"target_device_ids": ["DEV-B"]}
+    ).json()["schedule"]
+    assert body["target_device_ids"] == ["DEV-B"]
+    assert body["device_id"] == "DEV-B"
+    assert body["tasks_per_run"] == 2
+
+    body = client.patch(f"/api/schedules/{schedule['id']}", json={"target_device_ids": []}).json()["schedule"]
+    assert body["target_device_ids"] == []
+    assert body["device_id"] is None
+
+
+def test_update_schedule_device_id_replaces_multi_selection(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(client, target_device_ids=["DEV-A", "DEV-B"])
+
+    body = client.patch(f"/api/schedules/{schedule['id']}", json={"device_id": "DEV-A"}).json()["schedule"]
+
+    assert body["target_device_ids"] == ["DEV-A"]
+    assert body["device_id"] == "DEV-A"
+
+
+def test_copy_schedule_keeps_multiple_target_devices(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(client, total_calls=2, target_device_ids=["DEV-A", "DEV-B"])
+
+    copied = client.post(f"/api/schedules/{schedule['id']}/copy", json={}).json()["schedule"]
+
+    assert copied["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert copied["status"] == "paused"
+    assert copied["tasks_per_device"] == 2
+    assert copied["tasks_per_run"] == 4
+
+
+def test_multi_device_run_creates_same_amount_per_device(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(
+        client,
+        numbers=["010-1111-0001", "010-1111-0002", "010-1111-0003"],
+        total_calls=4,
+        order_mode="sequence",
+        target_device_ids=["DEV-A", "DEV-B"],
+    )
+
+    run_id = client.post(f"/api/schedules/{schedule['id']}/run-now").json()["run_id"]
+    tasks = _tasks_in_run(client, run_id)
+
+    assert len(tasks) == 8
+    counts = Counter(task["device_id"] for task in tasks)
+    assert counts == {"DEV-A": 4, "DEV-B": 4}
+    expected = ["010-1111-0001", "010-1111-0002", "010-1111-0003", "010-1111-0001"]
+    for device_id in ("DEV-A", "DEV-B"):
+        assert [t["phone_number"] for t in tasks if t["device_id"] == device_id] == expected
+    # 같은 실행 안에서 순번은 이어지고 겹치지 않는다.
+    assert sorted(task["seq"] for task in tasks) == list(range(1, 9))
+
+
+def test_multi_device_random_order_is_shuffled_per_device(client, monkeypatch):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    numbers = ["010-1111-0001", "010-1111-0002", "010-1111-0003", "010-1111-0004"]
+
+    calls: list[list[str]] = []
+
+    def fake_shuffle(items):
+        calls.append(list(items))
+        if len(calls) % 2 == 0:
+            items.reverse()
+
+    monkeypatch.setattr(scheduler.random, "shuffle", fake_shuffle)
+    schedule = make_schedule(
+        client,
+        numbers=numbers,
+        total_calls=4,
+        order_mode="random",
+        target_device_ids=["DEV-A", "DEV-B"],
+    )
+
+    run_id = client.post(f"/api/schedules/{schedule['id']}/run-now").json()["run_id"]
+    tasks = _tasks_in_run(client, run_id)
+
+    assert len(calls) == 2, "기기마다 따로 섞어야 한다"
+    first = [t["phone_number"] for t in tasks if t["device_id"] == "DEV-A"]
+    second = [t["phone_number"] for t in tasks if t["device_id"] == "DEV-B"]
+    assert first == numbers
+    assert second == list(reversed(numbers))
+
+
+def test_multi_device_tasks_are_claimed_only_by_their_device(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(
+        client,
+        numbers=["010-1111-0001", "010-1111-0002"],
+        total_calls=2,
+        target_device_ids=["DEV-A", "DEV-B"],
+    )
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+
+    for _ in range(2):
+        task = client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"]
+        assert task["device_id"] == "DEV-A"
+    assert client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"] is None
+
+    task_b = client.get("/api/tasks/poll", params={"device_id": "DEV-B"}).json()["task"]
+    assert task_b["device_id"] == "DEV-B"
+
+
+def test_delete_device_cleans_schedule_target_devices(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(client, target_device_ids=["DEV-A", "DEV-B"])
+
+    assert client.delete("/api/devices/DEV-A").status_code == 200
+    body = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
+    assert body["target_device_ids"] == ["DEV-B"]
+    assert body["device_id"] == "DEV-B"
+
+    assert client.delete("/api/devices/DEV-B").status_code == 200
+    body = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
+    assert body["target_device_ids"] == []
+    assert body["device_id"] is None
+
+
+def test_deleted_device_still_shows_in_schedule_with_id_name(client):
+    conn = _conn()
+    conn.execute(
+        """INSERT INTO schedules(name, type, numbers, repeat_count, order_mode, max_call_duration_sec,
+                                 start_at, recurrence, device_id, target_device_ids, status, created_at)
+           VALUES ('남은 스케줄', 'call', ?, 1, 'sequence', 30, '2026-11-23T09:00:00+09:00', 'once',
+                   '5656', '["5656"]', 'active', '2026-11-22T20:00:00+09:00')""",
+        (json.dumps(["010-1111-0001"]),),
+    )
+    conn.close()
+
+    schedules = client.get("/api/schedules").json()["schedules"]
+    schedule = schedules[0]
+    assert schedule["target_device_ids"] == ["5656"]
+    assert schedule["target_devices"] == [
+        {
+            "device_id": "5656",
+            "name": "5656",
+            "phone_number": "",
+            "online": False,
+            "enabled": False,
+            "missing": True,
+        }
+    ]
+
+
+def test_multi_device_volume_over_limit_is_rejected(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+
+    response = client.post(
+        "/api/schedules",
+        json={
+            "name": "너무 큰 스케줄",
+            "type": "call",
+            "numbers": ["010-1111-0001"],
+            "total_calls": 4000,
+            "start_at": "2026-11-23T09:00",
+            "recurrence": "once",
+            "target_device_ids": ["DEV-A", "DEV-B"],
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert "8000" in response.text or "5000" in response.text
+
+
+def test_db_migration_adds_target_device_ids_preserving_device_id(tmp_path, monkeypatch):
+    import sqlite3
+
+    old_db = tmp_path / "old_targets.db"
+    raw = sqlite3.connect(old_db)
+    raw.executescript(OLD_SCHEDULES_SCHEMA)
+    raw.execute(
+        """INSERT INTO schedules(name, type, numbers, repeat_count, order_mode, max_call_duration_sec,
+                                 start_at, recurrence, device_id, status, next_run_at, created_at)
+           VALUES ('운영 스케줄', 'call', ?, 1, 'random', 300, '2026-11-22T08:54:00+09:00', 'once',
+                   '5656', 'finished', NULL, '2026-11-22T08:00:00+09:00')""",
+        (json.dumps(["02-2192-0200"]),),
+    )
+    raw.commit()
+    raw.close()
+
+    db.init_db(old_db)  # 운영 DB 에 target_device_ids 컬럼 추가 + device_id 옮겨 담기
+
+    conn = sqlite3.connect(old_db)
+    conn.row_factory = sqlite3.Row
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(schedules)")}
+    assert "target_device_ids" in columns
+    row = conn.execute("SELECT * FROM schedules").fetchone()
+    assert row["device_id"] == "5656", "기존 지정 기기를 잃으면 안 된다"
+    assert json.loads(row["target_device_ids"]) == ["5656"]
+    assert row["name"] == "운영 스케줄"
+    conn.close()
+
+    # 마이그레이션 후 API 에서도 기기 한 대 지정으로 그대로 보인다
+    monkeypatch.setattr(config, "DB_PATH", old_db)
+    with TestClient(app) as migrated_client:
+        schedule = migrated_client.get("/api/schedules").json()["schedules"][0]
+        assert schedule["device_id"] == "5656"
+        assert schedule["target_device_ids"] == ["5656"]
+        assert schedule["tasks_per_run"] == schedule["tasks_per_device"] == 1
+
+    # 두 번 실행해도 안전(마이그레이션 멱등)
+    db.init_db(old_db)
+    conn = sqlite3.connect(old_db)
+    assert conn.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 1
+    assert json.loads(conn.execute("SELECT target_device_ids FROM schedules").fetchone()[0]) == ["5656"]
+    conn.close()
+
+
+def test_dashboard_has_multi_device_picker_and_device_column(client):
+    html = client.get("/").text
+
+    for keyword in (
+        'id="schedDevicePicker"',
+        'id="schedDeviceAuto"',
+        'id="schedDeviceList"',
+        'id="schedDeviceHelp"',
+        "selectAllScheduleDevices(",
+        "renderScheduleDevicePicker(",
+        "toggleScheduleDevice(",
+        "onDeviceAutoToggle(",
+        "scheduleDeviceCell(",
+        "target_device_ids",
+        "scheduleTargetDeviceIds(",
+        "자동 배분",
+        "기기당",
+        "번호 미설정",
+        "선택한",
+    ):
+        assert keyword in html, keyword
+
+    # 스케줄 목록: 체크박스 + 스케줄 + 유형 + 발신 기기 + 발신량 + 주기 + 다음 실행 + 최근 실행 + 상태 + 액션
+    header = html.split('id="schedulesTable"', 1)[1].split("</thead>", 1)[0]
+    assert header.count("</th>") == 10
+    assert header.index("발신 기기") < header.index("발신량")
+
+    # 기기를 고르면 각 기기에서 같은 횟수씩 발신한다는 안내
+    assert "각각" in html and "회씩" in html
+    assert 'emptyRow(10, "등록된 스케줄이 없습니다.' in html
+
+
+def test_pause_and_resume_keep_multiple_target_devices(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(client, target_device_ids=["DEV-A", "DEV-B"])
+
+    paused = client.post(f"/api/schedules/{schedule['id']}/pause").json()["schedule"]
+    assert paused["status"] == "paused"
+    assert paused["target_device_ids"] == ["DEV-A", "DEV-B"]
+
+    resumed = client.post(f"/api/schedules/{schedule['id']}/resume").json()["schedule"]
+    assert resumed["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert resumed["device_id"] is None
+
+    # 다른 항목만 고치는 PATCH 도 기기 목록을 건드리지 않는다
+    patched = client.patch(f"/api/schedules/{schedule['id']}", json={"name": "이름만 변경"}).json()["schedule"]
+    assert patched["target_device_ids"] == ["DEV-A", "DEV-B"]

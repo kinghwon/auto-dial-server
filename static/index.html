@@ -148,6 +148,24 @@
   .switch input:before{content:"";position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
   .switch input:checked:before{left:18px}
 
+  /* 발신 기기 여러 대 선택 */
+  .device-picker{border:1px solid var(--line-strong);border-radius:10px;background:#fff;overflow:hidden}
+  .device-picker .auto-row{display:flex;align-items:center;gap:9px;padding:10px 12px;background:#fafbfe;border-bottom:1px solid var(--line);margin:0;font-size:13px;font-weight:700;color:#3a465c;cursor:pointer}
+  .device-picker .auto-row input{width:16px;height:16px;accent-color:var(--primary);cursor:pointer;flex:0 0 auto}
+  .device-picker .device-list{max-height:210px;overflow:auto}
+  .device-picker .device-list:empty{display:none}
+  .device-pick{display:flex;align-items:center;gap:9px;padding:9px 12px;border-bottom:1px solid var(--line);margin:0;cursor:pointer;font-weight:500;transition:.12s}
+  .device-pick:last-child{border-bottom:none}
+  .device-pick:hover{background:#f7f9fe}
+  .device-pick input{width:16px;height:16px;accent-color:var(--primary);cursor:pointer;flex:0 0 auto}
+  .device-pick .dev-name{font-weight:700;color:var(--text);white-space:nowrap}
+  .device-pick .dev-meta{font-size:11.5px;color:var(--muted)}
+  .device-pick.off .dev-name{color:#5a6a80}
+  .device-picker.disabled .device-list{opacity:.45}
+  .device-picker.disabled .device-pick{cursor:not-allowed}
+  .dev-line{display:flex;align-items:baseline;gap:5px;white-space:nowrap}
+  .dev-line + .dev-line{margin-top:3px}
+
   /* 진행 바 */
   .progress{height:6px;background:#eef1f7;border-radius:999px;overflow:hidden;min-width:70px}
   .progress > span{display:block;height:100%;background:linear-gradient(90deg,#4b8bf5,#2f6bed);border-radius:999px;transition:.3s}
@@ -418,10 +436,20 @@
             </select>
           </div>
 
-          <div class="field">
-            <label>발신 기기</label>
-            <select id="schedDevice"><option value="">전체 분배 (공유 대기열)</option></select>
-            <div class="help">“전체 분배”는 온라인 기기들이 하나씩 나눠서 발신합니다.</div>
+          <div class="field span2">
+            <label>발신 기기 <span class="hint">여러 대를 고르면 각 기기에서 같은 횟수씩 발신합니다</span></label>
+            <div class="device-picker" id="schedDevicePicker">
+              <label class="auto-row">
+                <input type="checkbox" id="schedDeviceAuto" checked onchange="onDeviceAutoToggle()">
+                <span>기기 지정 안 함 · 전체 온라인 기기 자동 배분</span>
+              </label>
+              <div class="device-list" id="schedDeviceList"></div>
+            </div>
+            <div class="btn-row" style="margin-top:2px">
+              <button type="button" class="btn sm" onclick="selectAllScheduleDevices(true)">전체 기기 선택</button>
+              <button type="button" class="btn sm" onclick="selectAllScheduleDevices(false)">선택 해제 (자동 배분)</button>
+            </div>
+            <div class="help" id="schedDeviceHelp">기기 지정 없이 저장하면 온라인 기기들이 하나씩 나눠서 발신합니다.</div>
           </div>
 
           <div class="field span2">
@@ -450,7 +478,7 @@
         </div>
       </div>
       <div class="table-wrap"><table id="schedulesTable">
-        <thead><tr><th style="width:36px"><input type="checkbox" id="scheduleSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSchedules(this)"></th><th>스케줄</th><th>유형</th><th>발신량 / 순서</th><th>주기</th><th>다음 실행</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
+        <thead><tr><th style="width:36px"><input type="checkbox" id="scheduleSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSchedules(this)"></th><th>스케줄</th><th>유형</th><th>발신 기기</th><th>발신량 / 순서</th><th>주기</th><th>다음 실행</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -619,6 +647,9 @@ const state = {
   editingScheduleId: null,
   devicePhoneEditing: null,
   totalCallsAuto: true,
+  // 발신 기기 여러 대 선택(스케줄 폼)
+  schedDeviceIds: new Set(),
+  schedDeviceAuto: true,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -806,11 +837,7 @@ async function loadDevices() {
     $("deviceSummary").textContent = `전체 ${data.devices.length}대 · 온라인 ${online}대`;
     $("tabDeviceCount").textContent = data.devices.length ? ` ${online}/${data.devices.length}` : "";
 
-    const select = $("schedDevice");
-    const current = select.value;
-    select.innerHTML = '<option value="">전체 분배 (공유 대기열)</option>' +
-      data.devices.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} (${esc(d.id)})${d.online ? "" : " · 오프라인"}</option>`).join("");
-    select.value = current;
+    renderScheduleDevicePicker();
 
     // 수신 번호를 입력하는 중에는 5초 자동 갱신이 표를 다시 그려 입력값을 지우지 않게 한다.
     if (!state.devicePhoneEditing) {
@@ -991,9 +1018,97 @@ function updateSummary() {
   }
   const short = total < numbers.length ? ` · 번호 ${numbers.length}개 중 앞에서 ${total}개만 발신` : "";
   const extra = type === "sms" && !$("schedSmsBody").value.trim() ? " · 문자 내용을 입력하세요" : "";
+  const deviceCount = state.schedDeviceAuto ? 0 : state.schedDeviceIds.size;
+  const multi = deviceCount > 1
+    ? `<div style="margin-top:6px"><b>선택한 ${deviceCount}대 기기에서 각각 ${total}회씩 총 ${total * deviceCount}건 발신</b></div>`
+    : (deviceCount === 1
+        ? `<div style="margin-top:6px" class="muted">선택한 기기 1대에서 ${total}건 발신</div>`
+        : `<div style="margin-top:6px" class="muted">기기 지정 없음 · 온라인 기기들이 나눠서 총 ${total}건 발신</div>`);
   $("schedSummary").innerHTML =
     `총 <b>${total}건</b> ${type === "call" ? "전화" : "문자"} 발신 · 번호 ${numbers.length}개 · ${rounds}바퀴` +
-    `<div class="muted" style="margin-top:4px">${esc(ORDER_MODE[order] || order)}: ${esc(preview)}${esc(short)}${esc(extra)}</div>`;
+    `<div class="muted" style="margin-top:4px">${esc(ORDER_MODE[order] || order)}: ${esc(preview)}${esc(short)}${esc(extra)}</div>` +
+    multi;
+}
+
+/* ------------------------------------------------------------------ */
+/* 발신 기기 여러 대 선택                                            */
+/* ------------------------------------------------------------------ */
+function scheduleTargetDeviceIds() {
+  return state.schedDeviceAuto ? [] : [...state.schedDeviceIds];
+}
+
+function renderScheduleDevicePicker() {
+  const list = $("schedDeviceList");
+  if (!list) return;
+  const devices = (state.devices || []).slice();
+  const known = new Set(devices.map((d) => d.id));
+  // 기기 목록에서 이미 지워진 기기가 스케줄에 지정돼 있으면 함께 보여 준다.
+  scheduleTargetDeviceIds().forEach((id) => {
+    if (!known.has(id)) devices.push({ id, name: id, phone_number: "", online: false, missing: true });
+  });
+  list.innerHTML = devices.length
+    ? devices.map((d) => `
+        <label class="device-pick ${d.online ? "" : "off"}" title="${esc(d.name || d.id)} (${esc(d.id)})${d.phone_number ? " · " + esc(d.phone_number) : " · 번호 미설정"}">
+          <input type="checkbox" value="${esc(d.id)}" ${state.schedDeviceIds.has(d.id) ? "checked" : ""} ${state.schedDeviceAuto ? "disabled" : ""}
+                 onchange="toggleScheduleDevice('${esc(d.id)}', this.checked)">
+          <span class="dev-name">${esc(d.name || d.id)}</span>
+          <span class="dev-meta mono">${esc(d.id)} · ${d.phone_number ? esc(d.phone_number) : "번호 미설정"}</span>
+          <span class="spacer"></span>
+          ${d.missing ? badge("기기 목록에 없음", "b-warn") : (d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray"))}
+        </label>`).join("")
+    : `<div class="empty">등록된 기기가 없습니다. 앱에서 서비스 시작을 누르면 자동 등록됩니다.</div>`;
+  $("schedDevicePicker").classList.toggle("disabled", state.schedDeviceAuto);
+  $("schedDeviceAuto").checked = state.schedDeviceAuto;
+  updateScheduleDeviceHelp();
+}
+
+function updateScheduleDeviceHelp() {
+  const help = $("schedDeviceHelp");
+  if (!help) return;
+  const count = state.schedDeviceAuto ? 0 : state.schedDeviceIds.size;
+  if (count === 0) {
+    help.textContent = "기기 지정 없이 저장하면 온라인 기기들이 하나씩 나눠서 발신합니다.";
+  } else if (count === 1) {
+    const name = (state.devices.find((d) => d.id === [...state.schedDeviceIds][0]) || {}).name || [...state.schedDeviceIds][0];
+    help.textContent = `${name} 1대에서만 발신합니다. 여러 대를 고르면 각 기기에서 같은 횟수씩 발신합니다.`;
+  } else {
+    help.textContent = `선택한 ${count}대 기기에서 각각 같은 횟수만큼 따로 발신합니다. (예: 총 10회 × ${count}대 = ${10 * count}건)`;
+  }
+}
+
+function toggleScheduleDevice(id, checked) {
+  if (checked) {
+    state.schedDeviceIds.add(id);
+    state.schedDeviceAuto = false;
+  } else {
+    state.schedDeviceIds.delete(id);
+    if (!state.schedDeviceIds.size) state.schedDeviceAuto = true;
+  }
+  renderScheduleDevicePicker();
+  updateSummary();
+}
+
+function onDeviceAutoToggle() {
+  if ($("schedDeviceAuto").checked) {
+    state.schedDeviceAuto = true;
+    state.schedDeviceIds.clear();
+  } else {
+    state.schedDeviceAuto = false;
+  }
+  renderScheduleDevicePicker();
+  updateSummary();
+}
+
+function selectAllScheduleDevices(select) {
+  state.schedDeviceIds.clear();
+  if (select) {
+    (state.devices || []).forEach((d) => state.schedDeviceIds.add(d.id));
+    state.schedDeviceAuto = !state.schedDeviceIds.size;
+  } else {
+    state.schedDeviceAuto = true;
+  }
+  renderScheduleDevicePicker();
+  updateSummary();
 }
 
 function onNumbersInput() {
@@ -1029,17 +1144,6 @@ function setScheduleEditMode(schedule) {
   $("cancelScheduleEditBtn").style.display = schedule ? "" : "none";
 }
 
-function ensureDeviceOption(deviceId) {
-  if (!deviceId) return;
-  const select = $("schedDevice");
-  if (![...select.options].some((option) => option.value === deviceId)) {
-    const option = document.createElement("option");
-    option.value = deviceId;
-    option.textContent = `${deviceId} (기기 목록에 없음)`;
-    select.appendChild(option);
-  }
-}
-
 function defaultStartValue() {
   const d = new Date(Date.now() + 10 * 60 * 1000);
   d.setSeconds(0, 0);
@@ -1059,7 +1163,9 @@ function resetScheduleForm() {
   $("schedSmsBody").value = "";
   $("schedStart").value = defaultStartValue();
   $("schedRecurrence").value = "once";
-  $("schedDevice").value = "";
+  state.schedDeviceAuto = true;
+  state.schedDeviceIds.clear();
+  renderScheduleDevicePicker();
   document.querySelector('input[name="schedType"][value="call"]').checked = true;
   toggleTypeFields();
   updateSummary();
@@ -1084,8 +1190,12 @@ function openScheduleForm(schedule, quiet = false) {
   $("schedSmsBody").value = schedule.sms_body || "";
   $("schedStart").value = toLocalInput(schedule.start_at) || defaultStartValue();
   $("schedRecurrence").value = schedule.recurrence || "once";
-  ensureDeviceOption(schedule.device_id);
-  $("schedDevice").value = schedule.device_id || "";
+  const targets = (schedule.target_device_ids && schedule.target_device_ids.length)
+    ? schedule.target_device_ids
+    : (schedule.device_id ? [schedule.device_id] : []);
+  state.schedDeviceIds = new Set(targets);
+  state.schedDeviceAuto = targets.length === 0;
+  renderScheduleDevicePicker();
   document.querySelector(`input[name="schedType"][value="${schedule.type}"]`).checked = true;
   toggleTypeFields();
   updateSummary();
@@ -1117,7 +1227,8 @@ async function createSchedule() {
     order_mode: $("sOrder").value,
     start_at: $("schedStart").value,
     recurrence: $("schedRecurrence").value,
-    device_id: $("schedDevice").value || null,
+    target_device_ids: scheduleTargetDeviceIds(),
+    device_id: scheduleTargetDeviceIds().length === 1 ? scheduleTargetDeviceIds()[0] : null,
   };
   if (type === "call") {
     payload.max_call_duration_sec = Math.max(1, parseInt($("schedMaxSec").value || "30", 10));
@@ -1171,6 +1282,7 @@ async function loadSchedules() {
             <td><input type="checkbox" class="queue-check" ${state.selectedSchedules.has(s.id) ? "checked" : ""} onchange="toggleScheduleSelection(${s.id}, this.checked)"></td>
             <td><b>${esc(s.name)}</b><div class="muted" style="font-size:11.5px">#${s.id} · ${esc(detail)}</div></td>
             <td>${typeTag(s.type)}</td>
+            <td>${scheduleDeviceCell(s)}</td>
             <td class="nowrap"><b>${esc(amountText)}</b><div class="muted" style="font-size:11.5px">${esc(orderText)} · 번호 ${s.number_count}개${esc(legacyText)}</div></td>
             <td class="nowrap">${esc(RECURRENCE[s.recurrence] || s.recurrence)}<div class="muted" style="font-size:11.5px">${esc(s.start_at_text)}</div></td>
             <td class="nowrap">${s.next_run_at ? esc(s.next_run_text) : '<span class="muted">-</span>'}</td>
@@ -1189,13 +1301,33 @@ async function loadSchedules() {
             </td>
           </tr>`;
         }).join("")
-      : emptyRow(9, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
+      : emptyRow(10, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
 
     const activeIds = new Set(data.schedules.map((s) => s.id));
     Array.from(state.selectedSchedules).forEach((id) => { if (!activeIds.has(id)) state.selectedSchedules.delete(id); });
     updateScheduleToolbar();
     syncScheduleSelectAll();
   } catch (e) { toast(e.message, "err"); }
+}
+
+/* 스케줄 목록의 발신 기기 칸: 기기명 + 그 기기의 번호 */
+function scheduleDeviceCell(s) {
+  const devices = s.target_devices || [];
+  if (!devices.length) {
+    return '<span class="badge b-info">자동 배분</span>' +
+      '<div class="muted" style="font-size:11.5px;margin-top:3px">전체 온라인 기기</div>';
+  }
+  const per = s.tasks_per_device != null ? s.tasks_per_device : s.tasks_per_run;
+  const lines = devices.map((d) => `<div class="dev-line">` +
+    `<span class="${d.online ? "dot-online" : "dot-offline"}">●</span>` +
+    `<b>${esc(d.name || d.device_id)}</b>` +
+    `<span class="mono muted">${d.phone_number ? esc(d.phone_number) : "번호 미설정"}</span>` +
+    `${d.missing ? ' <span class="muted" style="font-size:11px">(삭제됨)</span>' : ""}` +
+    `</div>`).join("");
+  const multi = devices.length > 1
+    ? `<div class="muted" style="font-size:11.5px;margin-top:3px">기기당 ${per}회 · 총 ${s.tasks_per_run}건</div>`
+    : "";
+  return lines + multi;
 }
 
 function isExecutedSchedule(schedule) {

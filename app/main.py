@@ -195,10 +195,61 @@ def task_dict(row: sqlite3.Row) -> dict:
     }
 
 
-def schedule_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+def device_lookup(conn: sqlite3.Connection) -> dict[str, dict]:
+    """기기 ID → 대시보드용 기기 정보(이름·번호·온라인)."""
+    rows = conn.execute("SELECT * FROM devices").fetchall()
+    return {row["id"]: device_dict(row) for row in rows}
+
+
+def resolve_target_devices(
+    conn: sqlite3.Connection, device_ids: list[str], devices: dict[str, dict] | None = None
+) -> list[dict]:
+    """스케줄의 발신 기기 ID 목록을 이름·번호·온라인 상태로 풀어 준다.
+
+    기기가 이미 삭제됐으면 이름을 ID 로, 번호는 빈 값, missing=true 로 돌려준다.
+    """
+    if not device_ids:
+        return []
+    lookup = devices if devices is not None else device_lookup(conn)
+    result: list[dict] = []
+    for device_id in device_ids:
+        info = lookup.get(device_id)
+        if info is None:
+            result.append(
+                {
+                    "device_id": device_id,
+                    "name": device_id,
+                    "phone_number": "",
+                    "online": False,
+                    "enabled": False,
+                    "missing": True,
+                }
+            )
+        else:
+            result.append(
+                {
+                    "device_id": device_id,
+                    "name": info.get("name") or device_id,
+                    "phone_number": info.get("phone_number") or "",
+                    "online": bool(info.get("online")),
+                    "enabled": bool(info.get("enabled", True)),
+                    "missing": False,
+                }
+            )
+    return result
+
+
+def schedule_dict(
+    conn: sqlite3.Connection, row: sqlite3.Row, devices: dict[str, dict] | None = None
+) -> dict:
     numbers = json_list(row["numbers"])
     total_calls = row["total_calls"] if "total_calls" in row.keys() else None
     per_run = total_calls if total_calls is not None else len(numbers) * max(1, row["repeat_count"] or 1)
+    # 발신 기기 여러 대(예전 DB·예전 앱이 남긴 device_id 도 함께 살린다).
+    target_ids = db.json_list(_row_value(row, "target_device_ids"))
+    if not target_ids and row["device_id"]:
+        target_ids = [row["device_id"]]
+    target_devices = resolve_target_devices(conn, target_ids, devices)
     latest = conn.execute(
         "SELECT * FROM runs WHERE schedule_id = ? ORDER BY id DESC LIMIT 1", (row["id"],)
     ).fetchone()
@@ -221,12 +272,16 @@ def schedule_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "start_at_text": local_str(row["start_at"], "%Y-%m-%d %H:%M"),
         "recurrence": row["recurrence"],
         "device_id": row["device_id"],
+        "target_device_ids": target_ids,
+        "target_devices": target_devices,
+        "target_device_count": len(target_ids),
         "status": row["status"],
         "next_run_at": row["next_run_at"],
         "next_run_text": local_str(row["next_run_at"], "%Y-%m-%d %H:%M") if row["next_run_at"] else "-",
         "last_run_at": row["last_run_at"],
         "run_count": row["run_count"],
-        "tasks_per_run": per_run,
+        "tasks_per_run": per_run * max(1, len(target_ids)),
+        "tasks_per_device": per_run,
         "pending_tasks": opens,
         "latest_run": (
             {
@@ -527,6 +582,16 @@ def delete_device(device_id: str, conn: sqlite3.Connection = Depends(get_conn)):
         "UPDATE schedules SET device_id = NULL WHERE device_id = ?",
         (device_id,),
     )
+    # 여러 대 지정 스케줄의 기기 목록에서도 지운 기기를 빼낸다(스케줄은 남기고 나머지 기기로 계속 발신).
+    for sched in conn.execute("SELECT id, device_id, target_device_ids FROM schedules").fetchall():
+        targets = db.json_list(_row_value(sched, "target_device_ids"))
+        if not targets or device_id not in targets:
+            continue
+        remaining = [item for item in targets if item != device_id]
+        conn.execute(
+            "UPDATE schedules SET target_device_ids = ?, device_id = ? WHERE id = ?",
+            (json.dumps(remaining, ensure_ascii=False), remaining[0] if len(remaining) == 1 else None, sched["id"]),
+        )
     db.log(conn, f"기기 삭제: {device_id}", "warning")
     return {"ok": True, "deleted": device_id}
 
@@ -537,7 +602,8 @@ def delete_device(device_id: str, conn: sqlite3.Connection = Depends(get_conn)):
 @api.get("/schedules")
 def list_schedules(conn: sqlite3.Connection = Depends(get_conn)):
     rows = conn.execute("SELECT * FROM schedules ORDER BY id DESC").fetchall()
-    return {"schedules": [schedule_dict(conn, row) for row in rows]}
+    devices = device_lookup(conn)
+    return {"schedules": [schedule_dict(conn, row, devices) for row in rows]}
 
 
 @api.post("/schedules")
@@ -548,8 +614,8 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
     with db.transaction(conn):
         cursor = conn.execute(
             """INSERT INTO schedules(name, type, numbers, repeat_count, total_calls, order_mode, max_call_duration_sec,
-                                     sms_body, start_at, recurrence, device_id, status, next_run_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                                     sms_body, start_at, recurrence, device_id, target_device_ids, status, next_run_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
             (
                 payload.name,
                 payload.type,
@@ -562,6 +628,7 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
                 iso(start_at),
                 payload.recurrence,
                 payload.device_id,
+                json.dumps(payload.target_device_ids or [], ensure_ascii=False),
                 iso(start_at),
                 created,
             ),
@@ -572,10 +639,12 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
             if payload.total_calls is not None
             else f"{len(payload.numbers)}개 번호 × {payload.repeat_count}회"
         )
+        targets = payload.target_device_ids or []
+        device_text = f"기기 {', '.join(targets)}" if targets else "전체 기기 자동 배분"
         db.log(
             conn,
             f"스케줄 등록: '{payload.name}' {payload.type} {amount} "
-            f"({payload.order_mode}, {payload.recurrence}, {iso(start_at)})",
+            f"({device_text}, {payload.order_mode}, {payload.recurrence}, {iso(start_at)})",
         )
     row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
     return {"ok": True, "schedule": schedule_dict(conn, row)}
@@ -636,6 +705,8 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
         "start_at": row["start_at"],
         "recurrence": row["recurrence"],
         "device_id": row["device_id"],
+        "target_device_ids": db.json_list(_row_value(row, "target_device_ids"))
+        or ([row["device_id"]] if row["device_id"] else []),
         "status": row["status"],
     }
     before = dict(new)
@@ -662,6 +733,10 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
         new["recurrence"] = payload.recurrence
     if "device_id" in provided:
         new["device_id"] = payload.device_id
+    if {"target_device_ids", "target_device_id", "device_id"} & provided:
+        # 여러 대 지정(PATCH) 이 오면 목록을 통째로 바꿔 덮어쓴다.
+        new["target_device_ids"] = list(payload.target_device_ids or [])
+        new["device_id"] = new["target_device_ids"][0] if len(new["target_device_ids"]) == 1 else None
     if "status" in provided and payload.status is not None:
         new["status"] = payload.status
 
@@ -678,6 +753,19 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
 
     if not new["numbers"]:
         raise HTTPException(status_code=400, detail="발신할 전화번호를 1개 이상 입력하세요.")
+
+    per_device = new["total_calls"] if new["total_calls"] is not None else len(new["numbers"]) * max(
+        1, new["repeat_count"] or 1
+    )
+    if len(new["target_device_ids"]) > 1 and per_device * len(new["target_device_ids"]) > config.MAX_TOTAL_CALLS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"기기 {len(new['target_device_ids'])}대 × {per_device}회 = "
+                f"{per_device * len(new['target_device_ids'])}건은 한 번에 발신할 수 있는 "
+                f"최대 {config.MAX_TOTAL_CALLS}건을 넘습니다. 기기 수나 총 발신 횟수를 줄이세요."
+            ),
+        )
 
     start_dt = parse_dt(new["start_at"]) or now()
     if not new["name"]:
@@ -714,7 +802,7 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
         conn.execute(
             """UPDATE schedules SET name = ?, type = ?, numbers = ?, repeat_count = ?, total_calls = ?,
                                   order_mode = ?, max_call_duration_sec = ?, sms_body = ?, start_at = ?,
-                                  recurrence = ?, device_id = ?, status = ?, next_run_at = ?
+                                  recurrence = ?, device_id = ?, target_device_ids = ?, status = ?, next_run_at = ?
                WHERE id = ?""",
             (
                 new["name"][:120],
@@ -728,6 +816,7 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
                 iso(start_dt),
                 new["recurrence"],
                 new["device_id"],
+                json.dumps(new["target_device_ids"], ensure_ascii=False),
                 new["status"],
                 next_run,
                 schedule_id,
@@ -746,8 +835,11 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
             changes.append(f"실행 시각 {local_str(before['start_at'], '%m-%d %H:%M')}→{local_str(iso(start_dt), '%m-%d %H:%M')}")
         if before["recurrence"] != new["recurrence"]:
             changes.append(f"주기 {before['recurrence']}→{new['recurrence']}")
-        if (before["device_id"] or "") != (new["device_id"] or ""):
-            changes.append(f"기기 {before['device_id'] or '전체'}→{new['device_id'] or '전체'}")
+        if before["device_id"] != new["device_id"] or before["target_device_ids"] != new["target_device_ids"]:
+            def _dev_label(ids):
+                return ", ".join(ids) if ids else "전체 자동 배분"
+
+            changes.append(f"기기 {_dev_label(before['target_device_ids'])}→{_dev_label(new['target_device_ids'])}")
         if before["status"] != new["status"]:
             changes.append(f"상태 {before['status']}→{new['status']}")
         if before["name"] != new["name"]:
@@ -955,9 +1047,9 @@ def copy_schedule(
     with db.transaction(conn):
         cursor = conn.execute(
             """INSERT INTO schedules(name, type, numbers, repeat_count, total_calls, order_mode,
-                                     max_call_duration_sec, sms_body, start_at, recurrence, device_id,
+                                     max_call_duration_sec, sms_body, start_at, recurrence, device_id, target_device_ids,
                                      status, next_run_at, run_count, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
             (
                 name,
                 row["type"],
@@ -970,6 +1062,11 @@ def copy_schedule(
                 row["start_at"],
                 row["recurrence"],
                 row["device_id"],
+                json.dumps(
+                    db.json_list(_row_value(row, "target_device_ids"))
+                    or ([row["device_id"]] if row["device_id"] else []),
+                    ensure_ascii=False,
+                ),
                 status,
                 next_run,
                 created,
