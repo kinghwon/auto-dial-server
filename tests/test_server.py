@@ -2640,14 +2640,14 @@ def test_dashboard_has_multi_device_picker_and_device_column(client):
         assert keyword in html, keyword
 
     # 스케줄 목록: 체크박스 + 스케줄 + 유형 + 발신 기기 + 발신량 + 주기/종료일 + 다음 실행
-    #            + 보낸 회수 + 최근 실행 + 상태 + 액션
+    #            + 보낸 회수(최근 실행 진행 포함) + 상태 + 액션
     header = html.split('id="schedulesTable"', 1)[1].split("</thead>", 1)[0]
-    assert header.count("</th>") == 11
+    assert header.count("</th>") == 10
     assert header.index("발신 기기") < header.index("발신량")
 
     # 기기를 고르면 각 기기에서 같은 횟수씩 발신한다는 안내
     assert "각각" in html and "회씩" in html
-    assert 'emptyRow(11, "등록된 스케줄이 없습니다.' in html
+    assert 'emptyRow(10, "등록된 스케줄이 없습니다.' in html
 
 
 def test_pause_and_resume_keep_multiple_target_devices(client):

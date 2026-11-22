@@ -191,6 +191,10 @@
   .device-picker.disabled .device-pick{cursor:not-allowed}
   .dev-line{display:flex;align-items:baseline;gap:5px;white-space:nowrap}
   .dev-line + .dev-line{margin-top:3px}
+  /* 스케줄 목록: 열이 많아 좁아지면 한글·기기명이 한 자씩 끊기므로 최소 폭과 단어 단위 줄바꿈을 준다 */
+  #schedulesTable{min-width:1150px}
+  #schedulesTable td{word-break:keep-all}
+  #schedulesTable td:nth-child(2){min-width:160px}
 
   /* 진행 바 */
   .progress{height:6px;background:#eef1f7;border-radius:999px;overflow:hidden;min-width:70px}
@@ -584,7 +588,7 @@
         </div>
       </div>
       <div class="table-wrap"><table id="schedulesTable">
-        <thead><tr><th style="width:36px"><input type="checkbox" id="scheduleSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSchedules(this)"></th><th>스케줄</th><th>유형</th><th>발신 기기</th><th>발신량 / 순서</th><th>주기 / 종료일</th><th>다음 실행</th><th>보낸 회수 (진행)</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
+        <thead><tr><th style="width:36px"><input type="checkbox" id="scheduleSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSchedules(this)"></th><th>스케줄</th><th>유형</th><th>발신 기기</th><th>발신량 / 순서</th><th>주기 / 종료일</th><th>다음 실행</th><th>보낸 회수 (진행)</th><th>상태</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -1690,10 +1694,6 @@ async function loadSchedules() {
 
     $("schedulesTable").querySelector("tbody").innerHTML = data.schedules.length
       ? data.schedules.map((s) => {
-          const latest = s.latest_run;
-          const latestCell = latest
-            ? `${progressBar(latest.done_tasks, latest.total_tasks)}<div style="margin-top:4px">${statusBadge(RUN_STATUS, latest.status)}</div>`
-            : '<span class="muted">-</span>';
           const detail = s.type === "call" ? `${s.max_call_duration_sec}초 제한` : (s.sms_body || "").slice(0, 30);
           const amountText = `총 ${s.tasks_per_run}회`;
           const orderText = ORDER_MODE[s.order_mode] || s.order_mode || "순차";
@@ -1710,7 +1710,6 @@ async function loadSchedules() {
               : `<div class="muted" style="font-size:11.5px">종료일 없음</div>`}</td>
             <td class="nowrap">${s.next_run_at ? esc(s.next_run_text) : '<span class="muted">-</span>'}</td>
             <td style="min-width:170px">${sentStatsCell(s)}</td>
-            <td style="min-width:130px">${latestCell}</td>
             <td>${statusBadge(SCHED_STATUS, s.status)}</td>
             <td>
               <div class="cell-actions">
@@ -1725,7 +1724,7 @@ async function loadSchedules() {
             </td>
           </tr>`;
         }).join("")
-      : emptyRow(11, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
+      : emptyRow(10, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
 
     const activeIds = new Set(data.schedules.map((s) => s.id));
     Array.from(state.selectedSchedules).forEach((id) => { if (!activeIds.has(id)) state.selectedSchedules.delete(id); });
@@ -1734,17 +1733,21 @@ async function loadSchedules() {
   } catch (e) { toast(e.message, "err"); }
 }
 
-/* 스케줄 목록의 보낸 회수(진행) 칸: 성공·실패·대기 + 문자 미리보기 + 상세 버튼 */
+/* 스케줄 목록의 보낸 회수(진행) 칸: 성공·실패·대기 + 최근 실행 진행 + 문자 미리보기 + 상세 버튼 */
 function sentStatsCell(s) {
   const st = s.stats || {};
   const done = st.done_count || 0;
   const failed = st.failed_count || 0;
   const pending = st.pending_count || 0;
+  const latest = s.latest_run;
   const preview = s.type === "sms" && s.sms_body
     ? `<div class="sms-preview" title="${esc(s.sms_body)}">💬 ${esc(s.sms_body)}</div>`
     : "";
+  const latestLine = latest
+    ? `<div style="margin-top:4px">${progressBar(latest.done_tasks, latest.total_tasks)}</div>`
+    : "";
   return `<div class="sent-line"><span class="ok">성공 ${done}</span> · <span class="fail">실패 ${failed}</span> · 대기 ${pending}</div>` +
-    preview +
+    preview + latestLine +
     `<div style="margin-top:5px"><button class="btn sm" onclick="openSentStats(${s.id})">보낸 회수 상세</button></div>`;
 }
 
