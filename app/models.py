@@ -159,3 +159,12 @@ class SettingsUpdate(BaseModel):
     """기타 운영 설정(선택)."""
     online_timeout_sec: Optional[int] = Field(default=None, ge=10, le=3600)
     default_poll_interval_sec: Optional[int] = Field(default=None, ge=1, le=300)
+
+
+class RemoteSettings(BaseModel):
+    """폰에 내려보내는 원격 동작 설정(APK 재설치 없이 대시보드에서 변경)."""
+
+    poll_interval_sec: Optional[int] = Field(default=None, ge=2, le=300)
+    call_gap_sec: Optional[int] = Field(default=None, ge=0, le=600)
+    sms_forward_enabled: Optional[bool] = None
+    mms_forward_enabled: Optional[bool] = None

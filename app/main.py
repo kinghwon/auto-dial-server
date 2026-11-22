@@ -20,6 +20,7 @@ from .models import (
     DeviceRegister,
     DeviceUpdate,
     Heartbeat,
+    RemoteSettings,
     ScheduleCreate,
     ScheduleUpdate,
     SmsIncoming,
@@ -92,6 +93,34 @@ def device_is_online(row: sqlite3.Row, current: datetime | None = None) -> bool:
     if last_seen is None:
         return False
     return (current - last_seen).total_seconds() <= config.ONLINE_TIMEOUT_SEC
+
+
+def _setting_int(settings: dict, key: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(str(settings.get(key, default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+def remote_config(conn: sqlite3.Connection, device_id: str | None = None) -> dict:
+    """폰이 하트비트·풀링 때마다 받아가는 동작 설정.
+
+    APK를 다시 설치하지 않아도 대시보드에서 바꾼 값이 수 초 안에 모든 폰에 적용된다.
+    """
+    settings = db.get_settings(conn)
+    cfg = {
+        "poll_interval_sec": _setting_int(settings, "poll_interval_sec", 5, 2, 300),
+        "call_gap_sec": _setting_int(settings, "call_gap_sec", 3, 0, 600),
+        "sms_forward_enabled": settings.get("sms_forward_enabled", "1") == "1",
+        "mms_forward_enabled": settings.get("mms_forward_enabled", "1") == "1",
+        "device_enabled": True,
+    }
+    if device_id:
+        row = conn.execute("SELECT enabled FROM devices WHERE id = ?", (device_id,)).fetchone()
+        if row is not None:
+            cfg["device_enabled"] = bool(row["enabled"])
+    return cfg
 
 
 def device_dict(row: sqlite3.Row, current: datetime | None = None) -> dict:
@@ -373,6 +402,7 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
 def device_heartbeat(device_id: str, payload: Heartbeat | None = None, conn: sqlite3.Connection = Depends(get_conn)):
     body = payload or Heartbeat(device_id=device_id)
     row = ensure_device(conn, device_id)
+    cfg = remote_config(conn, device_id)
     conn.execute(
         "UPDATE devices SET last_seen = ?, battery = COALESCE(?, battery), network = COALESCE(NULLIF(?, ''), network) WHERE id = ?",
         (iso(now()), body.battery, body.network, row["id"]),
@@ -384,8 +414,10 @@ def device_heartbeat(device_id: str, payload: Heartbeat | None = None, conn: sql
     return {
         "ok": True,
         "server_time": iso(now()),
-        "poll_interval_sec": config.DEFAULT_POLL_INTERVAL_SEC,
+        "poll_interval_sec": cfg["poll_interval_sec"],
         "pending_tasks": pending,
+        # 대시보드에서 바꾼 원격 설정(확인 주기·발신 간격·문자 전달·기기 사용 여부)
+        "config": cfg,
     }
 
 
@@ -593,8 +625,10 @@ def claim_next_task(conn: sqlite3.Connection, device_id: str) -> dict | None:
 @api.get("/tasks/poll")
 def poll_task(device_id: str = Query(min_length=1, max_length=64), conn: sqlite3.Connection = Depends(get_conn)):
     ensure_device(conn, device_id)
+    cfg = remote_config(conn, device_id)
     conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (iso(now()), device_id))
-    task = claim_next_task(conn, device_id)
+    # 대시보드에서 '사용 중지'된 기기에는 작업을 배정하지 않는다.
+    task = claim_next_task(conn, device_id) if cfg["device_enabled"] else None
     pending = conn.execute(
         "SELECT COUNT(*) AS c FROM tasks WHERE status = 'pending' AND (device_id IS NULL OR device_id = ?)",
         (device_id,),
@@ -602,8 +636,9 @@ def poll_task(device_id: str = Query(min_length=1, max_length=64), conn: sqlite3
     return {
         "task": task,
         "pending_tasks": pending,
-        "poll_interval_sec": config.DEFAULT_POLL_INTERVAL_SEC,
+        "poll_interval_sec": cfg["poll_interval_sec"],
         "server_time": iso(now()),
+        "config": cfg,
     }
 
 
@@ -788,6 +823,8 @@ def get_settings(conn: sqlite3.Connection = Depends(get_conn)):
             "sms_forward_enabled": settings.get("sms_forward_enabled", "1") == "1",
             "configured": bool(settings.get("telegram_bot_token") and settings.get("telegram_chat_id")),
         },
+        # 폰에 내려보내는 원격 동작 설정(APK 재설치 없이 변경)
+        "remote": remote_config(conn),
         "server": {
             "timezone": config.TZ_NAME,
             "online_timeout_sec": config.ONLINE_TIMEOUT_SEC,
@@ -795,6 +832,36 @@ def get_settings(conn: sqlite3.Connection = Depends(get_conn)):
             "api_key_required": bool(config.API_KEY),
         },
     }
+
+
+@api.post("/settings/remote")
+def save_remote_settings(payload: RemoteSettings, conn: sqlite3.Connection = Depends(get_conn)):
+    """확인 주기·발신 간격·문자 전달·기기 사용 설정을 저장한다(폰은 30초 안에 적용)."""
+    if payload.poll_interval_sec is not None:
+        db.set_setting(conn, "poll_interval_sec", str(payload.poll_interval_sec))
+    if payload.call_gap_sec is not None:
+        db.set_setting(conn, "call_gap_sec", str(payload.call_gap_sec))
+    if payload.sms_forward_enabled is not None:
+        db.set_setting(conn, "sms_forward_enabled", "1" if payload.sms_forward_enabled else "0")
+    if payload.mms_forward_enabled is not None:
+        db.set_setting(conn, "mms_forward_enabled", "1" if payload.mms_forward_enabled else "0")
+    cfg = remote_config(conn)
+    db.log(
+        conn,
+        "원격 기기 설정 저장: 확인 {}초 · 간격 {}초 · SMS 전달 {} · MMS 전달 {}".format(
+            cfg["poll_interval_sec"],
+            cfg["call_gap_sec"],
+            "ON" if cfg["sms_forward_enabled"] else "OFF",
+            "ON" if cfg["mms_forward_enabled"] else "OFF",
+        ),
+    )
+    return {"ok": True, "remote": cfg}
+
+
+@api.post("/settings")
+def save_settings(payload: RemoteSettings, conn: sqlite3.Connection = Depends(get_conn)):
+    """POST /api/settings 도 /api/settings/remote 와 동일하게 동작한다."""
+    return save_remote_settings(payload, conn)
 
 
 @api.post("/settings/telegram")

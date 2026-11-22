@@ -494,3 +494,153 @@ def test_expand_tasks_helper():
     assert scheduler.expand_tasks(["A", "B"], 2) == [("A", 1), ("B", 1), ("A", 2), ("B", 2)]
     assert scheduler.expand_tasks(["A", "B"], 2, "grouped") == [("A", 1), ("A", 2), ("B", 1), ("B", 2)]
     assert scheduler.expand_tasks([], 3) == []
+
+
+# --------------------------------------------------------------------------
+# 9. 원격 기기 설정 (대시보드 → 폰, APK 재설치 없이 적용)
+# --------------------------------------------------------------------------
+DEFAULT_REMOTE = {
+    "poll_interval_sec": 5,
+    "call_gap_sec": 3,
+    "sms_forward_enabled": True,
+    "mms_forward_enabled": True,
+    "device_enabled": True,
+}
+
+
+def test_settings_returns_remote_defaults(client):
+    body = client.get("/api/settings").json()
+    assert body["remote"] == DEFAULT_REMOTE
+    # 기존 텔레그램 설정 응답은 그대로 유지된다(하위 호환).
+    assert "telegram" in body and "server" in body
+
+
+def test_remote_settings_save_applies_to_heartbeat_and_poll(client):
+    client.post("/api/devices", json={"device_id": "DEV-RC", "name": "원격폰"})
+
+    saved = client.post(
+        "/api/settings/remote",
+        json={"poll_interval_sec": 20, "call_gap_sec": 12, "sms_forward_enabled": False, "mms_forward_enabled": False},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["remote"] == {**DEFAULT_REMOTE, "poll_interval_sec": 20, "call_gap_sec": 12,
+                                      "sms_forward_enabled": False, "mms_forward_enabled": False}
+
+    # GET /api/settings 에도 저장값이 보인다.
+    assert client.get("/api/settings").json()["remote"]["poll_interval_sec"] == 20
+    assert client.get("/api/settings").json()["remote"]["sms_forward_enabled"] is False
+
+    # 하트비트 응답: 최상위 poll_interval_sec + config 블록
+    heartbeat = client.post("/api/devices/DEV-RC/heartbeat").json()
+    assert heartbeat["poll_interval_sec"] == 20
+    assert heartbeat["config"] == {**DEFAULT_REMOTE, "poll_interval_sec": 20, "call_gap_sec": 12,
+                                   "sms_forward_enabled": False, "mms_forward_enabled": False}
+
+    # 폴링 응답도 같은 설정을 돌려준다.
+    poll = client.get("/api/tasks/poll", params={"device_id": "DEV-RC"}).json()
+    assert poll["poll_interval_sec"] == 20
+    assert poll["config"] == heartbeat["config"]
+
+    # DB 에 실제로 저장된다(서버 재시작 후에도 유지).
+    conn = _conn()
+    settings = db.get_settings(conn)
+    conn.close()
+    assert settings["poll_interval_sec"] == "20"
+    assert settings["call_gap_sec"] == "12"
+    assert settings["sms_forward_enabled"] == "0"
+    assert settings["mms_forward_enabled"] == "0"
+
+
+def test_remote_settings_partial_update_keeps_other_values(client):
+    client.post("/api/settings/remote", json={"poll_interval_sec": 30, "call_gap_sec": 9})
+    client.post("/api/settings/remote", json={"mms_forward_enabled": False})
+    remote = client.get("/api/settings").json()["remote"]
+    assert remote["poll_interval_sec"] == 30
+    assert remote["call_gap_sec"] == 9
+    assert remote["sms_forward_enabled"] is True
+    assert remote["mms_forward_enabled"] is False
+
+    # 빈 본문은 아무것도 바꾸지 않는다.
+    assert client.post("/api/settings/remote", json={}).status_code == 200
+    assert client.get("/api/settings").json()["remote"] == remote
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"poll_interval_sec": 1},
+        {"poll_interval_sec": 301},
+        {"call_gap_sec": -1},
+        {"call_gap_sec": 601},
+        {"sms_forward_enabled": "maybe"},
+    ],
+)
+def test_remote_settings_rejects_out_of_range(client, payload):
+    assert client.post("/api/settings/remote", json=payload).status_code == 422
+    assert client.get("/api/settings").json()["remote"] == DEFAULT_REMOTE
+
+
+def test_remote_settings_alias_post_settings(client):
+    response = client.post("/api/settings", json={"poll_interval_sec": 7, "call_gap_sec": 0})
+    assert response.status_code == 200, response.text
+    assert response.json()["remote"]["poll_interval_sec"] == 7
+    assert client.get("/api/settings").json()["remote"]["call_gap_sec"] == 0
+
+
+def test_remote_config_clamps_corrupted_values(client):
+    conn = _conn()
+    db.set_setting(conn, "poll_interval_sec", "abc")
+    db.set_setting(conn, "call_gap_sec", "9999")
+    conn.close()
+    remote = client.get("/api/settings").json()["remote"]
+    assert remote["poll_interval_sec"] == 5   # 기본값으로 복구
+    assert remote["call_gap_sec"] == 600      # 상한으로 제한
+
+
+def test_remote_settings_change_is_logged(client):
+    client.post("/api/settings/remote", json={"poll_interval_sec": 11, "call_gap_sec": 4,
+                                              "sms_forward_enabled": True, "mms_forward_enabled": False})
+    logs = client.get("/api/logs").json()["logs"]
+    assert any("원격 기기 설정 저장" in entry["message"] and "11초" in entry["message"] for entry in logs)
+
+
+def test_disabled_device_is_not_assigned_tasks(client):
+    client.post("/api/devices", json={"device_id": "DEV-OFF", "name": "중지폰"})
+    schedule = make_schedule(client, numbers=["010-9999-0001", "010-9999-0002"], repeat_count=1)
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+
+    disabled = client.patch("/api/devices/DEV-OFF", json={"enabled": False})
+    assert disabled.status_code == 200
+    assert disabled.json()["device"]["enabled"] is False
+
+    # 중지된 기기는 하트비트는 계속하지만 작업은 받지 않는다.
+    heartbeat = client.post("/api/devices/DEV-OFF/heartbeat").json()
+    assert heartbeat["ok"] is True
+    assert heartbeat["config"]["device_enabled"] is False
+    assert heartbeat["pending_tasks"] == 2
+
+    poll = client.get("/api/tasks/poll", params={"device_id": "DEV-OFF"}).json()
+    assert poll["task"] is None
+    assert poll["config"]["device_enabled"] is False
+    assert poll["pending_tasks"] == 2
+
+    tasks = client.get("/api/tasks", params={"schedule_id": schedule["id"]}).json()["tasks"]
+    assert [task["status"] for task in tasks] == ["pending", "pending"]
+
+    # 다시 사용 설정하면 정상적으로 작업을 받는다.
+    assert client.patch("/api/devices/DEV-OFF", json={"enabled": True}).json()["device"]["enabled"] is True
+    task = client.get("/api/tasks/poll", params={"device_id": "DEV-OFF"}).json()
+    assert task["task"]["phone_number"] == "010-9999-0001"
+    assert task["config"]["device_enabled"] is True
+
+
+def test_disabled_device_does_not_block_other_devices(client):
+    client.post("/api/devices", json={"device_id": "DEV-OFF"})
+    client.post("/api/devices", json={"device_id": "DEV-ON"})
+    client.patch("/api/devices/DEV-OFF", json={"enabled": False})
+    schedule = make_schedule(client, numbers=["010-9999-0100"], repeat_count=1)
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+
+    task = client.get("/api/tasks/poll", params={"device_id": "DEV-ON"}).json()["task"]
+    assert task is not None
+    assert task["phone_number"] == "010-9999-0100"

@@ -247,6 +247,39 @@
   <section class="tabpane" id="pane-devices">
     <div class="card">
       <div class="card-head">
+        <div><h2>원격 기기 제어 설정</h2><div class="sub">여기서 바꾼 값이 연결된 모든 폰에 자동 적용됩니다 · APK 재설치 불필요</div></div>
+        <button class="btn sm" onclick="loadRemoteSettings(true)">서버 값 불러오기</button>
+      </div>
+      <div class="card-body">
+        <div class="form-grid">
+          <div class="field">
+            <label>확인 주기(초) <span class="hint">2~300</span></label>
+            <input type="number" id="rcPoll" min="2" max="300" step="1" inputmode="numeric">
+            <div class="help">폰이 서버에 새 작업을 물어보는 간격입니다. 짧을수록 반응이 빠릅니다.</div>
+          </div>
+          <div class="field">
+            <label>발신 간격(초) <span class="hint">0~600</span></label>
+            <input type="number" id="rcGap" min="0" max="600" step="1" inputmode="numeric">
+            <div class="help">전화·문자 한 건을 마친 뒤 다음 건까지 쉬는 시간입니다.</div>
+          </div>
+          <div class="field">
+            <label class="switch"><input type="checkbox" id="rcSms"> SMS 수신 전달</label>
+            <div class="help">폰에 온 일반 문자를 서버에 올려 텔레그램으로 받습니다.</div>
+          </div>
+          <div class="field">
+            <label class="switch"><input type="checkbox" id="rcMms"> MMS·LMS 수신 전달</label>
+            <div class="help">장문·사진·통신사/은행 문자의 전달 여부입니다.</div>
+          </div>
+        </div>
+        <div class="btn-row" style="margin-top:16px">
+          <button class="btn primary" onclick="saveRemoteSettings()">저장</button>
+        </div>
+        <div id="rcStatus" class="hint-line">불러오는 중…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
         <div><h2>기기 추가</h2><div class="sub">앱의 “기기 ID”와 같은 값을 입력하면 자동으로 연결됩니다</div></div>
       </div>
       <div class="card-body">
@@ -490,6 +523,7 @@ const state = {
   devices: [],
   schedules: [],
   taskFilter: "",
+  remoteDirty: false,
   timer: null,
   clockTimer: null,
 };
@@ -684,15 +718,68 @@ async function loadDevices() {
 
     $("devicesTable").querySelector("tbody").innerHTML = data.devices.length
       ? data.devices.map((d) => `
-        <tr>
-          <td>${d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray")}</td>
+        <tr style="${d.enabled ? "" : "opacity:.62"}">
+          <td>${d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray")}${d.enabled ? "" : " " + badge("중지됨", "b-warn")}</td>
           <td><b>${esc(d.name)}</b><div class="muted mono">${esc(d.id)}</div>${d.note ? `<div class="muted" style="font-size:11.5px">${esc(d.note)}</div>` : ""}</td>
           <td class="muted">${esc(d.model || "-")}<div style="font-size:11.5px">${d.android_version ? "Android " + esc(d.android_version) : ""}</div></td>
           <td>${d.battery === null || d.battery === undefined ? '<span class="muted">-</span>' : `${d.battery}%`}</td>
           <td class="muted nowrap">${esc(d.last_seen_text)}</td>
-          <td><button class="btn sm danger" onclick="deleteDevice('${esc(d.id)}')">삭제</button></td>
+          <td class="nowrap"><button class="btn sm" onclick="toggleDevice('${esc(d.id)}', ${d.enabled ? "false" : "true"})">${d.enabled ? "사용 중지" : "사용"}</button> <button class="btn sm danger" onclick="deleteDevice('${esc(d.id)}')">삭제</button></td>
         </tr>`).join("")
       : emptyRow(6, "등록된 기기가 없습니다. 앱에서 서비스 시작을 누르면 자동 등록됩니다.", "📵");
+
+    if (state.tab === "devices") loadRemoteSettings();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 원격 기기 제어 설정 (모든 폰에 자동 적용)                          */
+/* ------------------------------------------------------------------ */
+function markRemoteDirty() { state.remoteDirty = true; }
+
+async function loadRemoteSettings(force = false) {
+  // 사용자가 입력 중인 값을 5초 자동 갱신이 덮어쓰지 않도록 한다.
+  if (!force && state.remoteDirty) return;
+  try {
+    const data = await api("/api/settings");
+    const remote = data.remote || {};
+    $("rcPoll").value = remote.poll_interval_sec ?? 5;
+    $("rcGap").value = remote.call_gap_sec ?? 3;
+    $("rcSms").checked = remote.sms_forward_enabled !== false;
+    $("rcMms").checked = remote.mms_forward_enabled !== false;
+    state.remoteDirty = false;
+    $("rcStatus").textContent = `현재 서버 값 · 확인 ${remote.poll_interval_sec ?? 5}초 · 발신 간격 ${remote.call_gap_sec ?? 3}초 · SMS ${remote.sms_forward_enabled !== false ? "전달" : "안 함"} · MMS ${remote.mms_forward_enabled !== false ? "전달" : "안 함"}`;
+  } catch (e) {
+    $("rcStatus").textContent = "서버 설정을 불러오지 못했습니다: " + e.message;
+  }
+}
+
+async function saveRemoteSettings() {
+  const poll = parseInt($("rcPoll").value, 10);
+  const gap = parseInt($("rcGap").value, 10);
+  if (!Number.isFinite(poll) || poll < 2 || poll > 300) { toast("확인 주기는 2~300초 사이로 입력하세요.", "err"); return; }
+  if (!Number.isFinite(gap) || gap < 0 || gap > 600) { toast("발신 간격은 0~600초 사이로 입력하세요.", "err"); return; }
+  try {
+    await api("/api/settings/remote", {
+      method: "POST",
+      body: JSON.stringify({
+        poll_interval_sec: poll,
+        call_gap_sec: gap,
+        sms_forward_enabled: $("rcSms").checked,
+        mms_forward_enabled: $("rcMms").checked,
+      }),
+    });
+    state.remoteDirty = false;
+    toast("저장했습니다. 연결된 폰에 곧 적용됩니다.", "ok");
+    loadRemoteSettings(true);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function toggleDevice(id, enable) {
+  try {
+    await api(`/api/devices/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ enabled: enable }) });
+    toast(enable ? `기기 ${id} 를 다시 사용합니다.` : `기기 ${id} 를 중지했습니다. 새 작업이 배정되지 않습니다.`, "ok");
+    loadDevices();
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -1030,6 +1117,7 @@ function startAutoRefresh() {
   startClock();
   resetScheduleForm();
   toggleTypeFields();
+  ["rcPoll", "rcGap", "rcSms", "rcMms"].forEach((id) => $(id).addEventListener("input", markRemoteDirty));
   const hash = (location.hash || "").replace("#", "");
   if (hash && document.getElementById("pane-" + hash)) {
     document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === hash));

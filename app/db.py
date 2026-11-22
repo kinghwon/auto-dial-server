@@ -121,6 +121,10 @@ DEFAULT_SETTINGS = {
     "telegram_chat_id": "",
     "telegram_enabled": "1",
     "sms_forward_enabled": "1",
+    "mms_forward_enabled": "1",
+    # 앱(폰)에 내려보내는 원격 동작 설정. APK 재설치 없이 대시보드에서 바꿀 수 있다.
+    "poll_interval_sec": "5",
+    "call_gap_sec": "3",
 }
 
 
