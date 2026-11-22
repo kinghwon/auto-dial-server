@@ -2277,6 +2277,8 @@ def test_dashboard_sms_tab_has_receiver_number_column(client):
         "saveDevicePhone(",
         'id="devPhone"',
         "phone_number: phoneNumber",
+        "state.devicePhoneEditing",
+        "cancelDevicePhone(",
     ):
         assert keyword in html, keyword
 

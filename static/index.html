@@ -617,6 +617,7 @@ const state = {
   timer: null,
   clockTimer: null,
   editingScheduleId: null,
+  devicePhoneEditing: null,
   totalCallsAuto: true,
 };
 
@@ -708,6 +709,8 @@ document.querySelectorAll(".tab").forEach((button) => {
 
 function switchTab(tab) {
   state.tab = tab;
+  // 다른 탭으로 이동하면 기기 수신 번호 입력 상태를 끝낸다(돌아왔을 때 최신 목록을 그린다).
+  if (tab !== "devices") state.devicePhoneEditing = null;
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   document.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + tab));
   location.hash = tab;
@@ -809,8 +812,9 @@ async function loadDevices() {
       data.devices.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} (${esc(d.id)})${d.online ? "" : " · 오프라인"}</option>`).join("");
     select.value = current;
 
-    $("devicesTable").querySelector("tbody").innerHTML = data.devices.length
-      ? data.devices.map((d) => `
+    // 수신 번호를 입력하는 중에는 5초 자동 갱신이 표를 다시 그려 입력값을 지우지 않게 한다.
+    if (!state.devicePhoneEditing) {
+      $("devicesTable").querySelector("tbody").innerHTML = data.devices.length ? data.devices.map((d) => `
         <tr style="${d.enabled ? "" : "opacity:.62"}">
           <td>${d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray")}${d.enabled ? "" : " " + badge("중지됨", "b-warn")}</td>
           <td><b>${esc(d.name)}</b><div class="muted mono">${esc(d.id)}</div>${d.note ? `<div class="muted" style="font-size:11.5px">${esc(d.note)}</div>` : ""}</td>
@@ -819,8 +823,8 @@ async function loadDevices() {
           <td>${d.battery === null || d.battery === undefined ? '<span class="muted">-</span>' : `${d.battery}%`}</td>
           <td class="muted nowrap">${esc(d.last_seen_text)}</td>
           <td class="nowrap"><button class="btn sm" onclick="toggleDevice('${esc(d.id)}', ${d.enabled ? "false" : "true"})">${d.enabled ? "사용 중지" : "사용"}</button> <button class="btn sm danger" onclick="deleteDevice('${esc(d.id)}')">삭제</button></td>
-        </tr>`).join("")
-      : emptyRow(7, "등록된 기기가 없습니다. 앱에서 서비스 시작을 누르면 자동 등록됩니다.", "📵");
+        </tr>`).join("") : emptyRow(7, "등록된 기기가 없습니다. 앱에서 서비스 시작을 누르면 자동 등록됩니다.", "📵");
+    }
 
     if (state.tab === "devices") loadRemoteSettings();
   } catch (e) { toast(e.message, "err"); }
@@ -905,16 +909,22 @@ function editDevicePhone(btn, id) {
   if (!cell || cell.dataset.editing === "1") return;
   const current = cell.dataset.phone || "";
   cell.dataset.editing = "1";
-  cell.innerHTML = `<span class="mono"><input type="tel" class="phone-input" value="${esc(current)}" placeholder="010-0000-0000" maxlength="30" style="width:132px"></span> <button class="btn sm primary" onclick="saveDevicePhone(this, '${esc(id)}')">저장</button> <button class="btn sm" onclick="loadDevices()">취소</button>`;
+  state.devicePhoneEditing = String(id);
+  cell.innerHTML = `<span class="mono"><input type="tel" class="phone-input" value="${esc(current)}" placeholder="010-0000-0000" maxlength="30" style="width:132px"></span> <button class="btn sm primary" onclick="saveDevicePhone(this, '${esc(id)}')">저장</button> <button class="btn sm" onclick="cancelDevicePhone()">취소</button>`;
   const input = cell.querySelector("input");
   if (input) {
     input.focus();
     input.select();
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") saveDevicePhone(input, id);
-      if (event.key === "Escape") loadDevices();
+      if (event.key === "Escape") cancelDevicePhone();
     });
   }
+}
+
+function cancelDevicePhone() {
+  state.devicePhoneEditing = null;
+  loadDevices();
 }
 
 async function saveDevicePhone(el, id) {
@@ -925,6 +935,7 @@ async function saveDevicePhone(el, id) {
     await api(`/api/devices/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ phone_number: value }) });
     toast(value ? `기기 ${id} 의 수신 번호를 ${value} 로 저장했습니다.` : `기기 ${id} 의 수신 번호를 비웠습니다.`, "ok");
   } catch (e) { toast(e.message, "err"); }
+  state.devicePhoneEditing = null;
   loadDevices();
 }
 
