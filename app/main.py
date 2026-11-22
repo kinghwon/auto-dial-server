@@ -36,7 +36,7 @@ from .models import (
     TelegramTest,
 )
 from . import telegram_client
-from .timeutil import iso, local_str, next_occurrence, now, now_iso, parse_dt
+from .timeutil import end_date_deadline, iso, local_str, next_occurrence, now, now_iso, parse_dt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("auto-dialer")
@@ -299,8 +299,48 @@ def resolve_target_devices(
     return result
 
 
+def _schedule_task_counts(conn: sqlite3.Connection) -> dict[int, dict]:
+    """스케줄별 발신 작업 집계(보낸 회수 관리). 한 번의 질의로 모든 스케줄을 모은다."""
+    rows = conn.execute(
+        """SELECT schedule_id,
+                  SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_count,
+                  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+                  SUM(CASE WHEN status IN ('pending','assigned','running') THEN 1 ELSE 0 END) AS pending_count,
+                  SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_count,
+                  COUNT(*) AS total_tasks,
+                  MAX(CASE WHEN status = 'done' THEN finished_at END) AS last_sent_at
+           FROM tasks WHERE deleted_at IS NULL AND schedule_id IS NOT NULL
+           GROUP BY schedule_id"""
+    ).fetchall()
+    return {
+        int(row["schedule_id"]): {
+            "done_count": int(row["done_count"] or 0),
+            "failed_count": int(row["failed_count"] or 0),
+            "pending_count": int(row["pending_count"] or 0),
+            "skipped_count": int(row["skipped_count"] or 0),
+            "total_tasks": int(row["total_tasks"] or 0),
+            "last_sent_at": row["last_sent_at"],
+        }
+        for row in rows
+    }
+
+
+def _empty_task_counts() -> dict:
+    return {
+        "done_count": 0,
+        "failed_count": 0,
+        "pending_count": 0,
+        "skipped_count": 0,
+        "total_tasks": 0,
+        "last_sent_at": None,
+    }
+
+
 def schedule_dict(
-    conn: sqlite3.Connection, row: sqlite3.Row, devices: dict[str, dict] | None = None
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    devices: dict[str, dict] | None = None,
+    task_counts: dict[int, dict] | None = None,
 ) -> dict:
     numbers = json_list(row["numbers"])
     total_calls = row["total_calls"] if "total_calls" in row.keys() else None
@@ -318,6 +358,13 @@ def schedule_dict(
            WHERE schedule_id = ? AND deleted_at IS NULL AND status IN ('pending','assigned','running')""",
         (row["id"],),
     ).fetchone()["c"]
+    end_date = (_row_value(row, "end_date") or "").strip()
+    deadline = end_date_deadline(end_date)
+    if task_counts is not None:
+        counts = dict(task_counts.get(int(row["id"])) or _empty_task_counts())
+    else:
+        counts = _schedule_task_counts(conn).get(int(row["id"])) or _empty_task_counts()
+    counts["run_count"] = row["run_count"] or 0
     return {
         "id": row["id"],
         "name": row["name"],
@@ -331,6 +378,9 @@ def schedule_dict(
         "sms_body": row["sms_body"],
         "start_at": row["start_at"],
         "start_at_text": local_str(row["start_at"], "%Y-%m-%d %H:%M"),
+        "end_date": end_date,
+        "end_date_text": end_date or "",
+        "end_date_expired": bool(deadline is not None and now() > deadline),
         "recurrence": row["recurrence"],
         "device_id": row["device_id"],
         "target_device_ids": target_ids,
@@ -344,6 +394,7 @@ def schedule_dict(
         "tasks_per_run": per_run * max(1, len(target_ids)),
         "tasks_per_device": per_run,
         "pending_tasks": opens,
+        "stats": counts,
         "latest_run": (
             {
                 "id": latest["id"],
@@ -486,6 +537,25 @@ def stats(conn: sqlite3.Connection = Depends(get_conn)):
     sms_today = conn.execute(
         "SELECT COUNT(*) AS c FROM sms_inbox WHERE deleted_at IS NULL AND created_at >= ?", (today_start,)
     ).fetchone()["c"]
+    # 보낸(발신) 문자·전화 건수: 수신 문자(sms_inbox)와 구분해 발신 작업(tasks)에서 센다.
+    sms_sent_today = conn.execute(
+        """SELECT COUNT(*) AS c FROM tasks
+           WHERE deleted_at IS NULL AND type = 'sms' AND status = 'done' AND finished_at >= ?""",
+        (today_start,),
+    ).fetchone()["c"]
+    call_done_today = conn.execute(
+        """SELECT COUNT(*) AS c FROM tasks
+           WHERE deleted_at IS NULL AND type = 'call' AND status = 'done' AND finished_at >= ?""",
+        (today_start,),
+    ).fetchone()["c"]
+    sent_totals = conn.execute(
+        """SELECT
+             SUM(CASE WHEN type = 'sms' AND status = 'done' THEN 1 ELSE 0 END) AS sms_done,
+             SUM(CASE WHEN type = 'sms' AND status = 'failed' THEN 1 ELSE 0 END) AS sms_failed,
+             SUM(CASE WHEN type = 'call' AND status = 'done' THEN 1 ELSE 0 END) AS call_done,
+             SUM(CASE WHEN type = 'call' AND status = 'failed' THEN 1 ELSE 0 END) AS call_failed
+           FROM tasks WHERE deleted_at IS NULL"""
+    ).fetchone()
     telegram_failed = conn.execute(
         """SELECT COUNT(*) AS c FROM sms_inbox
            WHERE deleted_at IS NULL AND telegram_status IN ('failed','pending')"""
@@ -504,6 +574,14 @@ def stats(conn: sqlite3.Connection = Depends(get_conn)):
             "done_today": done_today,
             "failed_today": failed_today,
             "calls_today": calls_today,
+        },
+        "sent": {
+            "sms_today": sms_sent_today,
+            "call_today": call_done_today,
+            "sms_done": int(sent_totals["sms_done"] or 0),
+            "sms_failed": int(sent_totals["sms_failed"] or 0),
+            "call_done": int(sent_totals["call_done"] or 0),
+            "call_failed": int(sent_totals["call_failed"] or 0),
         },
         "sms": {"today": sms_today, "telegram_issue": telegram_failed},
         "upcoming": [
@@ -742,7 +820,8 @@ def delete_device(device_id: str, conn: sqlite3.Connection = Depends(get_conn)):
 def list_schedules(conn: sqlite3.Connection = Depends(get_conn)):
     rows = conn.execute("SELECT * FROM schedules WHERE deleted_at IS NULL ORDER BY id DESC").fetchall()
     devices = device_lookup(conn)
-    return {"schedules": [schedule_dict(conn, row, devices) for row in rows]}
+    task_counts = _schedule_task_counts(conn)
+    return {"schedules": [schedule_dict(conn, row, devices, task_counts) for row in rows]}
 
 
 @api.post("/schedules")
@@ -753,8 +832,8 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
     with db.transaction(conn):
         cursor = conn.execute(
             """INSERT INTO schedules(name, type, numbers, repeat_count, total_calls, order_mode, max_call_duration_sec,
-                                     sms_body, start_at, recurrence, device_id, target_device_ids, status, next_run_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                                     sms_body, start_at, end_date, recurrence, device_id, target_device_ids, status, next_run_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
             (
                 payload.name,
                 payload.type,
@@ -765,6 +844,7 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
                 payload.max_call_duration_sec,
                 payload.sms_body,
                 iso(start_at),
+                payload.end_date or "",
                 payload.recurrence,
                 payload.device_id,
                 json.dumps(payload.target_device_ids or [], ensure_ascii=False),
@@ -780,10 +860,11 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
         )
         targets = payload.target_device_ids or []
         device_text = f"기기 {', '.join(targets)}" if targets else "전체 기기 자동 배분"
+        end_text = f", 종료일 {payload.end_date}" if payload.end_date else ""
         db.log(
             conn,
             f"스케줄 등록: '{payload.name}' {payload.type} {amount} "
-            f"({device_text}, {payload.order_mode}, {payload.recurrence}, {iso(start_at)})",
+            f"({device_text}, {payload.order_mode}, {payload.recurrence}{end_text}, {iso(start_at)})",
         )
     row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
     return {"ok": True, "schedule": schedule_dict(conn, row)}
@@ -795,6 +876,127 @@ def get_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn))
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
     return {"schedule": schedule_dict(conn, row)}
+
+
+# 보낸 회수 집계용 공통 SELECT. 번호별·기기별 조회는 GROUP BY 를 붙여 쓴다.
+_TASK_COUNTS_SELECT = """
+    SELECT {extra}
+      SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_count,
+      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+      SUM(CASE WHEN status IN ('pending','assigned','running') THEN 1 ELSE 0 END) AS pending_count,
+      SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_count,
+      COUNT(*) AS total_tasks,
+      MAX(CASE WHEN status = 'done' THEN finished_at END) AS last_sent_at
+    FROM tasks WHERE deleted_at IS NULL AND schedule_id = ? {group}
+"""
+
+_EMPTY_COUNT_ROW = {
+    "done_count": 0,
+    "failed_count": 0,
+    "pending_count": 0,
+    "skipped_count": 0,
+    "total_tasks": 0,
+    "last_sent_at": None,
+}
+
+
+def _count_bundle(target) -> dict:
+    """집계 행(dict/sqlite3.Row/None)을 응답용 건수 묶음으로 바꾼다."""
+    target = target or _EMPTY_COUNT_ROW
+    last_sent = target["last_sent_at"]
+    return {
+        "done_count": int(target["done_count"] or 0),
+        "failed_count": int(target["failed_count"] or 0),
+        "pending_count": int(target["pending_count"] or 0),
+        "skipped_count": int(target["skipped_count"] or 0),
+        "total_tasks": int(target["total_tasks"] or 0),
+        "last_sent_at": last_sent,
+        "last_sent_text": local_str(last_sent, "%Y-%m-%d %H:%M:%S") if last_sent else "-",
+    }
+
+
+@api.get("/schedules/{schedule_id}/stats")
+def schedule_sent_stats(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """스케줄 하나의 보낸 회수 상세: 전체·번호별·기기별 성공/실패/대기 건수."""
+    row = conn.execute("SELECT * FROM schedules WHERE id = ? AND deleted_at IS NULL", (schedule_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+
+    totals = _count_bundle(
+        conn.execute(_TASK_COUNTS_SELECT.format(extra="", group=""), (schedule_id,)).fetchone()
+    )
+    totals["run_count"] = row["run_count"] or 0
+
+    # 번호별: 스케줄에 등록된 번호 순서를 그대로 유지하고, 기록만 있는 번호는 뒤에 붙인다.
+    number_rows = conn.execute(
+        _TASK_COUNTS_SELECT.format(
+            extra="phone_number,",
+            group="GROUP BY phone_number ORDER BY MIN(seq) ASC, MIN(id) ASC",
+        ),
+        (schedule_id,),
+    ).fetchall()
+    by_number = {entry["phone_number"]: entry for entry in number_rows}
+    per_number: list[dict] = []
+    seen_numbers: set[str] = set()
+    for number in json_list(row["numbers"]):
+        per_number.append({"number": number, **_count_bundle(by_number.get(number))})
+        seen_numbers.add(number)
+    for entry in number_rows:
+        if entry["phone_number"] in seen_numbers:
+            continue
+        per_number.append({"number": entry["phone_number"], **_count_bundle(entry)})
+
+    # 기기별: 기기 이름·번호를 붙여 준다.
+    devices = device_lookup(conn)
+    device_rows = conn.execute(
+        _TASK_COUNTS_SELECT.format(
+            extra="device_id,",
+            group="GROUP BY device_id ORDER BY MIN(seq) ASC, MIN(id) ASC",
+        ),
+        (schedule_id,),
+    ).fetchall()
+    target_ids = db.json_list(_row_value(row, "target_device_ids"))
+    if not target_ids and row["device_id"]:
+        target_ids = [row["device_id"]]
+    per_device: list[dict] = []
+    seen_devices: set[str] = set()
+
+    def _device_item(device_id: str, counts: dict) -> dict:
+        info = devices.get(device_id) if device_id else None
+        return {
+            "device_id": device_id,
+            "device_name": (info.get("name") if info else "") or device_id or "자동 배분",
+            "phone_number": (info.get("phone_number") if info else "") or "",
+            **counts,
+        }
+
+    for entry in device_rows:
+        device_id = entry["device_id"] or ""
+        per_device.append(_device_item(device_id, _count_bundle(entry)))
+        seen_devices.add(device_id)
+    for device_id in target_ids:
+        if device_id in seen_devices:
+            continue
+        per_device.append(_device_item(device_id, _count_bundle(None)))
+
+    end_date = (_row_value(row, "end_date") or "").strip()
+    deadline = end_date_deadline(end_date)
+    return {
+        "schedule_id": row["id"],
+        "name": row["name"],
+        "type": row["type"],
+        "status": row["status"],
+        "sms_body": row["sms_body"],
+        "start_at": row["start_at"],
+        "start_at_text": local_str(row["start_at"], "%Y-%m-%d %H:%M"),
+        "end_date": end_date,
+        "end_date_expired": bool(deadline is not None and now() > deadline),
+        "next_run_at": row["next_run_at"],
+        "next_run_text": local_str(row["next_run_at"], "%Y-%m-%d %H:%M") if row["next_run_at"] else "-",
+        "numbers": per_number,
+        "devices": per_device,
+        **totals,
+    }
 
 
 def _next_run_after_edit(
@@ -842,6 +1044,7 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
         "max_call_duration_sec": row["max_call_duration_sec"],
         "sms_body": row["sms_body"],
         "start_at": row["start_at"],
+        "end_date": (_row_value(row, "end_date") or "").strip(),
         "recurrence": row["recurrence"],
         "device_id": row["device_id"],
         "target_device_ids": db.json_list(_row_value(row, "target_device_ids"))
@@ -868,6 +1071,8 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
         new["sms_body"] = payload.sms_body
     if "start_at" in provided and payload.start_at is not None:
         new["start_at"] = payload.start_at
+    if "end_date" in provided and payload.end_date is not None:
+        new["end_date"] = payload.end_date
     if "recurrence" in provided and payload.recurrence is not None:
         new["recurrence"] = payload.recurrence
     if "device_id" in provided:
@@ -907,17 +1112,34 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
         )
 
     start_dt = parse_dt(new["start_at"]) or now()
+    deadline = end_date_deadline(new["end_date"])
+    if deadline is not None and start_dt > deadline:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"실행 시각({start_dt.strftime('%Y-%m-%d %H:%M')})이 실행 종료일({new['end_date']})보다 뒤입니다. "
+                "시작 시각이나 종료일을 다시 정하세요."
+            ),
+        )
     if not new["name"]:
         label = "전화" if new["type"] == "call" else "문자"
         new["name"] = f"{label} 발신 {start_dt.strftime('%m-%d %H:%M')}"
 
     # 다음 실행 시각 · 상태
     current = now()
-    schedule_changed = bool({"start_at", "recurrence"} & provided)
+    schedule_changed = bool({"start_at", "recurrence", "end_date"} & provided)
     explicitly_status = "status" in provided and payload.status is not None
     if schedule_changed and not explicitly_status and new["status"] == "finished" and start_dt > current:
         # 지난 1회성 일정의 실행 시각을 미래로 옮기면 다시 예약한다.
         new["status"] = "active"
+    if schedule_changed and not explicitly_status and new["status"] == "finished" and "end_date" in provided:
+        # 종료일을 늘렸을 때 아직 남은 반복이 있으면 다시 예약한다.
+        candidate = _next_run_after_edit(
+            start_dt, new["recurrence"], current, run_count=row["run_count"] or 0
+        )
+        candidate_dt = parse_dt(candidate) if candidate else None
+        if candidate_dt is not None and (deadline is None or candidate_dt <= deadline):
+            new["status"] = "active"
 
     if new["status"] == "finished":
         next_run = None
@@ -937,10 +1159,17 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
     else:
         next_run = row["next_run_at"]
 
+    # 종료일을 넘긴 예약은 실행하지 않는다.
+    next_run_dt = parse_dt(next_run) if next_run else None
+    if deadline is not None and next_run_dt is not None and next_run_dt > deadline:
+        next_run = None
+        if new["status"] == "active":
+            new["status"] = "finished"
+
     with db.transaction(conn):
         conn.execute(
             """UPDATE schedules SET name = ?, type = ?, numbers = ?, repeat_count = ?, total_calls = ?,
-                                  order_mode = ?, max_call_duration_sec = ?, sms_body = ?, start_at = ?,
+                                  order_mode = ?, max_call_duration_sec = ?, sms_body = ?, start_at = ?, end_date = ?,
                                   recurrence = ?, device_id = ?, target_device_ids = ?, status = ?, next_run_at = ?
                WHERE id = ?""",
             (
@@ -953,6 +1182,7 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
                 new["max_call_duration_sec"],
                 new["sms_body"],
                 iso(start_dt),
+                new["end_date"] or "",
                 new["recurrence"],
                 new["device_id"],
                 json.dumps(new["target_device_ids"], ensure_ascii=False),
@@ -972,6 +1202,8 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Con
             changes.append(f"유형 {before['type']}→{new['type']}")
         if before["start_at"] != iso(start_dt):
             changes.append(f"실행 시각 {local_str(before['start_at'], '%m-%d %H:%M')}→{local_str(iso(start_dt), '%m-%d %H:%M')}")
+        if before["end_date"] != new["end_date"]:
+            changes.append(f"종료일 {before['end_date'] or '없음'}→{new['end_date'] or '없음'}")
         if before["recurrence"] != new["recurrence"]:
             changes.append(f"주기 {before['recurrence']}→{new['recurrence']}")
         if before["device_id"] != new["device_id"] or before["target_device_ids"] != new["target_device_ids"]:
@@ -1015,6 +1247,19 @@ def resume_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_con
             guard += 1
     elif start_at <= current:
         next_run = current
+    deadline = end_date_deadline((_row_value(row, "end_date") or "").strip())
+    if deadline is not None and next_run > deadline:
+        # 종료일을 넘겨 재개하면 바로 다시 종료되므로, 그 뜻을 분명히 알려 준다.
+        conn.execute(
+            "UPDATE schedules SET status = 'finished', next_run_at = NULL WHERE id = ?", (schedule_id,)
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"이 스케줄은 실행 종료일({row['end_date']})이 지나 재개할 수 없습니다. "
+                "종료일을 늘리거나 지운 뒤 다시 재개하세요."
+            ),
+        )
     conn.execute(
         "UPDATE schedules SET status = 'active', next_run_at = ? WHERE id = ?",
         (iso(next_run), schedule_id),
@@ -1209,9 +1454,9 @@ def copy_schedule(
     with db.transaction(conn):
         cursor = conn.execute(
             """INSERT INTO schedules(name, type, numbers, repeat_count, total_calls, order_mode,
-                                     max_call_duration_sec, sms_body, start_at, recurrence, device_id, target_device_ids,
+                                     max_call_duration_sec, sms_body, start_at, end_date, recurrence, device_id, target_device_ids,
                                      status, next_run_at, run_count, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
             (
                 name,
                 row["type"],
@@ -1222,6 +1467,7 @@ def copy_schedule(
                 row["max_call_duration_sec"],
                 row["sms_body"],
                 row["start_at"],
+                (_row_value(row, "end_date") or ""),
                 row["recurrence"],
                 row["device_id"],
                 json.dumps(

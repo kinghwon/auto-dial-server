@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sqlite3
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -2638,14 +2639,15 @@ def test_dashboard_has_multi_device_picker_and_device_column(client):
     ):
         assert keyword in html, keyword
 
-    # 스케줄 목록: 체크박스 + 스케줄 + 유형 + 발신 기기 + 발신량 + 주기 + 다음 실행 + 최근 실행 + 상태 + 액션
+    # 스케줄 목록: 체크박스 + 스케줄 + 유형 + 발신 기기 + 발신량 + 주기/종료일 + 다음 실행
+    #            + 보낸 회수 + 최근 실행 + 상태 + 액션
     header = html.split('id="schedulesTable"', 1)[1].split("</thead>", 1)[0]
-    assert header.count("</th>") == 10
+    assert header.count("</th>") == 11
     assert header.index("발신 기기") < header.index("발신량")
 
     # 기기를 고르면 각 기기에서 같은 횟수씩 발신한다는 안내
     assert "각각" in html and "회씩" in html
-    assert 'emptyRow(10, "등록된 스케줄이 없습니다.' in html
+    assert 'emptyRow(11, "등록된 스케줄이 없습니다.' in html
 
 
 def test_pause_and_resume_keep_multiple_target_devices(client):
@@ -3407,3 +3409,422 @@ def test_archive_and_logs_require_api_key(client, monkeypatch):
     headers = {"X-API-Key": "secret-key"}
     assert client.get("/api/archive", headers=headers).status_code == 200
     assert client.get("/api/logs", headers=headers).status_code == 200
+
+
+# --------------------------------------------------------------------------
+# 24. 실행 종료일(end_date) — 검증 · 자동 종료 · 복사/수정 보존
+# --------------------------------------------------------------------------
+def test_end_date_created_and_returned(client):
+    schedule = make_schedule(client, start_at="2026-11-23T09:00", recurrence="daily", end_date="2026-11-30")
+    assert schedule["end_date"] == "2026-11-30"
+    assert schedule["end_date_text"] == "2026-11-30"
+    assert schedule["end_date_expired"] is False
+
+    # 종료일을 비우면(기본) 종료일 없이 반복한다.
+    plain = make_schedule(client, start_at="2026-11-23T09:00", recurrence="daily")
+    assert plain["end_date"] == ""
+    assert plain["end_date_expired"] is False
+
+
+@pytest.mark.parametrize("bad", ["2026-13-01", "2026-02-30", "2026/11/30", "20261130", "내일", "2026-1-5"])
+def test_end_date_invalid_format_rejected(client, bad):
+    response = client.post(
+        "/api/schedules",
+        json={"type": "call", "numbers": ["010-1234-5678"], "start_at": "2026-11-23T09:00", "end_date": bad},
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_end_date_before_start_rejected(client):
+    response = client.post(
+        "/api/schedules",
+        json={"type": "call", "numbers": ["010-1234-5678"], "start_at": "2026-12-01T09:00", "end_date": "2026-11-30"},
+    )
+    assert response.status_code == 422
+    assert "종료일" in response.text
+
+    # 같은 날이면 허용(그날 23:59 까지)
+    ok = make_schedule(client, start_at="2026-11-30T21:00", end_date="2026-11-30")
+    assert ok["end_date"] == "2026-11-30"
+
+
+def test_end_date_stops_recurring_schedule_and_marks_finished(client):
+    schedule = make_schedule(
+        client,
+        numbers=["010-9090-0001"],
+        repeat_count=1,
+        start_at="2026-11-20T09:00",
+        recurrence="daily",
+        end_date="2026-11-20",
+    )
+    conn = _conn()
+    try:
+        created = scheduler.run_due_schedules(conn, parse_dt("2026-11-22T10:00:00+09:00"))
+    finally:
+        conn.close()
+    assert created == []  # 종료일이 지나 실행을 만들지 않는다
+
+    after = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
+    assert after["status"] == "finished"
+    assert after["next_run_at"] is None
+    assert after["end_date_expired"] is True
+    assert client.get("/api/runs").json()["runs"] == []
+
+
+def test_end_date_runs_on_last_day_then_finishes(client):
+    schedule = make_schedule(
+        client,
+        numbers=["010-9090-0002"],
+        repeat_count=1,
+        start_at="2026-11-20T09:00",
+        recurrence="daily",
+        end_date="2026-11-21",
+    )
+    conn = _conn()
+    try:
+        # 20일: 종료일 전이므로 실행
+        first = scheduler.run_due_schedules(conn, parse_dt("2026-11-20T10:00:00+09:00"))
+        row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule["id"],)).fetchone()
+        assert first and row["status"] == "active"
+        assert row["next_run_at"].startswith("2026-11-21T09:00")
+
+        # 21일(종료일 당일): 마지막 실행 후 종료
+        second = scheduler.run_due_schedules(conn, parse_dt("2026-11-21T10:00:00+09:00"))
+        row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule["id"],)).fetchone()
+    finally:
+        conn.close()
+    assert second
+    assert row["status"] == "finished"
+    assert row["next_run_at"] is None
+    runs = client.get("/api/runs").json()["runs"]
+    assert len(runs) == 2
+    assert all(run["schedule_id"] == schedule["id"] for run in runs)
+
+
+def test_end_date_past_finishes_schedule_with_future_next_run(client):
+    """예전에 저장된 예약 시각이 종료일 뒤로 잡혀 있어도 스케줄러가 종료 처리한다."""
+    schedule = make_schedule(
+        client,
+        numbers=["010-9090-0003"],
+        repeat_count=1,
+        start_at="2026-11-23T09:00",
+        recurrence="daily",
+        end_date="2026-11-23",
+    )
+    conn = _conn()
+    try:
+        # 종료일 뒤로 예약이 밀린 상태를 흉내 낸다.
+        conn.execute(
+            "UPDATE schedules SET next_run_at = ? WHERE id = ?",
+            ("2026-11-25T09:00:00+09:00", schedule["id"]),
+        )
+        finished = scheduler.finish_expired_schedules(conn, parse_dt("2026-11-23T10:00:00+09:00"))
+        row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule["id"],)).fetchone()
+    finally:
+        conn.close()
+    assert finished == [schedule["id"]]
+    assert row["status"] == "finished"
+    assert row["next_run_at"] is None
+
+
+def test_end_date_preserved_on_copy_and_edit(client):
+    schedule = make_schedule(
+        client, start_at="2026-11-23T09:00", recurrence="daily", end_date="2026-11-30"
+    )
+    copied = client.post(f"/api/schedules/{schedule['id']}/copy", json={}).json()["schedule"]
+    assert copied["end_date"] == "2026-11-30"
+
+    # 종료일만 늘리면 값이 그대로 저장된다.
+    edited = client.patch(f"/api/schedules/{schedule['id']}", json={"end_date": "2026-12-15"}).json()["schedule"]
+    assert edited["end_date"] == "2026-12-15"
+
+    # 종료일을 지우면 종료일 없이 반복한다.
+    cleared = client.patch(f"/api/schedules/{schedule['id']}", json={"end_date": ""}).json()["schedule"]
+    assert cleared["end_date"] == ""
+
+    # 이름만 고쳐도 종료일은 유지된다.
+    renamed = client.patch(f"/api/schedules/{copied['id']}", json={"name": "이름만 변경"}).json()["schedule"]
+    assert renamed["end_date"] == "2026-11-30"
+
+
+def test_edit_end_date_before_start_rejected(client):
+    schedule = make_schedule(client, start_at="2026-11-23T09:00", recurrence="daily")
+    response = client.patch(f"/api/schedules/{schedule['id']}", json={"end_date": "2026-11-22"})
+    assert response.status_code == 422
+
+
+def test_finished_schedule_reactivates_when_end_date_extended(client):
+    schedule = make_schedule(
+        client,
+        numbers=["010-9090-0004"],
+        repeat_count=1,
+        start_at="2026-11-20T09:00",
+        recurrence="daily",
+        end_date="2026-11-20",
+    )
+    conn = _conn()
+    try:
+        scheduler.run_due_schedules(conn, parse_dt("2026-11-22T10:00:00+09:00"))
+    finally:
+        conn.close()
+    assert client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]["status"] == "finished"
+
+    extended = client.patch(
+        f"/api/schedules/{schedule['id']}", json={"end_date": "2026-12-31"}
+    ).json()["schedule"]
+    assert extended["status"] == "active"
+    assert extended["next_run_at"] is not None
+
+
+def test_resume_after_end_date_is_blocked(client):
+    schedule = make_schedule(
+        client,
+        start_at="2026-11-20T09:00",
+        recurrence="daily",
+        end_date="2026-11-20",
+    )
+    client.post(f"/api/schedules/{schedule['id']}/pause")
+    response = client.post(f"/api/schedules/{schedule['id']}/resume")
+    assert response.status_code == 400
+    assert "종료일" in response.text
+    assert client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]["status"] == "finished"
+
+
+def test_end_date_column_added_by_migration(tmp_path, monkeypatch):
+    """예전 DB(운영 중 Railway 볼륨)에 end_date 컬럼이 손실 없이 추가된다."""
+    old_db = tmp_path / "old.db"
+    conn = sqlite3.connect(old_db)
+    conn.executescript(
+        """
+        CREATE TABLE schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL DEFAULT '',
+            type TEXT NOT NULL,
+            numbers TEXT NOT NULL,
+            repeat_count INTEGER NOT NULL DEFAULT 1,
+            order_mode TEXT NOT NULL DEFAULT 'sequence',
+            max_call_duration_sec INTEGER,
+            sms_body TEXT,
+            start_at TEXT NOT NULL,
+            recurrence TEXT NOT NULL DEFAULT 'once',
+            device_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            next_run_at TEXT,
+            last_run_at TEXT,
+            run_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """INSERT INTO schedules(name, type, numbers, repeat_count, start_at, recurrence, status, created_at)
+           VALUES ('운영 스케줄', 'call', '["02-2192-0200"]', 1, '2026-11-22T08:54:00+09:00', 'daily', 'paused',
+                   '2026-11-22T08:00:00+09:00')"""
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(config, "DB_PATH", old_db)
+    db.init_db()
+
+    conn = sqlite3.connect(old_db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM schedules").fetchone()
+    conn.close()
+    assert row["end_date"] == ""  # 기존 스케줄은 종료일 없음(그대로 반복)
+    assert row["name"] == "운영 스케줄"
+
+
+# --------------------------------------------------------------------------
+# 25. 문자(SMS) 자동 발송 · 앱 poll 계약 · 보낸 회수 관리
+# --------------------------------------------------------------------------
+ANDROID_TASK_FIELDS = {
+    "id",
+    "type",
+    "phone_number",
+    "max_call_duration_sec",
+    "sms_body",
+    "schedule_name",
+    "repeat_index",
+}
+
+
+def test_sms_schedule_multi_device_enqueue_and_poll_payload(client):
+    """문자 스케줄이 기기마다 같은 건수로 만들어지고, 앱(v1.3.6)이 읽는 필드로 내려간다."""
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(
+        client,
+        type="sms",
+        numbers=["010-7777-0001", "010-7777-0002"],
+        repeat_count=1,
+        total_calls=2,
+        sms_body="안녕하세요. 안내 문자입니다.",
+        max_call_duration_sec=None,
+        target_device_ids=["DEV-A", "DEV-B"],
+    )
+    assert schedule["type"] == "sms"
+    assert schedule["tasks_per_device"] == 2
+    assert schedule["tasks_per_run"] == 4
+
+    run = client.post(f"/api/schedules/{schedule['id']}/run-now").json()
+    tasks = _tasks_in_run(client, run["run_id"])
+    assert len(tasks) == 4
+    assert {task["device_id"] for task in tasks} == {"DEV-A", "DEV-B"}
+    assert all(task["type"] == "sms" and task["sms_body"] == "안녕하세요. 안내 문자입니다." for task in tasks)
+
+    polled = client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"]
+    assert polled is not None
+    assert ANDROID_TASK_FIELDS <= set(polled)
+    assert polled["type"] == "sms"
+    assert polled["sms_body"] == "안녕하세요. 안내 문자입니다."
+    assert polled["phone_number"] in ("010-7777-0001", "010-7777-0002")
+    assert polled["schedule_name"] == schedule["name"]
+    assert polled["repeat_index"] == 1
+    assert polled["max_call_duration_sec"] is None
+    assert polled["device_id"] == "DEV-A"
+
+    # 문자는 결과 보고도 전화와 같다(성공/실패).
+    done = client.post(
+        f"/api/tasks/{polled['id']}/result",
+        json={"device_id": "DEV-A", "status": "done", "result": "문자 발송 완료"},
+    )
+    assert done.status_code == 200
+    assert done.json()["task"]["status"] == "done"
+
+
+def test_schedule_list_includes_sent_counts(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    schedule = make_schedule(
+        client,
+        type="sms",
+        numbers=["010-8888-0001", "010-8888-0002"],
+        repeat_count=1,
+        total_calls=4,
+        sms_body="보낸 회수 테스트",
+        max_call_duration_sec=None,
+        target_device_ids=["DEV-A"],
+    )
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    run_tasks = client.get("/api/tasks", params={"schedule_id": schedule["id"]}).json()["tasks"]
+    assert len(run_tasks) == 4
+    first, second = run_tasks[0], run_tasks[1]
+    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-A", "status": "done"})
+    client.post(
+        f"/api/tasks/{second['id']}/result",
+        json={"device_id": "DEV-A", "status": "failed", "error": "통신사 오류"},
+    )
+
+    listed = next(s for s in client.get("/api/schedules").json()["schedules"] if s["id"] == schedule["id"])
+    stats = listed["stats"]
+    assert stats["done_count"] == 1
+    assert stats["failed_count"] == 1
+    assert stats["pending_count"] == 2
+    assert stats["total_tasks"] == 4
+    assert stats["run_count"] == 1
+    assert stats["last_sent_at"]
+
+
+def test_schedule_stats_endpoint_per_number_and_device(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    schedule = make_schedule(
+        client,
+        type="sms",
+        numbers=["010-9999-0001", "010-9999-0002"],
+        repeat_count=1,
+        total_calls=2,
+        sms_body="상세 집계",
+        max_call_duration_sec=None,
+        target_device_ids=["DEV-A", "DEV-B"],
+    )
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    tasks = client.get("/api/tasks", params={"schedule_id": schedule["id"], "limit": 100}).json()["tasks"]
+    # DEV-A 의 0001 은 성공, DEV-A 의 0002 는 대기, DEV-B 의 0001 은 실패
+    by_key = {(task["device_id"], task["phone_number"]): task for task in tasks}
+    assert len(by_key) == 4
+    client.post(
+        f"/api/tasks/{by_key[('DEV-A', '010-9999-0001')]['id']}/result",
+        json={"device_id": "DEV-A", "status": "done"},
+    )
+    client.post(
+        f"/api/tasks/{by_key[('DEV-B', '010-9999-0001')]['id']}/result",
+        json={"device_id": "DEV-B", "status": "failed", "error": "전송 실패"},
+    )
+
+    detail = client.get(f"/api/schedules/{schedule['id']}/stats").json()
+    assert detail["schedule_id"] == schedule["id"]
+    assert detail["type"] == "sms"
+    assert detail["done_count"] == 1
+    assert detail["failed_count"] == 1
+    assert detail["pending_count"] == 2
+    assert detail["total_tasks"] == 4
+
+    # 번호별: 등록 순서 그대로
+    assert [entry["number"] for entry in detail["numbers"]] == ["010-9999-0001", "010-9999-0002"]
+    by_number = {entry["number"]: entry for entry in detail["numbers"]}
+    assert by_number["010-9999-0001"]["total_tasks"] == 2
+    assert by_number["010-9999-0001"]["done_count"] == 1
+    assert by_number["010-9999-0001"]["failed_count"] == 1
+    assert by_number["010-9999-0001"]["last_sent_text"] != "-"
+    assert by_number["010-9999-0002"]["pending_count"] == 2
+    assert by_number["010-9999-0002"]["last_sent_at"] is None
+
+    # 기기별: 이름·수신 번호가 붙는다
+    by_device = {entry["device_id"]: entry for entry in detail["devices"]}
+    assert set(by_device) == {"DEV-A", "DEV-B"}
+    assert by_device["DEV-A"]["device_name"] == "갤럭시 A"
+    assert by_device["DEV-A"]["phone_number"] == "010-1111-2222"
+    assert by_device["DEV-A"]["done_count"] == 1
+    assert by_device["DEV-A"]["pending_count"] == 1
+    assert by_device["DEV-B"]["failed_count"] == 1
+    assert by_device["DEV-B"]["phone_number"] == "010-3333-4444"
+
+    assert client.get("/api/schedules/9999/stats").status_code == 404
+
+
+def test_schedule_stats_excludes_deleted_tasks(client):
+    schedule = make_schedule(client, numbers=["010-1212-0001"], repeat_count=1, start_at="2026-11-20T09:00")
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    task = client.get("/api/tasks", params={"schedule_id": schedule["id"]}).json()["tasks"][0]
+    assert client.delete(f"/api/tasks/{task['id']}").status_code == 200
+
+    detail = client.get(f"/api/schedules/{schedule['id']}/stats").json()
+    assert detail["total_tasks"] == 0
+    assert detail["done_count"] == 0
+    assert detail["numbers"][0]["number"] == "010-1212-0001"
+    assert detail["numbers"][0]["total_tasks"] == 0
+
+
+def test_global_stats_separates_sent_calls_and_sms(client):
+    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    sms = make_schedule(
+        client,
+        type="sms",
+        numbers=["010-5555-0001"],
+        repeat_count=1,
+        sms_body="발신 집계",
+        max_call_duration_sec=None,
+        target_device_ids=["DEV-A"],
+        start_at="2026-11-20T09:00",
+    )
+    call = make_schedule(
+        client,
+        numbers=["010-5555-0002"],
+        repeat_count=1,
+        target_device_ids=["DEV-A"],
+        start_at="2026-11-20T09:00",
+    )
+    client.post(f"/api/schedules/{sms['id']}/run-now")
+    client.post(f"/api/schedules/{call['id']}/run-now")
+    for task in client.get("/api/tasks", params={"limit": 100}).json()["tasks"]:
+        client.post(f"/api/tasks/{task['id']}/result", json={"device_id": "DEV-A", "status": "done"})
+
+    stats = client.get("/api/stats").json()
+    assert stats["sent"]["sms_done"] == 1
+    assert stats["sent"]["call_done"] == 1
+    assert stats["sent"]["sms_failed"] == 0
+    assert stats["sent"]["sms_today"] == 1
+    assert stats["sent"]["call_today"] == 1
+    # 수신 문자 수와 발신 문자 수는 따로 센다.
+    assert stats["sms"]["today"] == 0

@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS schedules (
     max_call_duration_sec  INTEGER,
     sms_body               TEXT,
     start_at               TEXT NOT NULL,
+    -- 실행 종료일(YYYY-MM-DD). 비어 있으면 종료일 없이 계속 반복한다.
+    end_date               TEXT NOT NULL DEFAULT '',
     recurrence             TEXT NOT NULL DEFAULT 'once',
     device_id              TEXT,
     target_device_ids      TEXT NOT NULL DEFAULT '[]',
@@ -216,6 +218,10 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
         # 총 발신 횟수(지정 시 번호 개수 × 반복 횟수 대신 사용). 기존 스케줄은 NULL = 기존 방식 유지.
         conn.execute("ALTER TABLE schedules ADD COLUMN total_calls INTEGER")
         added.append("schedules.total_calls")
+    if "end_date" not in schedule_columns:
+        # 실행 종료일(선택). 기존 스케줄은 빈 값 = 종료일 없음(지금까지처럼 계속 반복).
+        conn.execute("ALTER TABLE schedules ADD COLUMN end_date TEXT NOT NULL DEFAULT ''")
+        added.append("schedules.end_date")
     if "target_device_ids" not in schedule_columns:
         # 발신 기기 여러 대 지정(JSON 배열). 기존 스케줄의 device_id 는 그대로 두고 배열에도 옮겨 담는다.
         conn.execute("ALTER TABLE schedules ADD COLUMN target_device_ids TEXT NOT NULL DEFAULT '[]'")

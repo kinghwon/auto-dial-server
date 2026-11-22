@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Iterable
 
 from . import config, db
-from .timeutil import iso, next_occurrence, now, parse_dt
+from .timeutil import end_date_deadline, iso, next_occurrence, now, parse_dt
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,67 @@ def _advance_next_run(schedule_row, current: datetime) -> datetime | None:
     while candidate is not None and candidate <= current and guard < 1000:
         candidate = next_occurrence(candidate, recurrence)
         guard += 1
+    return _clamp_to_end_date(schedule_row, candidate)
+
+
+def _clamp_to_end_date(schedule_row, candidate: datetime | None) -> datetime | None:
+    """다음 실행 시각이 종료일(그날 23:59:59)보다 뒤면 실행하지 않는다(None)."""
+    if candidate is None:
+        return None
+    end_date = _row_end_date(schedule_row)
+    deadline = end_date_deadline(end_date)
+    if deadline is not None and candidate > deadline:
+        return None
     return candidate
+
+
+def _row_end_date(schedule_row) -> str:
+    """예전 DB(컬럼 없음)와도 안전하게 종료일을 읽는다."""
+    try:
+        keys = schedule_row.keys()
+    except AttributeError:
+        return ""
+    if "end_date" not in keys:
+        return ""
+    return (schedule_row["end_date"] or "").strip()
+
+
+def is_end_date_expired(schedule_row, current: datetime | None = None) -> bool:
+    """종료일이 지났는지(그날 23:59:59 초과) 확인한다."""
+    current = current or now()
+    deadline = end_date_deadline(_row_end_date(schedule_row))
+    return deadline is not None and current > deadline
+
+
+def finish_expired_schedules(conn, current: datetime | None = None) -> list[int]:
+    """종료일이 지난 활성 스케줄을 종료 처리한다.
+
+    예약 시각이 종료일 뒤로 잠겨 있어 저절로 만기가 오지 않는 스케줄까지
+    목록에서 분명히 '종료'로 보이도록 스케줄러 1주기마다 확인한다.
+    """
+    current = current or now()
+    rows = conn.execute(
+        """SELECT * FROM schedules
+           WHERE status = 'active' AND deleted_at IS NULL AND COALESCE(end_date, '') <> ''"""
+    ).fetchall()
+    finished: list[int] = []
+    for row in rows:
+        deadline = end_date_deadline(_row_end_date(row))
+        if deadline is None:
+            continue
+        next_at = parse_dt(row["next_run_at"]) if row["next_run_at"] else None
+        if current > deadline or (next_at is not None and next_at > deadline):
+            conn.execute(
+                "UPDATE schedules SET next_run_at = NULL, status = 'finished' WHERE id = ?",
+                (row["id"],),
+            )
+            db.log(
+                conn,
+                f"스케줄 '{row['name']}' 종료일({row['end_date']}) 도달 → 더 이상 실행하지 않습니다.",
+                category="schedule",
+            )
+            finished.append(int(row["id"]))
+    return finished
 
 
 def run_due_schedules(conn, current: datetime | None = None) -> list[int]:
@@ -228,6 +288,18 @@ def run_due_schedules(conn, current: datetime | None = None) -> list[int]:
 
     created_runs: list[int] = []
     for row in rows:
+        # 종료일이 지난 스케줄은 실행을 만들지 않고 종료 처리한다.
+        if is_end_date_expired(row, current):
+            conn.execute(
+                "UPDATE schedules SET next_run_at = NULL, status = 'finished' WHERE id = ?",
+                (row["id"],),
+            )
+            db.log(
+                conn,
+                f"스케줄 '{row['name']}' 종료일({row['end_date']})이 지나 실행하지 않았습니다.",
+                category="schedule",
+            )
+            continue
         run_id = create_run(conn, row, parse_dt(row["next_run_at"]) or current)
         next_at = _advance_next_run(row, current)
         status = "finished" if next_at is None else "active"
@@ -235,6 +307,12 @@ def run_due_schedules(conn, current: datetime | None = None) -> list[int]:
             "UPDATE schedules SET next_run_at = ?, status = ? WHERE id = ?",
             (iso(next_at), status, row["id"]),
         )
+        if next_at is None and _row_end_date(row) and status == "finished":
+            db.log(
+                conn,
+                f"스케줄 '{row['name']}' 마지막 실행 후 종료일({row['end_date']})에 도달해 종료되었습니다.",
+                category="schedule",
+            )
         if run_id:
             created_runs.append(run_id)
     return created_runs
@@ -328,12 +406,18 @@ def retry_pending_telegram(conn, limit: int = 10) -> int:
 
 
 def tick(conn, current: datetime | None = None) -> dict:
-    """스케줄러 1회 주기: 만기 실행 → 응답 없는 작업 회수 → 텔레그램 재시도."""
+    """스케줄러 1회 주기: 만기 실행 → 종료일 지난 스케줄 정리 → 응답 없는 작업 회수 → 텔레그램 재시도."""
     current = current or now()
     created = run_due_schedules(conn, current)
+    expired = finish_expired_schedules(conn, current)
     reaped = reap_stale_tasks(conn, current)
     retried = retry_pending_telegram(conn)
-    return {"runs_created": len(created), "tasks_reaped": reaped, "telegram_retried": retried}
+    return {
+        "runs_created": len(created),
+        "schedules_finished": len(expired),
+        "tasks_reaped": reaped,
+        "telegram_retried": retried,
+    }
 
 
 # --------------------------------------------------------------------------

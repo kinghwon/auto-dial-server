@@ -7,9 +7,33 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import config
-from .timeutil import RECURRENCES, parse_dt
+from .timeutil import RECURRENCES, end_date_deadline, parse_dt
 
 PHONE_RE = re.compile(r"^[0-9+\-()#*\s]{3,30}$")
+END_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def clean_end_date(value: str | None) -> str:
+    """실행 종료일. 'YYYY-MM-DD 또는 빈 값("" = 종료일 없음)만 받는다."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if not END_DATE_RE.match(text) or end_date_deadline(text) is None:
+        raise ValueError(f"실행 종료일은 YYYY-MM-DD 형식의 실제 날짜로 입력하세요: {text}")
+    return text
+
+
+def ensure_end_date_after_start(end_date: str, start_at, label: str = "실행 시각") -> None:
+    """시작 시각이 종료일 23:59:59 보다 뒤면 안 된다(그 스케줄은 한 번도 실행되지 않는다)."""
+    if not end_date:
+        return
+    deadline = end_date_deadline(end_date)
+    start = parse_dt(start_at) if start_at else None
+    if deadline is not None and start is not None and start > deadline:
+        raise ValueError(
+            f"{label}({start.strftime('%Y-%m-%d %H:%M')})이 실행 종료일({end_date})보다 뒤입니다. "
+            "시작 시각이나 종료일을 다시 정하세요."
+        )
 
 
 def clean_numbers(values: list[str] | str) -> list[str]:
@@ -188,6 +212,8 @@ class ScheduleCreate(ScheduleBase):
     max_call_duration_sec: Optional[int] = Field(default=None, ge=1, le=config.MAX_CALL_MAX_SEC)
     sms_body: Optional[str] = Field(default=None, max_length=2000)
     start_at: str
+    # 실행 종료일(YYYY-MM-DD). 비우면 종료일 없이 계속 반복한다.
+    end_date: str = Field(default="", max_length=10)
     recurrence: Literal["once", "daily", "weekly", "monthly"] = "once"
     # 발신 기기 한 대(예전 형식). 여러 대를 고를 때는 target_device_ids 를 쓴다.
     device_id: Optional[str] = Field(default=None, max_length=64)
@@ -203,6 +229,11 @@ class ScheduleCreate(ScheduleBase):
             raise ValueError("실행 시각을 입력하세요.")
         return value.strip()
 
+    @field_validator("end_date")
+    @classmethod
+    def _end_date(cls, value: str | None) -> str:
+        return clean_end_date(value)
+
     @model_validator(mode="after")
     def _check_type_fields(self):
         if self.type == "call":
@@ -215,6 +246,7 @@ class ScheduleCreate(ScheduleBase):
             self.max_call_duration_sec = None
         if self.recurrence not in RECURRENCES:
             raise ValueError("반복 주기는 once/daily/weekly/monthly 중 하나여야 합니다.")
+        ensure_end_date_after_start(self.end_date, self.start_at)
         if not self.name.strip():
             label = "전화" if self.type == "call" else "문자"
             self.name = f"{label} 발신 {self.start_at[5:16].replace('T', ' ')}"
@@ -247,6 +279,8 @@ class ScheduleUpdate(ScheduleBase):
     max_call_duration_sec: Optional[int] = Field(default=None, ge=1, le=config.MAX_CALL_MAX_SEC)
     sms_body: Optional[str] = Field(default=None, max_length=2000)
     start_at: Optional[str] = None
+    # 실행 종료일(YYYY-MM-DD). '' 을 보내면 종료일을 지운다(None = 그대로).
+    end_date: Optional[str] = Field(default=None, max_length=10)
     recurrence: Optional[Literal["once", "daily", "weekly", "monthly"]] = None
     device_id: Optional[str] = Field(default=None, max_length=64)
     target_device_id: Optional[str] = Field(default=None, max_length=64)
@@ -261,6 +295,13 @@ class ScheduleUpdate(ScheduleBase):
         if parse_dt(value) is None:
             raise ValueError("실행 시각을 입력하세요.")
         return value.strip()
+
+    @field_validator("end_date")
+    @classmethod
+    def _end_date(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return clean_end_date(value)
 
     @model_validator(mode="after")
     def _require_change(self):

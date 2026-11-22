@@ -140,6 +140,32 @@
   .seg input{display:none}
   .seg input:checked + span{color:#fff}
   .seg label:has(input:checked){background:var(--primary);color:#fff;box-shadow:0 2px 8px rgba(47,107,237,.25)}
+
+  /* 전화/문자 발신 유형 카드 */
+  .type-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  @media(max-width:760px){.type-cards{grid-template-columns:1fr}}
+  .type-card{position:relative;display:flex;gap:11px;align-items:flex-start;border:1.5px solid var(--line-strong);border-radius:12px;background:#fff;padding:12px 14px;cursor:pointer;transition:.15s;margin:0;font-weight:500}
+  .type-card:hover{border-color:#c3cee0;background:#fafbfe}
+  .type-card input{position:absolute;opacity:0;width:1px;height:1px}
+  .type-card:has(input:checked){border-color:var(--primary);background:#f3f7ff;box-shadow:0 3px 14px rgba(47,107,237,.14)}
+  .type-card .tc-icon{font-size:20px;line-height:1.1;flex:0 0 auto}
+  .type-card b{display:block;font-size:14px;color:var(--text)}
+  .type-card small{display:block;margin-top:3px;font-size:11.5px;font-weight:500;color:var(--muted);line-height:1.5}
+  .type-card .tc-check{margin-left:auto;color:var(--primary);font-weight:800;opacity:0;transition:.15s}
+  .type-card:has(input:checked) .tc-check{opacity:1}
+  .sms-counter{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:11.5px;color:var(--muted)}
+  .sms-counter b{color:var(--primary);font-weight:700}
+  .sms-counter .over{color:var(--danger);font-weight:700}
+  #smsBodyField.on{border-radius:12px;background:#f6fbf7;border:1px dashed #bfe4cb;padding:8px 10px}
+  .sms-preview{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+  .sent-line{font-size:11.5px;white-space:nowrap;color:#4b5a72}
+  .sent-line .ok{color:var(--ok);font-weight:700}
+  .sent-line .fail{color:var(--danger);font-weight:700}
+  .mini-table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .mini-table th,.mini-table td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+  .mini-table th{color:var(--muted);font-size:11.5px;font-weight:700;background:#fafbfe}
+  .mini-table td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .mini-table tr:last-child td{border-bottom:none}
   .summary{background:#f7f9fe;border:1px dashed #cfdcf6;border-radius:10px;padding:11px 13px;font-size:12.5px;color:#33456b}
   .summary b{color:var(--primary)}
   .switch{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:600;color:#3a465c}
@@ -256,6 +282,7 @@
   <!-- ================= 대시보드 ================= -->
   <section class="tabpane active" id="pane-dashboard">
     <div class="stats" id="statCards"></div>
+    <div class="hint-line" id="sentSummary"></div>
 
     <div class="grid2" style="margin-top:18px">
       <div class="card">
@@ -443,10 +470,20 @@
           </div>
 
           <div class="field span2">
-            <label>발신 유형</label>
-            <div class="seg">
-              <label><input type="radio" name="schedType" value="call" checked onchange="toggleTypeFields()"><span>📞 전화 발신</span></label>
-              <label><input type="radio" name="schedType" value="sms" onchange="toggleTypeFields()"><span>💬 문자 발신</span></label>
+            <label>발신 유형 <span class="hint">전화를 걸지, 문자를 보낼지 먼저 고르세요</span></label>
+            <div class="type-cards" role="radiogroup" aria-label="발신 유형">
+              <label class="type-card">
+                <input type="radio" name="schedType" value="call" checked onchange="toggleTypeFields()">
+                <span class="tc-icon">📞</span>
+                <span><b>전화 발신</b><small>번호로 전화를 걸고 통화 제한 시간이 지나면 폰이 끊습니다.</small></span>
+                <span class="tc-check">✓</span>
+              </label>
+              <label class="type-card">
+                <input type="radio" name="schedType" value="sms" onchange="toggleTypeFields()">
+                <span class="tc-icon">💬</span>
+                <span><b>문자 발신</b><small>아래에 쓴 문자 내용을 번호마다 그대로 보냅니다.</small></span>
+                <span class="tc-check">✓</span>
+              </label>
             </div>
           </div>
 
@@ -478,9 +515,10 @@
           </div>
 
           <div class="field span2" id="smsBodyField" style="display:none">
-            <label>문자 내용</label>
-            <textarea id="schedSmsBody" placeholder="보낼 문자 내용을 입력하세요." maxlength="2000" oninput="updateSummary()"></textarea>
-            <div class="help">90자(한글 45자)가 넘으면 자동으로 나눠서 발송됩니다.</div>
+            <label>문자 내용 <span class="hint">모든 번호에 같은 내용이 발송됩니다</span></label>
+            <textarea id="schedSmsBody" placeholder="보낼 문자 내용을 입력하세요." maxlength="2000" oninput="updateSmsCounter()"></textarea>
+            <div class="sms-counter" id="schedSmsCount">0자 · 0바이트 · SMS 1건</div>
+            <div class="help">90바이트(한글 45자)까지 SMS 1건, 넘으면 LMS로 나뉘고 앱이 자동으로 분할 발송합니다. 최대 2000자.</div>
           </div>
 
           <div class="field">
@@ -490,12 +528,18 @@
 
           <div class="field">
             <label>반복 주기</label>
-            <select id="schedRecurrence">
+            <select id="schedRecurrence" onchange="updateSummary()">
               <option value="once">1회만</option>
               <option value="daily">매일</option>
               <option value="weekly">매주</option>
               <option value="monthly">매월</option>
             </select>
+          </div>
+
+          <div class="field">
+            <label>실행 종료 일자 <span class="hint">선택</span></label>
+            <input type="date" id="schedEndDate" onchange="updateSummary()">
+            <div class="help">비워 두면 종료일 없이 반복 실행됩니다. 이 날짜(23:59)까지만 실행합니다.</div>
           </div>
 
           <div class="field span2">
@@ -540,7 +584,7 @@
         </div>
       </div>
       <div class="table-wrap"><table id="schedulesTable">
-        <thead><tr><th style="width:36px"><input type="checkbox" id="scheduleSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSchedules(this)"></th><th>스케줄</th><th>유형</th><th>발신 기기</th><th>발신량 / 순서</th><th>주기</th><th>다음 실행</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
+        <thead><tr><th style="width:36px"><input type="checkbox" id="scheduleSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSchedules(this)"></th><th>스케줄</th><th>유형</th><th>발신 기기</th><th>발신량 / 순서</th><th>주기 / 종료일</th><th>다음 실행</th><th>보낸 회수 (진행)</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -755,6 +799,17 @@
   </div>
 </div>
 
+<div class="modal" id="sentStatsModal">
+  <div class="box wide" style="max-width:780px">
+    <h3 id="sentStatsTitle">보낸 회수 상세</h3>
+    <p id="sentStatsSub">-</p>
+    <div id="sentStatsBody">불러오는 중…</div>
+    <div class="btn-row" style="margin-top:18px;justify-content:flex-end">
+      <button class="btn" onclick="closeSentStats()">닫기</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal lightbox" id="smsPhotoModal">
   <div class="box">
     <div class="lightbox-head">
@@ -927,11 +982,14 @@ async function loadHealth() {
 async function loadDashboard() {
   try {
     const stats = await api("/api/stats");
+    const sent = stats.sent || {
+      sms_today: 0, call_today: 0, sms_done: 0, sms_failed: 0, call_done: 0, call_failed: 0,
+    };
     const cards = [
       { label: "등록 기기", value: stats.devices.total, unit: "대", foot: `온라인 ${stats.devices.online}대`, accent: true },
       { label: "활성 스케줄", value: stats.schedules.active, unit: "개", foot: "예약 대기 중" },
       { label: "발신 대기", value: stats.tasks.pending, unit: "건", foot: "폰이 가져갈 작업" },
-      { label: "오늘 완료", value: stats.tasks.done_today, unit: "건", foot: `전화 ${stats.tasks.calls_today}건` },
+      { label: "오늘 완료", value: stats.tasks.done_today, unit: "건", foot: `전화 ${sent.call_today} · 문자 ${sent.sms_today}` },
       { label: "오늘 실패", value: stats.tasks.failed_today, unit: "건", foot: stats.tasks.failed_today ? "확인 필요" : "문제 없음" },
       { label: "오늘 수신 문자", value: stats.sms.today, unit: "건", foot: stats.sms.telegram_issue ? `전달 미완료 ${stats.sms.telegram_issue}건` : "모두 전달됨" },
     ];
@@ -941,6 +999,14 @@ async function loadDashboard() {
         <div class="value">${c.value}<small>${c.unit}</small></div>
         <div class="foot">${esc(c.foot)}</div>
       </div>`).join("");
+
+    if ($("sentSummary")) {
+      $("sentSummary").innerHTML =
+        `📞 전화 발신 누적 <b>${sent.call_done}</b>건 (실패 ${sent.call_failed}) · ` +
+        `💬 문자 발신 누적 <b>${sent.sms_done}</b>건 (실패 ${sent.sms_failed}) — ` +
+        `오늘 전화 ${sent.call_today}건 / 문자 ${sent.sms_today}건 발신했습니다. ` +
+        `(‘오늘 수신 문자’는 폰으로 <b>받은</b> 문자입니다)`;
+    }
 
     $("recentRunsTable").querySelector("tbody").innerHTML = stats.recent_runs.length
       ? stats.recent_runs.map((run) => `
@@ -1294,6 +1360,39 @@ function toggleTypeFields() {
   const isCall = scheduleType() === "call";
   $("callDurationField").style.display = isCall ? "" : "none";
   $("smsBodyField").style.display = isCall ? "none" : "";
+  $("smsBodyField").classList.toggle("on", !isCall);
+  if (!isCall) updateSmsCounter();
+  updateSummary();
+}
+
+/* 문자 내용 글자수·바이트(SMS/LMS) 계산: 한글은 2바이트(EUC-KR) 기준으로 센다. */
+function smsByteLength(text) {
+  let bytes = 0;
+  for (const ch of String(text || "")) {
+    const code = ch.codePointAt(0);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0xffff) bytes += 2;
+    else bytes += 4;
+  }
+  return bytes;
+}
+
+function smsKindLabel(bytes) {
+  if (bytes <= 90) return "SMS 1건";
+  if (bytes <= 2000) return "LMS(장문) 1건";
+  return "2000바이트 초과 · 여러 건으로 나뉘어 발송";
+}
+
+function updateSmsCounter() {
+  const el = $("schedSmsCount");
+  if (!el) return;
+  const text = $("schedSmsBody").value;
+  const chars = [...text].length;
+  const bytes = smsByteLength(text);
+  const over = bytes > 2000;
+  el.innerHTML = `<span>글자수 <b>${chars}</b>자</span><span>·</span>` +
+    `<span class="${over ? "over" : ""}">${bytes}바이트</span><span>·</span>` +
+    `<span class="${over ? "over" : ""}">${esc(smsKindLabel(bytes))}</span>`;
   updateSummary();
 }
 
@@ -1331,10 +1430,17 @@ function updateSummary() {
     : (deviceCount === 1
         ? `<div style="margin-top:6px" class="muted">선택한 기기 1대에서 ${total}건 발신</div>`
         : `<div style="margin-top:6px" class="muted">기기 지정 없음 · 온라인 기기들이 나눠서 총 ${total}건 발신</div>`);
+  const endDate = $("schedEndDate") ? $("schedEndDate").value : "";
+  const repeatLabel = RECURRENCE[$("schedRecurrence").value] || "1회";
+  const endLine = endDate
+    ? `<div style="margin-top:6px" class="muted">🗓️ ${esc(repeatLabel)} 반복 · <b>${esc(endDate)}</b> 까지만 실행 (그날 23:59 이후 중지)</div>`
+    : (($("schedRecurrence").value !== "once")
+        ? `<div style="margin-top:6px" class="muted">🗓️ ${esc(repeatLabel)} 반복 · 종료일 없음(직접 멈출 때까지 계속)</div>`
+        : "");
   $("schedSummary").innerHTML =
     `총 <b>${total}건</b> ${type === "call" ? "전화" : "문자"} 발신 · 번호 ${numbers.length}개 · ${rounds}바퀴` +
     `<div class="muted" style="margin-top:4px">${esc(ORDER_MODE[order] || order)}: ${esc(preview)}${esc(short)}${esc(extra)}</div>` +
-    multi;
+    multi + endLine;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1469,6 +1575,7 @@ function resetScheduleForm() {
   $("schedMaxSec").value = "30";
   $("schedSmsBody").value = "";
   $("schedStart").value = defaultStartValue();
+  $("schedEndDate").value = "";
   $("schedRecurrence").value = "once";
   state.schedDeviceAuto = true;
   state.schedDeviceIds.clear();
@@ -1496,6 +1603,7 @@ function openScheduleForm(schedule, quiet = false) {
   $("schedMaxSec").value = String(schedule.max_call_duration_sec || 30);
   $("schedSmsBody").value = schedule.sms_body || "";
   $("schedStart").value = toLocalInput(schedule.start_at) || defaultStartValue();
+  $("schedEndDate").value = schedule.end_date || "";
   $("schedRecurrence").value = schedule.recurrence || "once";
   const targets = (schedule.target_device_ids && schedule.target_device_ids.length)
     ? schedule.target_device_ids
@@ -1524,6 +1632,11 @@ async function createSchedule() {
   const rawTotal = parseInt($("sTotalCalls").value || "0", 10);
   if (rawTotal > 5000) { toast("총 통화 횟수는 5000건까지 지정할 수 있습니다.", "err"); return; }
   const totalCalls = rawTotal > 0 ? rawTotal : null;
+  const endDate = $("schedEndDate").value || "";
+  if (endDate && $("schedStart").value.slice(0, 10) > endDate) {
+    toast(`실행 시각(${$("schedStart").value.slice(0, 10)})이 실행 종료일(${endDate})보다 뒤입니다.`, "err");
+    return;
+  }
   const payload = {
     name: $("schedName").value.trim(),
     type,
@@ -1533,6 +1646,7 @@ async function createSchedule() {
     repeat_count: totalCalls !== null ? Math.min(1000, Math.max(1, Math.ceil(totalCalls / numbers.length))) : 1,
     order_mode: $("sOrder").value,
     start_at: $("schedStart").value,
+    end_date: endDate,
     recurrence: $("schedRecurrence").value,
     target_device_ids: scheduleTargetDeviceIds(),
     device_id: scheduleTargetDeviceIds().length === 1 ? scheduleTargetDeviceIds()[0] : null,
@@ -1591,8 +1705,11 @@ async function loadSchedules() {
             <td>${typeTag(s.type)}</td>
             <td>${scheduleDeviceCell(s)}</td>
             <td class="nowrap"><b>${esc(amountText)}</b><div class="muted" style="font-size:11.5px">${esc(orderText)} · 번호 ${s.number_count}개${esc(legacyText)}</div></td>
-            <td class="nowrap">${esc(RECURRENCE[s.recurrence] || s.recurrence)}<div class="muted" style="font-size:11.5px">${esc(s.start_at_text)}</div></td>
+            <td class="nowrap">${esc(RECURRENCE[s.recurrence] || s.recurrence)}<div class="muted" style="font-size:11.5px">시작 ${esc(s.start_at_text)}</div>${s.end_date
+              ? `<div class="muted" style="font-size:11.5px">종료일 ${esc(s.end_date)}</div>${s.end_date_expired ? `<div style="margin-top:3px">${badge("종료일 만료", "b-warn")}</div>` : ""}`
+              : `<div class="muted" style="font-size:11.5px">종료일 없음</div>`}</td>
             <td class="nowrap">${s.next_run_at ? esc(s.next_run_text) : '<span class="muted">-</span>'}</td>
+            <td style="min-width:170px">${sentStatsCell(s)}</td>
             <td style="min-width:130px">${latestCell}</td>
             <td>${statusBadge(SCHED_STATUS, s.status)}</td>
             <td>
@@ -1608,13 +1725,79 @@ async function loadSchedules() {
             </td>
           </tr>`;
         }).join("")
-      : emptyRow(10, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
+      : emptyRow(11, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
 
     const activeIds = new Set(data.schedules.map((s) => s.id));
     Array.from(state.selectedSchedules).forEach((id) => { if (!activeIds.has(id)) state.selectedSchedules.delete(id); });
     updateScheduleToolbar();
     syncScheduleSelectAll();
   } catch (e) { toast(e.message, "err"); }
+}
+
+/* 스케줄 목록의 보낸 회수(진행) 칸: 성공·실패·대기 + 문자 미리보기 + 상세 버튼 */
+function sentStatsCell(s) {
+  const st = s.stats || {};
+  const done = st.done_count || 0;
+  const failed = st.failed_count || 0;
+  const pending = st.pending_count || 0;
+  const preview = s.type === "sms" && s.sms_body
+    ? `<div class="sms-preview" title="${esc(s.sms_body)}">💬 ${esc(s.sms_body)}</div>`
+    : "";
+  return `<div class="sent-line"><span class="ok">성공 ${done}</span> · <span class="fail">실패 ${failed}</span> · 대기 ${pending}</div>` +
+    preview +
+    `<div style="margin-top:5px"><button class="btn sm" onclick="openSentStats(${s.id})">보낸 회수 상세</button></div>`;
+}
+
+/* 보낸 회수 상세 모달: 전체·번호별·기기별 성공/실패/대기 */
+async function openSentStats(id) {
+  $("sentStatsModal").classList.add("show");
+  $("sentStatsTitle").textContent = "보낸 회수 상세";
+  $("sentStatsSub").textContent = "불러오는 중…";
+  $("sentStatsBody").innerHTML = "";
+  try {
+    const data = await api(`/api/schedules/${id}/stats`);
+    renderSentStats(data);
+  } catch (e) {
+    $("sentStatsSub").textContent = "-";
+    $("sentStatsBody").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    toast(e.message, "err");
+  }
+}
+
+function closeSentStats() { $("sentStatsModal").classList.remove("show"); }
+
+function renderSentStats(data) {
+  $("sentStatsTitle").textContent = `보낸 회수 상세 · #${data.schedule_id} ${data.name || ""}`;
+  const parts = [
+    data.type === "sms" ? "💬 문자 발신" : "📞 전화 발신",
+    `성공 ${data.done_count}건`,
+    `실패 ${data.failed_count}건`,
+    `대기 ${data.pending_count}건`,
+    `취소 ${data.skipped_count}건`,
+    `실행 ${data.run_count}회`,
+  ];
+  if (data.end_date) parts.push(`종료일 ${data.end_date}${data.end_date_expired ? " (만료)" : ""}`);
+  $("sentStatsSub").textContent = parts.join(" · ");
+
+  const counts = (c) => `<td class="num ok" style="color:var(--ok);font-weight:700">${c.done_count}</td>` +
+    `<td class="num" style="color:var(--danger);font-weight:700">${c.failed_count}</td>` +
+    `<td class="num">${c.pending_count}</td><td class="num muted">${c.skipped_count}</td><td class="num muted">${c.total_tasks}</td>`;
+
+  const numberRows = data.numbers.length
+    ? data.numbers.map((n) => `<tr><td class="mono">${esc(n.number)}</td>${counts(n)}<td class="muted">${esc(n.last_sent_text)}</td></tr>`).join("")
+    : `<tr><td colspan="7" class="muted">번호별 발신 기록이 없습니다.</td></tr>`;
+  const deviceRows = data.devices.length
+    ? data.devices.map((d) => `<tr><td><b>${esc(d.device_name)}</b><div class="muted mono" style="font-size:11px">${esc(d.device_id || "-")} ${d.phone_number ? "· " + esc(d.phone_number) : ""}</div></td>${counts(d)}<td class="muted">${esc(d.last_sent_text)}</td></tr>`).join("")
+    : `<tr><td colspan="7" class="muted">기기별 발신 기록이 없습니다.</td></tr>`;
+
+  $("sentStatsBody").innerHTML =
+    `<div class="summary" style="margin-bottom:14px">전체 <b>${data.total_tasks}건</b> 중 ` +
+      `<b>성공 ${data.done_count}건</b> · 실패 ${data.failed_count}건 · 대기 ${data.pending_count}건 · 취소 ${data.skipped_count}건` +
+      `<div class="muted" style="margin-top:4px">마지막 성공 발신 ${esc(data.last_sent_text)}</div></div>` +
+    `<h3 style="font-size:14px;margin:14px 0 8px">번호별 보낸 횟수</h3>` +
+    `<div class="table-wrap"><table class="mini-table"><thead><tr><th>번호</th><th class="num">성공</th><th class="num">실패</th><th class="num">대기</th><th class="num">취소</th><th class="num">전체</th><th>마지막 발신</th></tr></thead><tbody>${numberRows}</tbody></table></div>` +
+    `<h3 style="font-size:14px;margin:18px 0 8px">기기별 보낸 횟수</h3>` +
+    `<div class="table-wrap"><table class="mini-table"><thead><tr><th>기기</th><th class="num">성공</th><th class="num">실패</th><th class="num">대기</th><th class="num">취소</th><th class="num">전체</th><th>마지막 발신</th></tr></thead><tbody>${deviceRows}</tbody></table></div>`;
 }
 
 /* 스케줄 목록의 발신 기기 칸: 기기명 + 그 기기의 번호 */

@@ -89,3 +89,24 @@ def next_occurrence(dt: datetime, recurrence: str) -> datetime | None:
 def first_run_at(start_at: datetime, current: datetime) -> datetime:
     """start_at 이 이미 지났다면 반복 주기 단위로 앞당겨 다음 실행 시각을 구한다."""
     return start_at
+
+
+def parse_end_date(value: str | None) -> date | None:
+    """'YYYY-MM-DD' 종료일을 date 로. 빈 값이거나 형식이 틀리면 None."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def end_date_deadline(value: str | None) -> datetime | None:
+    """종료일 그날의 23:59:59(서버 TZ). 이 시각까지만 실행을 허용한다."""
+    day = parse_end_date(value)
+    if day is None:
+        return None
+    return datetime.combine(day, time(23, 59, 59), tzinfo=TZ)
