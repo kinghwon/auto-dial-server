@@ -144,6 +144,7 @@ def device_dict(row: sqlite3.Row, current: datetime | None = None) -> dict:
         "app_version": row["app_version"] or "",
         "battery": row["battery"],
         "network": row["network"] or "",
+        "phone_number": (_row_value(row, "phone_number") or ""),
         "note": row["note"] or "",
         "enabled": bool(row["enabled"]),
         "online": device_is_online(row, current),
@@ -283,12 +284,17 @@ def sms_attachment_list(row: sqlite3.Row) -> list[dict]:
     return result
 
 
-def sms_dict(row: sqlite3.Row) -> dict:
+def sms_dict(row: sqlite3.Row, device_phones: dict[str, str] | None = None) -> dict:
     attachments = sms_attachment_list(row)
+    # 수신 번호: 문자에 기록된 값 → 비었으면 그 기기의 번호(devices.phone_number) 순서로 쓴다.
+    receiver_number = (_row_value(row, "receiver_number") or "").strip()
+    if not receiver_number and device_phones:
+        receiver_number = (device_phones.get(row["device_id"]) or "").strip()
     return {
         "id": row["id"],
         "device_id": row["device_id"],
         "sender": row["sender"],
+        "receiver_number": receiver_number,
         "body": row["body"],
         "received_at": row["received_at"],
         "received_at_text": local_str(row["received_at"], "%Y-%m-%d %H:%M:%S") if row["received_at"] else "-",
@@ -422,14 +428,15 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
     row = conn.execute("SELECT * FROM devices WHERE id = ?", (payload.device_id,)).fetchone()
     if row is None:
         conn.execute(
-            """INSERT INTO devices(id, name, model, android_version, app_version, note, enabled, last_seen, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            """INSERT INTO devices(id, name, model, android_version, app_version, phone_number, note, enabled, last_seen, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
             (
                 payload.device_id,
                 payload.name or payload.device_id,
                 payload.model,
                 payload.android_version,
                 payload.app_version,
+                payload.phone_number,
                 payload.note,
                 current,
                 current,
@@ -439,12 +446,14 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
     else:
         conn.execute(
             """UPDATE devices SET name = ?, model = ?, android_version = ?, app_version = ?,
+                      phone_number = COALESCE(NULLIF(?, ''), phone_number),
                       note = COALESCE(NULLIF(?, ''), note), last_seen = ? WHERE id = ?""",
             (
                 payload.name or row["name"] or payload.device_id,
                 payload.model or row["model"],
                 payload.android_version or row["android_version"],
                 payload.app_version or row["app_version"],
+                payload.phone_number,
                 payload.note,
                 current,
                 payload.device_id,
@@ -489,6 +498,9 @@ def update_device(device_id: str, payload: DeviceUpdate, conn: sqlite3.Connectio
     if payload.note is not None:
         updates.append("note = ?")
         values.append(payload.note[:400])
+    if payload.phone_number is not None:
+        updates.append("phone_number = ?")
+        values.append(payload.phone_number[:30])
     if payload.enabled is not None:
         updates.append("enabled = ?")
         values.append(1 if payload.enabled else 0)
@@ -1376,6 +1388,17 @@ def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite
     device = ensure_device(conn, payload.device_id)
     conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (iso(now()), payload.device_id))
 
+    # 수신 번호: 앱이 보낸 값(receiver_number/recipient) → 없으면 기기에 등록된 번호.
+    receiver_number = (payload.receiver_number or "").strip()
+    device_phone = (_row_value(device, "phone_number") or "").strip()
+    if not receiver_number:
+        receiver_number = device_phone
+    elif not device_phone:
+        # 기기에 번호가 비어 있는데 앱이 실제 수신 번호를 알려 줬다면 기기 정보도 채워 둔다.
+        conn.execute("UPDATE devices SET phone_number = ? WHERE id = ?", (receiver_number[:30], payload.device_id))
+        device_phone = receiver_number
+        db.log(conn, f"기기 수신 번호 자동 등록: {payload.device_id} → {receiver_number}")
+
     received_at = None
     if payload.received_at:
         try:
@@ -1388,9 +1411,9 @@ def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite
         received_at = iso(now())
 
     cursor = conn.execute(
-        """INSERT INTO sms_inbox(device_id, sender, body, received_at, created_at, telegram_status)
-           VALUES (?, ?, ?, ?, ?, 'pending')""",
-        (payload.device_id, payload.sender, payload.body, received_at, iso(now())),
+        """INSERT INTO sms_inbox(device_id, sender, receiver_number, body, received_at, created_at, telegram_status)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+        (payload.device_id, payload.sender, receiver_number, payload.body, received_at, iso(now())),
     )
     sms_id = int(cursor.lastrowid)
     saved = save_sms_attachments(sms_id, payload.attachments)
@@ -1412,7 +1435,7 @@ def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite
         )
 
     row = conn.execute("SELECT * FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
-    return {"ok": True, "id": sms_id, "sms": sms_dict(row)}
+    return {"ok": True, "id": sms_id, "sms": sms_dict(row, {payload.device_id: device_phone})}
 
 
 def _attachment_extension(content_type: str, filename: str) -> str:
@@ -1509,9 +1532,10 @@ def list_sms(
     ).fetchall()
     total = conn.execute(f"SELECT COUNT(*) AS c FROM sms_inbox{where}", values).fetchone()["c"]
     names = {row["id"]: (row["name"] or row["id"]) for row in conn.execute("SELECT id, name FROM devices")}
+    phones = {row["id"]: (_row_value(row, "phone_number") or "") for row in conn.execute("SELECT * FROM devices")}
     items = []
     for row in rows:
-        item = sms_dict(row)
+        item = sms_dict(row, phones)
         item["device_name"] = names.get(row["device_id"], row["device_id"])
         items.append(item)
     return {"messages": items, "count": len(items), "total": int(total or 0)}

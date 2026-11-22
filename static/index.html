@@ -321,6 +321,10 @@
             <label>표시 이름</label>
             <input type="text" id="devName" placeholder="예: 사무실폰" maxlength="80">
           </div>
+          <div class="field">
+            <label>수신 번호 <span class="hint">선택 · 이 폰이 문자를 받는 번호</span></label>
+            <input type="tel" id="devPhone" placeholder="예: 010-1234-5678" maxlength="30">
+          </div>
           <div class="field span2">
             <label>메모 <span class="hint">선택</span></label>
             <input type="text" id="devNote" placeholder="예: 유심 2번, 충전기 연결됨" maxlength="400">
@@ -339,7 +343,7 @@
         <button class="btn sm" onclick="loadDevices()">새로고침</button>
       </div>
       <div class="table-wrap"><table id="devicesTable">
-        <thead><tr><th>상태</th><th>기기</th><th>모델 / 안드로이드</th><th>배터리</th><th>마지막 연결</th><th></th></tr></thead>
+        <thead><tr><th>상태</th><th>기기</th><th>수신 번호</th><th>모델 / 안드로이드</th><th>배터리</th><th>마지막 연결</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -514,7 +518,7 @@
         </div>
       </div>
       <div class="table-wrap"><table id="smsTable">
-        <thead><tr><th style="width:36px"><input type="checkbox" id="smsSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSms(this)"></th><th>수신 시각</th><th>기기</th><th>발신 번호</th><th>내용 / 사진</th><th>텔레그램</th><th></th></tr></thead>
+        <thead><tr><th style="width:36px"><input type="checkbox" id="smsSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSms(this)"></th><th>수신 시각</th><th>기기</th><th>수신 번호</th><th>발신 번호</th><th>내용 / 사진</th><th>텔레그램</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -810,12 +814,13 @@ async function loadDevices() {
         <tr style="${d.enabled ? "" : "opacity:.62"}">
           <td>${d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray")}${d.enabled ? "" : " " + badge("중지됨", "b-warn")}</td>
           <td><b>${esc(d.name)}</b><div class="muted mono">${esc(d.id)}</div>${d.note ? `<div class="muted" style="font-size:11.5px">${esc(d.note)}</div>` : ""}</td>
+          <td class="nowrap" data-phone="${esc(d.phone_number || "")}"><span class="mono">${d.phone_number ? esc(d.phone_number) : '<span class="muted">미설정</span>'}</span> <button class="btn sm" title="이 폰이 문자를 받는 번호를 입력합니다" onclick="editDevicePhone(this, '${esc(d.id)}')">${d.phone_number ? "수정" : "입력"}</button></td>
           <td class="muted">${esc(d.model || "-")}<div style="font-size:11.5px">${d.android_version ? "Android " + esc(d.android_version) : ""}</div></td>
           <td>${d.battery === null || d.battery === undefined ? '<span class="muted">-</span>' : `${d.battery}%`}</td>
           <td class="muted nowrap">${esc(d.last_seen_text)}</td>
           <td class="nowrap"><button class="btn sm" onclick="toggleDevice('${esc(d.id)}', ${d.enabled ? "false" : "true"})">${d.enabled ? "사용 중지" : "사용"}</button> <button class="btn sm danger" onclick="deleteDevice('${esc(d.id)}')">삭제</button></td>
         </tr>`).join("")
-      : emptyRow(6, "등록된 기기가 없습니다. 앱에서 서비스 시작을 누르면 자동 등록됩니다.", "📵");
+      : emptyRow(7, "등록된 기기가 없습니다. 앱에서 서비스 시작을 누르면 자동 등록됩니다.", "📵");
 
     if (state.tab === "devices") loadRemoteSettings();
   } catch (e) { toast(e.message, "err"); }
@@ -884,13 +889,43 @@ async function addDevice() {
   const id = $("devId").value.trim();
   const name = $("devName").value.trim();
   const note = $("devNote").value.trim();
+  const phoneNumber = $("devPhone").value.trim();
   if (!id) { toast("기기 ID를 입력하세요.", "err"); return; }
   try {
-    await api("/api/devices", { method: "POST", body: JSON.stringify({ device_id: id, name: name || id, note }) });
-    $("devId").value = ""; $("devName").value = ""; $("devNote").value = "";
+    await api("/api/devices", { method: "POST", body: JSON.stringify({ device_id: id, name: name || id, note, phone_number: phoneNumber }) });
+    $("devId").value = ""; $("devName").value = ""; $("devNote").value = ""; $("devPhone").value = "";
     toast("기기를 등록했습니다.", "ok");
     loadDevices();
   } catch (e) { toast(e.message, "err"); }
+}
+
+/* 등록된 기기의 수신 번호를 표 안에서 바로 입력·수정한다. */
+function editDevicePhone(btn, id) {
+  const cell = btn.closest("td");
+  if (!cell || cell.dataset.editing === "1") return;
+  const current = cell.dataset.phone || "";
+  cell.dataset.editing = "1";
+  cell.innerHTML = `<span class="mono"><input type="tel" class="phone-input" value="${esc(current)}" placeholder="010-0000-0000" maxlength="30" style="width:132px"></span> <button class="btn sm primary" onclick="saveDevicePhone(this, '${esc(id)}')">저장</button> <button class="btn sm" onclick="loadDevices()">취소</button>`;
+  const input = cell.querySelector("input");
+  if (input) {
+    input.focus();
+    input.select();
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") saveDevicePhone(input, id);
+      if (event.key === "Escape") loadDevices();
+    });
+  }
+}
+
+async function saveDevicePhone(el, id) {
+  const cell = el.closest("td");
+  const input = cell ? cell.querySelector("input") : null;
+  const value = (input ? input.value : "").trim();
+  try {
+    await api(`/api/devices/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ phone_number: value }) });
+    toast(value ? `기기 ${id} 의 수신 번호를 ${value} 로 저장했습니다.` : `기기 ${id} 의 수신 번호를 비웠습니다.`, "ok");
+  } catch (e) { toast(e.message, "err"); }
+  loadDevices();
 }
 
 async function deleteDevice(id) {
@@ -1665,7 +1700,7 @@ async function loadSms() {
 
     // 목록이 그대로면(5초 자동 갱신) 다시 그리지 않아 사진 클릭·펼치기가 끊기지 않게 한다.
     const signature = JSON.stringify(data.messages.map((m) => [
-      m.id, m.received_at, m.device_name, m.device_id, m.sender, m.body,
+      m.id, m.received_at, m.device_name, m.device_id, m.sender, m.receiver_number, m.body,
       m.telegram_status, m.telegram_error, m.attachment_count,
     ]));
     const listChanged = signature !== state.smsSignature;
@@ -1682,6 +1717,7 @@ async function loadSms() {
           <td><input type="checkbox" class="queue-check sms-check" ${state.selectedSms.has(m.id) ? "checked" : ""} onchange="toggleSmsSelection(${m.id}, this.checked)"></td>
           <td class="nowrap mono">${esc(m.received_at_text)}</td>
           <td><b>${esc(m.device_name)}</b><div class="muted mono" style="font-size:11.5px">${esc(m.device_id)}</div></td>
+          <td class="mono nowrap">${esc(m.receiver_number || "-")}</td>
           <td class="mono nowrap">${esc(m.sender || "-")}${m.has_mms ? '<span class="mms-tag">📷 MMS</span>' : ""}</td>
           <td style="max-width:420px">
             ${m.body ? `<div class="sms-body${state.openSms.has(m.id) ? " open" : ""}" title="눌러서 전체 보기" onclick="toggleSmsBody(this, ${m.id})">${esc(m.body)}</div>` : '<span class="muted">(내용 없음)</span>'}
@@ -1690,7 +1726,7 @@ async function loadSms() {
           <td>${statusBadge(TG_STATUS, m.telegram_status)}${m.telegram_error ? `<div class="muted" style="font-size:11px;margin-top:3px">${esc(m.telegram_error)}</div>` : ""}</td>
           <td><div class="cell-actions"><button class="btn sm" onclick="resendSms(${m.id})">다시 전송</button><button class="btn sm danger" onclick="deleteSms(${m.id})">삭제</button></div></td>
         </tr>`).join("")
-        : emptyRow(7, "수신된 문자가 없습니다.", "📨");
+        : emptyRow(8, "수신된 문자가 없습니다.", "📨");
       hydrateSmsThumbs();
     }
 

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS devices (
     app_version      TEXT DEFAULT '',
     battery          INTEGER,
     network          TEXT DEFAULT '',
+    phone_number     TEXT DEFAULT '',
     note             TEXT DEFAULT '',
     enabled          INTEGER NOT NULL DEFAULT 1,
     last_seen        TEXT,
@@ -85,6 +86,7 @@ CREATE TABLE IF NOT EXISTS sms_inbox (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id          TEXT,
     sender             TEXT DEFAULT '',
+    receiver_number    TEXT DEFAULT '',
     body               TEXT DEFAULT '',
     received_at        TEXT,
     created_at         TEXT NOT NULL,
@@ -171,7 +173,17 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
         conn.execute("ALTER TABLE schedules ADD COLUMN total_calls INTEGER")
         added.append("schedules.total_calls")
 
+    device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
+    if "phone_number" not in device_columns:
+        # 기기가 문자를 받는 번호(대시보드 “기기 관리”에서 입력). 기존 기기는 빈 값 = 미설정.
+        conn.execute("ALTER TABLE devices ADD COLUMN phone_number TEXT DEFAULT ''")
+        added.append("devices.phone_number")
+
     sms_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sms_inbox)")}
+    if "receiver_number" not in sms_columns:
+        # 이 문자를 받은 번호. 비어 있으면 기기의 phone_number 로 대신 보여준다.
+        conn.execute("ALTER TABLE sms_inbox ADD COLUMN receiver_number TEXT DEFAULT ''")
+        added.append("sms_inbox.receiver_number")
     if "attachment_count" not in sms_columns:
         # MMS 사진 첨부 개수. 기존 문자는 0 = 첨부 없음.
         conn.execute("ALTER TABLE sms_inbox ADD COLUMN attachment_count INTEGER NOT NULL DEFAULT 0")

@@ -34,13 +34,30 @@ def clean_numbers(values: list[str] | str) -> list[str]:
     return cleaned
 
 
+def clean_phone_number(value: str | None) -> str:
+    """사용자가 입력한 전화번호(선택 항목). 빈 값은 "" 로, 형식이 틀리면 오류."""
+    number = (value or "").strip()
+    if not number:
+        return ""
+    if not PHONE_RE.match(number):
+        raise ValueError(f"전화번호 형식이 올바르지 않습니다: {number}")
+    return number
+
+
 class DeviceRegister(BaseModel):
     device_id: str = Field(min_length=1, max_length=64)
     name: str = Field(default="", max_length=80)
     model: str = Field(default="", max_length=80)
     android_version: str = Field(default="", max_length=40)
     app_version: str = Field(default="", max_length=40)
+    # 기기가 문자를 받는 번호(선택). 앱이 보내지 않으면 대시보드에서 직접 입력한다.
+    phone_number: str = Field(default="", max_length=30)
     note: str = Field(default="", max_length=400)
+
+    @field_validator("phone_number")
+    @classmethod
+    def _phone_number(cls, value: str) -> str:
+        return clean_phone_number(value)
 
     @field_validator("device_id")
     @classmethod
@@ -60,7 +77,16 @@ class Heartbeat(BaseModel):
 class DeviceUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=80)
     note: Optional[str] = Field(default=None, max_length=400)
+    # 기기가 문자를 받는 번호. 빈 문자열을 보내면 지운다(None 이면 그대로 둔다).
+    phone_number: Optional[str] = Field(default=None, max_length=30)
     enabled: Optional[bool] = None
+
+    @field_validator("phone_number")
+    @classmethod
+    def _phone_number(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return clean_phone_number(value)
 
 
 ORDER_MODES = ("sequence", "grouped", "random")
@@ -292,6 +318,10 @@ class SmsIncoming(BaseModel):
     device_id: str = Field(min_length=1, max_length=64)
     sender: str = Field(default="", max_length=64)
     body: str = Field(default="", max_length=4000)
+    # 이 문자를 받은 번호(그 기기의 번호). 앱이 보내면 그대로 저장하고,
+    # 없으면 devices.phone_number 로 채운다. recipient 는 앱 쪽 호환용 이름.
+    receiver_number: Optional[str] = Field(default=None, max_length=40)
+    recipient: Optional[str] = Field(default=None, max_length=40)
     received_at: Optional[str] = None
     received_ts: Optional[int] = None  # epoch millis (앱에서 보내는 경우)
     # MMS 사진·파일 첨부(최대 10건). 비어 있으면 기존 문자 전용 경로 그대로 동작한다.
@@ -301,6 +331,19 @@ class SmsIncoming(BaseModel):
     @classmethod
     def _sender(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("receiver_number", "recipient")
+    @classmethod
+    def _receiver_number(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _merge_receiver(self):
+        if not (self.receiver_number or "").strip() and (self.recipient or "").strip():
+            self.receiver_number = self.recipient.strip()
+        return self
 
 
 class TelegramSettings(BaseModel):

@@ -2080,3 +2080,213 @@ def test_dashboard_has_sms_view_and_delete_controls(client):
         "smsAttachmentBlobUrl",
     ):
         assert keyword in html, keyword
+
+
+# --------------------------------------------------------------------------
+# 수신 번호 (기기 전화번호 + 수신 문자 탭 컬럼)
+# --------------------------------------------------------------------------
+def test_db_schema_has_phone_and_receiver_columns(isolate_db):
+    conn = _conn()
+    device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
+    sms_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sms_inbox)")}
+    conn.close()
+    assert "phone_number" in device_columns
+    assert "receiver_number" in sms_columns
+
+
+def test_device_phone_number_register_patch_and_clear(client):
+    created = client.post(
+        "/api/devices",
+        json={"device_id": "DEV-PHONE", "name": "사무실폰", "phone_number": "010-1234-5678"},
+    ).json()["device"]
+    assert created["phone_number"] == "010-1234-5678"
+
+    listed = client.get("/api/devices").json()["devices"][0]
+    assert listed["phone_number"] == "010-1234-5678"
+
+    # 앱이 번호 없이 다시 등록(하트비트 대신 재등록)해도 대시보드에서 넣은 번호가 지워지지 않는다
+    again = client.post("/api/devices", json={"device_id": "DEV-PHONE", "name": "사무실폰"}).json()["device"]
+    assert again["phone_number"] == "010-1234-5678"
+
+    patched = client.patch("/api/devices/DEV-PHONE", json={"phone_number": "02-123-4567"}).json()["device"]
+    assert patched["phone_number"] == "02-123-4567"
+
+    cleared = client.patch("/api/devices/DEV-PHONE", json={"phone_number": ""}).json()["device"]
+    assert cleared["phone_number"] == ""
+
+    # 형식이 틀린 번호는 저장하지 않는다
+    assert client.patch("/api/devices/DEV-PHONE", json={"phone_number": "전화번호아님!!"}).status_code == 422
+    assert client.get("/api/devices").json()["devices"][0]["phone_number"] == ""
+
+
+def test_incoming_sms_stores_explicit_receiver_number(client):
+    client.post("/api/devices", json={"device_id": "DEV-R1", "name": "A폰", "phone_number": "010-1000-0001"})
+    response = client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": "DEV-R1",
+            "sender": "010-2000-0002",
+            "body": "명시한 수신 번호",
+            "receiver_number": "010-9999-0000",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["sms"]["receiver_number"] == "010-9999-0000"
+
+    stored = client.get("/api/sms").json()["messages"][0]
+    assert stored["receiver_number"] == "010-9999-0000"
+
+    # 기기 번호(fallback)가 아니라 문자에 기록된 값이 남는다
+    conn = _conn()
+    row = conn.execute("SELECT receiver_number FROM sms_inbox").fetchone()
+    conn.close()
+    assert row["receiver_number"] == "010-9999-0000"
+
+
+def test_incoming_sms_falls_back_to_device_phone_number(client):
+    client.post("/api/devices", json={"device_id": "DEV-R2", "name": "B폰", "phone_number": "010-3000-0003"})
+    response = client.post(
+        "/api/sms/incoming",
+        json={"device_id": "DEV-R2", "sender": "010-4000-0004", "body": "번호 없이 도착"},
+    )
+    assert response.json()["sms"]["receiver_number"] == "010-3000-0003"
+    assert client.get("/api/sms").json()["messages"][0]["receiver_number"] == "010-3000-0003"
+
+    conn = _conn()
+    row = conn.execute("SELECT receiver_number FROM sms_inbox").fetchone()
+    conn.close()
+    assert row["receiver_number"] == "010-3000-0003"
+
+
+def test_incoming_sms_accepts_recipient_alias_and_fills_device_number(client):
+    client.post("/api/devices", json={"device_id": "DEV-R3", "name": "C폰"})
+    response = client.post(
+        "/api/sms/incoming",
+        json={"device_id": "DEV-R3", "sender": "010-5000-0005", "body": "recipient 이름", "recipient": "010-7000-0007"},
+    )
+    assert response.json()["sms"]["receiver_number"] == "010-7000-0007"
+
+    # 앱이 알려 준 수신 번호는 기기 정보에도 채워 둔다 (다음 문자부터 fallback 으로도 보인다)
+    device = client.get("/api/devices").json()["devices"][0]
+    assert device["phone_number"] == "010-7000-0007"
+    assert client.get("/api/sms").json()["messages"][0]["receiver_number"] == "010-7000-0007"
+
+
+def test_sms_receiver_number_falls_back_when_device_number_added_later(client):
+    client.post("/api/sms/incoming", json={"device_id": "DEV-R4", "sender": "1", "body": "먼저 온 문자"})
+    first = client.get("/api/sms").json()["messages"][0]
+    assert first["receiver_number"] == ""
+
+    # 나중에 대시보드에서 기기 번호를 넣으면 이미 받은 문자에도 수신 번호가 보인다
+    client.patch("/api/devices/DEV-R4", json={"phone_number": "010-6000-0006"})
+    after = client.get("/api/sms").json()["messages"][0]
+    assert after["receiver_number"] == "010-6000-0006"
+
+
+def test_sms_receiver_number_is_empty_string_for_unknown_number(client):
+    client.post("/api/sms/incoming", json={"device_id": "DEV-NONUM", "sender": "1", "body": "번호 미설정"})
+    item = client.get("/api/sms").json()["messages"][0]
+    assert item["receiver_number"] == ""
+
+
+def test_db_migration_adds_phone_and_receiver_columns_to_existing_db(tmp_path, monkeypatch):
+    import sqlite3
+
+    old_db = tmp_path / "old_sms.db"
+    raw = sqlite3.connect(old_db)
+    raw.executescript(
+        """
+        CREATE TABLE devices (
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL DEFAULT '',
+            model            TEXT DEFAULT '',
+            android_version  TEXT DEFAULT '',
+            app_version      TEXT DEFAULT '',
+            battery          INTEGER,
+            network          TEXT DEFAULT '',
+            note             TEXT DEFAULT '',
+            enabled          INTEGER NOT NULL DEFAULT 1,
+            last_seen        TEXT,
+            created_at       TEXT NOT NULL
+        );
+        CREATE TABLE sms_inbox (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id       TEXT,
+            sender          TEXT DEFAULT '',
+            body            TEXT DEFAULT '',
+            received_at     TEXT,
+            created_at      TEXT NOT NULL,
+            telegram_status TEXT NOT NULL DEFAULT 'pending',
+            telegram_error  TEXT,
+            telegram_attempts INTEGER NOT NULL DEFAULT 0,
+            telegram_sent_at  TEXT
+        );
+        """
+    )
+    raw.execute(
+        "INSERT INTO devices(id, name, enabled, created_at) VALUES ('5656', '5656', 1, '2026-11-22T19:07:06+09:00')"
+    )
+    raw.execute(
+        """INSERT INTO sms_inbox(device_id, sender, body, received_at, created_at, telegram_status)
+           VALUES ('5656', '01076762164', '기존 문자', '2026-11-22T21:30:22+09:00',
+                   '2026-11-22T21:30:24+09:00', 'sent')"""
+    )
+    raw.commit()
+    raw.close()
+
+    db.init_db(old_db)  # 운영 중인 DB(수신 번호 컬럼 없음)에 컬럼 추가
+
+    conn = sqlite3.connect(old_db)
+    conn.row_factory = sqlite3.Row
+    device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
+    sms_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sms_inbox)")}
+    assert "phone_number" in device_columns
+    assert "receiver_number" in sms_columns
+    device_row = conn.execute("SELECT * FROM devices").fetchone()
+    sms_row = conn.execute("SELECT * FROM sms_inbox").fetchone()
+    assert device_row["name"] == "5656"
+    assert device_row["phone_number"] == ""
+    assert sms_row["body"] == "기존 문자"
+    assert sms_row["receiver_number"] == ""
+    conn.close()
+
+    # 마이그레이션 후에도 기존 문자는 그대로 보이고, 기기 번호를 넣으면 수신 번호가 채워진다
+    monkeypatch.setattr(config, "DB_PATH", old_db)
+    with TestClient(app) as migrated_client:
+        messages = migrated_client.get("/api/sms").json()["messages"]
+        assert messages[0]["body"] == "기존 문자"
+        assert messages[0]["receiver_number"] == ""
+        migrated_client.patch("/api/devices/5656", json={"phone_number": "010-5656-3939"})
+        messages = migrated_client.get("/api/sms").json()["messages"]
+        assert messages[0]["receiver_number"] == "010-5656-3939"
+        assert messages[0]["device_id"] == "5656"
+
+    # 두 번 실행해도 안전(멱등)
+    db.init_db(old_db)
+    conn = sqlite3.connect(old_db)
+    assert conn.execute("SELECT COUNT(*) FROM sms_inbox").fetchone()[0] == 1
+    conn.close()
+
+
+def test_dashboard_sms_tab_has_receiver_number_column(client):
+    html = client.get("/").text
+    for keyword in (
+        "수신 번호",
+        "m.receiver_number",
+        "editDevicePhone(",
+        "saveDevicePhone(",
+        'id="devPhone"',
+        "phone_number: phoneNumber",
+    ):
+        assert keyword in html, keyword
+
+    # 수신 문자 표: 체크박스 + 수신시각 + 기기 + 수신번호 + 발신번호 + 내용 + 텔레그램 + 액션
+    header = html.split('id="smsTable"', 1)[1].split("</thead>", 1)[0]
+    assert header.count("</th>") == 8
+    assert header.index("수신 번호") < header.index("발신 번호")
+    assert 'emptyRow(8, "수신된 문자가 없습니다.' in html
+
+    # 기기 표: 상태 + 기기 + 수신번호 + 모델 + 배터리 + 마지막 연결 + 액션
+    device_header = html.split('id="devicesTable"', 1)[1].split("</thead>", 1)[0]
+    assert device_header.count("</th>") == 7
+    assert 'emptyRow(7, "등록된 기기가 없습니다.' in html
