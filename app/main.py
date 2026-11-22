@@ -677,13 +677,15 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
     # 옛 기기 ID 로 들어와도 같은 기기로 잇는다.
     phone = resolve_device_key(conn, phone)
     row = conn.execute("SELECT * FROM devices WHERE id = ?", (phone,)).fetchone()
+    # 앱이 보낸 기기 이름(공백 제거). 비어 있으면 지금 이름을 그대로 둔다.
+    name_value = (payload.name or "").strip()
     if row is None:
         conn.execute(
             """INSERT INTO devices(id, name, model, android_version, app_version, phone_number, note, enabled, last_seen, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
             (
                 phone,
-                payload.name or phone,
+                name_value or phone,
                 payload.model,
                 payload.android_version,
                 payload.app_version,
@@ -697,10 +699,20 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
     else:
         # 앱은 30초마다 같은 등록 요청을 보낸다. 대시보드에서 직접 고친 이름·모델·안드로이드 버전은 덮어쓰지 않는다.
         # 수신번호는 기기 키이므로 앱이 무엇을 보내든 서버 값(=키)을 그대로 둔다.
+        #
+        # 예외: 사용자가 앱 화면에서 기기 이름을 직접 고쳐 force_name=true 로 보낸 경우에는
+        # 그 이름이 마지막 의도된 값이므로 대시보드에서 고친 이름도 이 이름으로 바꾼다
+        # (웹·앱 기기 이름을 어느 쪽에서 고쳐도 같게 유지).
+        force_name = bool(payload.force_name) and bool(name_value)
+        name_sql = (
+            "name = ?, name_customized = 1"
+            if force_name
+            else "name = CASE WHEN COALESCE(name_customized, 0) = 1 THEN name\n"
+            "ELSE COALESCE(NULLIF(?, ''), name) END"
+        )
         conn.execute(
-            """UPDATE devices SET
-                      name = CASE WHEN COALESCE(name_customized, 0) = 1 THEN name
-                                  ELSE COALESCE(NULLIF(?, ''), name) END,
+            f"""UPDATE devices SET
+                      {name_sql},
                       model = CASE WHEN COALESCE(model_customized, 0) = 1 THEN model
                                    ELSE COALESCE(NULLIF(?, ''), model) END,
                       android_version = CASE WHEN COALESCE(android_customized, 0) = 1 THEN android_version
@@ -709,7 +721,7 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
                       phone_number = ?,
                       note = COALESCE(NULLIF(?, ''), note), last_seen = ? WHERE id = ?""",
             (
-                payload.name or phone,
+                name_value,
                 payload.model,
                 payload.android_version,
                 payload.app_version or row["app_version"],
@@ -719,8 +731,15 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
                 phone,
             ),
         )
+        if force_name:
+            db.log(conn, f"기기 이름을 앱에서 반영: {phone} → {name_value}", "info")
     row = conn.execute("SELECT * FROM devices WHERE id = ?", (phone,)).fetchone()
-    return {"ok": True, "device": device_dict(row)}
+    return {
+        "ok": True,
+        "device": device_dict(row),
+        # 앱 화면이 서버의 기기 이름과 바로 같아지도록 현재 이름을 함께 돌려준다.
+        "device_name": row["name"] or phone,
+    }
 
 
 @api.post("/devices/{device_id}/heartbeat")
@@ -742,6 +761,8 @@ def device_heartbeat(device_id: str, payload: Heartbeat | None = None, conn: sql
         "server_time": iso(now()),
         "poll_interval_sec": cfg["poll_interval_sec"],
         "pending_tasks": pending,
+        # 앱 화면의 기기 이름이 대시보드와 같아지도록 현재 이름을 함께 내려준다.
+        "device_name": row["name"] or device_key,
         # 대시보드에서 바꾼 원격 설정(확인 주기·발신 간격·문자 전달·기기 사용 여부)
         "config": cfg,
     }
@@ -1821,7 +1842,8 @@ def bulk_delete_tasks(payload: TaskBulkDelete, conn: sqlite3.Connection = Depend
 
 @api.get("/tasks/poll")
 def poll_task(device_id: str = Query(min_length=1, max_length=64), conn: sqlite3.Connection = Depends(get_conn)):
-    device_key = ensure_device(conn, device_id)["id"]
+    device_row = ensure_device(conn, device_id)
+    device_key = device_row["id"]
     cfg = remote_config(conn, device_key)
     conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (iso(now()), device_key))
     # 대시보드에서 '사용 중지'된 기기에는 작업을 배정하지 않는다.
@@ -1835,6 +1857,8 @@ def poll_task(device_id: str = Query(min_length=1, max_length=64), conn: sqlite3
         "pending_tasks": pending,
         "poll_interval_sec": cfg["poll_interval_sec"],
         "server_time": iso(now()),
+        # 앱 화면의 기기 이름이 대시보드와 같아지도록 현재 이름을 함께 내려준다.
+        "device_name": device_row["name"] or device_key,
         "config": cfg,
     }
 

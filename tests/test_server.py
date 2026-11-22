@@ -2872,6 +2872,70 @@ def test_device_unmodified_name_follows_app_registration(client):
     assert device["name_customized"] is False
 
 
+# --------------------------------------------------------------------------
+# 기기 이름 양방향 동기화 (웹 대시보드 ↔ 앱)
+# --------------------------------------------------------------------------
+def test_register_heartbeat_and_poll_return_device_name(client):
+    """앱이 서버의 지금 기기 이름을 받아 화면에 그대로 보여줄 수 있어야 한다."""
+    body = client.post("/api/devices", json={"device_id": "010-9000-0301", "name": "거실폰"}).json()
+    assert body["device_name"] == "거실폰"
+    assert body["device"]["name"] == "거실폰"
+
+    beat = client.post("/api/devices/010-9000-0301/heartbeat", json={"device_id": "010-9000-0301"}).json()
+    assert beat["device_name"] == "거실폰"
+    poll = client.get("/api/tasks/poll", params={"device_id": "010-9000-0301"}).json()
+    assert poll["device_name"] == "거실폰"
+
+    # 웹에서 이름을 고치면 다음 하트비트·폴링 응답에 바로 새 이름이 실린다.
+    client.patch("/api/devices/010-9000-0301", json={"name": "사무실폰"})
+    beat = client.post("/api/devices/010-9000-0301/heartbeat", json={"device_id": "010-9000-0301"}).json()
+    assert beat["device_name"] == "사무실폰"
+    poll = client.get("/api/tasks/poll", params={"device_id": "010-9000-0301"}).json()
+    assert poll["device_name"] == "사무실폰"
+
+
+def test_force_name_overrides_web_customized_name(client):
+    """앱에서 직접 고친 이름(force_name)은 웹에서 고쳐 둔 이름보다 우선한다(마지막 의도가 이긴다)."""
+    client.post("/api/devices", json={"device_id": "010-9000-0302", "name": "앱이름"})
+    client.patch("/api/devices/010-9000-0302", json={"name": "웹이름"})
+
+    body = client.post(
+        "/api/devices",
+        json={
+            "device_id": "010-9000-0302",
+            "phone_number": "010-9000-0302",
+            "name": "  폰에서 바꾼 이름  ",
+            "force_name": True,
+        },
+    ).json()
+    assert body["device"]["name"] == "폰에서 바꾼 이름"
+    assert body["device_name"] == "폰에서 바꾼 이름"
+    assert body["device"]["name_customized"] is True
+
+    # 그 뒤의 보통 등록(force 없음)은 앱이 예전 이름을 보내도 이 이름을 덮어쓰지 않는다.
+    for name in ("앱이름", "또 다른 이름"):
+        device = client.post(
+            "/api/devices",
+            json={"device_id": "010-9000-0302", "phone_number": "010-9000-0302", "name": name},
+        ).json()["device"]
+        assert device["name"] == "폰에서 바꾼 이름"
+
+    # 앱 화면에서도 서버 이름 그대로 보인다.
+    assert client.get("/api/tasks/poll", params={"device_id": "010-9000-0302"}).json()["device_name"] == "폰에서 바꾼 이름"
+
+
+def test_force_name_with_blank_name_keeps_current_name(client):
+    """이름을 비운 채 force_name 만 보내면(오작동) 이름을 지우지 않는다."""
+    client.post("/api/devices", json={"device_id": "010-9000-0303", "name": "그대로"})
+    for blank in ("", "   "):
+        body = client.post(
+            "/api/devices",
+            json={"device_id": "010-9000-0303", "phone_number": "010-9000-0303", "name": blank, "force_name": True},
+        ).json()
+        assert body["device"]["name"] == "그대로"
+        assert body["device_name"] == "그대로"
+
+
 def test_device_key_is_never_empty_or_changed_by_sms(client):
     client.post("/api/devices", json={"device_id": "010-9000-0141", "name": "폰"})
     assert client.patch("/api/devices/010-9000-0141", json={"phone_number": ""}).status_code == 422

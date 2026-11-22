@@ -84,6 +84,9 @@ class DeviceRegister(BaseModel):
     # 폰이 문자를 받는 번호 = 기기 키. 앱이 유심에서 읽어 보낸다.
     phone_number: str = Field(default="", max_length=30)
     note: str = Field(default="", max_length=400)
+    # 사용자가 앱에서 기기 이름을 직접 바꾼 직후의 등록이면 true.
+    # true 이면 대시보드에서 고쳐 둔 이름(name_customized=1)이라도 이 이름으로 바꾼다.
+    force_name: bool = False
 
     @field_validator("phone_number")
     @classmethod
