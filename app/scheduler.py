@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from datetime import datetime, timedelta
 from typing import Iterable
 
@@ -19,13 +20,17 @@ _scheduler = None
 # --------------------------------------------------------------------------
 def expand_tasks(
     numbers: Iterable[str],
-    repeat_count: int,
+    repeat_count: int = 1,
     order_mode: str = "sequence",
+    total_calls: int | None = None,
 ) -> list[tuple[str, int]]:
     """(번호, 회차) 목록을 만든다.
 
+    total_calls 가 지정되면 번호 개수 × repeat_count 대신 정확히 total_calls 건을 만든다.
+
     order_mode:
       - sequence : 번호 순서대로 한 바퀴씩 반복  → A,B,C,A,B,C
+      - random   : 한 바퀴(라운드)마다 번호를 무작위로 섞어서 발신
       - grouped  : 번호마다 연속 반복            → A,A,A,B,B,B
     """
     cleaned = [str(n).strip() for n in numbers if str(n).strip()]
@@ -33,22 +38,58 @@ def expand_tasks(
     if not cleaned:
         return []
 
-    result: list[tuple[str, int]] = []
+    per_round = len(cleaned)
+    try:
+        target = int(total_calls) if total_calls is not None else per_round * repeat
+    except (TypeError, ValueError):
+        target = per_round * repeat
+    target = max(1, min(target, config.MAX_TOTAL_CALLS))
+
     if order_mode == "grouped":
-        for number in cleaned:
-            for index in range(1, repeat + 1):
-                result.append((number, index))
-    else:
-        for index in range(1, repeat + 1):
-            for number in cleaned:
-                result.append((number, index))
-    return result
+        base: list[tuple[str, int]] = [(number, index) for number in cleaned for index in range(1, repeat + 1)]
+        if target <= len(base):
+            return base[:target]
+        result: list[tuple[str, int]] = []
+        round_no = 0
+        while len(result) < target:
+            for number, index in base:
+                if len(result) >= target:
+                    break
+                result.append((number, round_no * repeat + index))
+            round_no += 1
+        return result
+
+    if order_mode == "random":
+        pool: list[str] = []
+        previous: str | None = None
+        result = []
+        while len(result) < target:
+            if not pool:
+                pool = list(cleaned)
+                random.shuffle(pool)
+                # 라운드 경계에서 바로 앞 번호가 또 나오지 않도록 자리를 바꾼다.
+                if previous is not None and len(pool) > 1 and pool[0] == previous:
+                    swap = random.randrange(1, len(pool))
+                    pool[0], pool[swap] = pool[swap], pool[0]
+            number = pool.pop(0)
+            result.append(number)
+            previous = number
+        return [(number, index // per_round + 1) for index, number in enumerate(result)]
+
+    # sequence (기본): 번호 목록을 처음부터 다시 돌면서 채운다.
+    return [(cleaned[index % per_round], index // per_round + 1) for index in range(target)]
 
 
 def create_run(conn, schedule_row, scheduled_for: datetime, source: str = "scheduled") -> int | None:
     """스케줄 하나를 실행(run)으로 확장해 tasks 를 만든다."""
     numbers = db.json_list(schedule_row["numbers"])
-    pairs = expand_tasks(numbers, schedule_row["repeat_count"], schedule_row["order_mode"] or "sequence")
+    total_calls = schedule_row["total_calls"] if "total_calls" in schedule_row.keys() else None
+    pairs = expand_tasks(
+        numbers,
+        schedule_row["repeat_count"],
+        schedule_row["order_mode"] or "sequence",
+        total_calls=total_calls,
+    )
     if not pairs:
         db.log(conn, f"스케줄 #{schedule_row['id']} 에 발신할 번호가 없습니다.", "warning")
         return None

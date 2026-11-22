@@ -333,7 +333,7 @@
   <section class="tabpane" id="pane-schedules">
     <div class="card">
       <div class="card-head">
-        <div><h2>새 발신 스케줄</h2><div class="sub">번호를 순서대로, 정해진 횟수만큼 예약 발신합니다</div></div>
+        <div><h2 id="scheduleFormTitle">새 발신 스케줄</h2><div class="sub" id="scheduleFormSub">번호를 원하는 순서대로, 정해진 총 횟수만큼 예약 발신합니다</div></div>
       </div>
       <div class="card-body">
         <div class="form-grid">
@@ -352,20 +352,22 @@
 
           <div class="field span2">
             <label>발신 번호 목록 <span class="hint">한 줄에 하나씩, 위에서부터 순서대로</span></label>
-            <textarea id="schedNumbers" placeholder="010-1234-5678&#10;010-9876-5432&#10;02-123-4567" oninput="updateSummary()"></textarea>
+            <textarea id="schedNumbers" placeholder="010-1234-5678&#10;010-9876-5432&#10;02-123-4567" oninput="onNumbersInput()"></textarea>
             <div class="help">쉼표로도 구분할 수 있습니다. 최대 500개.</div>
           </div>
 
           <div class="field">
-            <label>반복 횟수 <span class="hint">각 번호에 대해</span></label>
-            <input type="number" id="schedRepeat" value="1" min="1" max="1000" oninput="updateSummary()">
+            <label>총 통화 횟수 <span class="hint">이 스케줄 1회 실행에서 발신할 전체 건수</span></label>
+            <input type="number" id="sTotalCalls" value="1" min="1" max="5000" oninput="onTotalCallsInput()">
+            <div class="help">번호가 25개여도 총 60회로 지정하면 60건을 발신합니다. 비우거나 0이면 번호 개수만큼 1회씩.</div>
           </div>
 
           <div class="field">
-            <label>반복 순서</label>
-            <select id="schedOrder" onchange="updateSummary()">
-              <option value="sequence">번호 순서대로 반복 (A,B,C → A,B,C)</option>
-              <option value="grouped">번호마다 연속 반복 (A,A,A → B,B,B)</option>
+            <label>발신 순서</label>
+            <select id="sOrder" onchange="updateSummary()">
+              <option value="sequence">순차 (목록 순서대로)</option>
+              <option value="random">랜덤 (무작위 순서)</option>
+              <option value="grouped" id="sOrderGrouped" hidden>번호마다 연속 반복 (기존 방식)</option>
             </select>
           </div>
 
@@ -403,11 +405,12 @@
           </div>
 
           <div class="field span2">
-            <div class="summary" id="schedSummary">번호와 반복 횟수를 입력하면 발신 건수가 표시됩니다.</div>
+            <div class="summary" id="schedSummary">번호와 총 통화 횟수를 입력하면 발신 건수가 표시됩니다.</div>
           </div>
         </div>
         <div class="btn-row" style="margin-top:16px">
           <button class="btn primary" id="createScheduleBtn" onclick="createSchedule()">스케줄 등록</button>
+          <button class="btn" id="cancelScheduleEditBtn" style="display:none" onclick="cancelScheduleEdit()">수정 취소</button>
           <button class="btn" onclick="resetScheduleForm()">초기화</button>
         </div>
       </div>
@@ -419,7 +422,7 @@
         <button class="btn sm" onclick="loadSchedules()">새로고침</button>
       </div>
       <div class="table-wrap"><table id="schedulesTable">
-        <thead><tr><th>스케줄</th><th>유형</th><th>번호 × 횟수</th><th>주기</th><th>다음 실행</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
+        <thead><tr><th>스케줄</th><th>유형</th><th>발신량 / 순서</th><th>주기</th><th>다음 실행</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -549,6 +552,8 @@ const state = {
   remoteDirty: false,
   timer: null,
   clockTimer: null,
+  editingScheduleId: null,
+  totalCallsAuto: true,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -602,6 +607,7 @@ const RUN_STATUS = { pending: ["대기", "b-gray"], running: ["진행 중", "b-w
 const SCHED_STATUS = { active: ["활성", "b-ok"], paused: ["일시정지", "b-warn"], finished: ["종료", "b-gray"] };
 const TG_STATUS = { sent: ["전송됨", "b-ok"], pending: ["재시도 대기", "b-warn"], failed: ["전송 실패", "b-danger"], skipped: ["전달 안 함", "b-gray"], disabled: ["전달 꺼짐", "b-gray"] };
 const RECURRENCE = { once: "1회", daily: "매일", weekly: "매주", monthly: "매월" };
+const ORDER_MODE = { sequence: "순차", random: "랜덤", grouped: "연속 반복" };
 
 function badge(text, cls) { return `<span class="badge ${cls}"><i></i>${esc(text)}</span>`; }
 function statusBadge(map, key) { const item = map[key] || [key, "b-gray"]; return badge(item[0], item[1]); }
@@ -857,25 +863,71 @@ function parseNumbers(text) {
 
 function updateSummary() {
   const numbers = parseNumbers($("schedNumbers").value);
-  const repeat = Math.max(1, parseInt($("schedRepeat").value || "1", 10));
-  const order = $("schedOrder").value;
+  const order = $("sOrder").value;
   const type = scheduleType();
   if (!numbers.length) {
-    $("schedSummary").textContent = "번호와 반복 횟수를 입력하면 발신 건수가 표시됩니다.";
+    $("schedSummary").textContent = "번호와 총 통화 횟수를 입력하면 발신 건수가 표시됩니다.";
     return;
   }
-  const total = numbers.length * repeat;
+  let total = parseInt($("sTotalCalls").value || "0", 10);
+  if (!total || total < 1) total = numbers.length; // 비우면 번호 개수만큼 1회씩
+  total = Math.min(total, 5000);
+  const rounds = Math.ceil(total / numbers.length);
   let preview;
-  if (order === "grouped") {
+  if (order === "random") {
+    preview = `${numbers.slice(0, 2).join(" → ")} … 라운드마다 무작위로 섮기`;
+  } else if (order === "grouped") {
     const first = numbers[0]; const second = numbers[1] || numbers[0];
-    preview = `${first} ×${repeat} → ${second} ×${repeat} …`;
+    preview = `${first} 연속 → ${second} 연속 …`;
   } else {
     const head = numbers.slice(0, 3).join(" → ");
-    preview = repeat > 1 ? `${head} → (다시) ${head} …` : head;
+    preview = rounds > 1 ? `${head} → (다시) ${head} …` : head;
   }
+  const short = total < numbers.length ? ` · 번호 ${numbers.length}개 중 앞에서 ${total}개만 발신` : "";
   const extra = type === "sms" && !$("schedSmsBody").value.trim() ? " · 문자 내용을 입력하세요" : "";
   $("schedSummary").innerHTML =
-    `총 <b>${total}건</b> ${type === "call" ? "전화" : "문자"} 발신 · 번호 ${numbers.length}개 × ${repeat}회<div class="muted" style="margin-top:4px">순서: ${esc(preview)}${esc(extra)}</div>`;
+    `총 <b>${total}건</b> ${type === "call" ? "전화" : "문자"} 발신 · 번호 ${numbers.length}개 · ${rounds}바퀴` +
+    `<div class="muted" style="margin-top:4px">${esc(ORDER_MODE[order] || order)}: ${esc(preview)}${esc(short)}${esc(extra)}</div>`;
+}
+
+function onNumbersInput() {
+  const numbers = parseNumbers($("schedNumbers").value);
+  // 직접 고치기 전까지는 번호 개수를 따라간다.
+  if (state.totalCallsAuto) $("sTotalCalls").value = numbers.length ? String(numbers.length) : "1";
+  updateSummary();
+}
+
+function onTotalCallsInput() {
+  state.totalCallsAuto = !$("sTotalCalls").value;
+  updateSummary();
+}
+
+function toLocalInput(isoText) {
+  const date = new Date(isoText);
+  if (isNaN(date.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function setScheduleEditMode(schedule) {
+  state.editingScheduleId = schedule ? schedule.id : null;
+  $("scheduleFormTitle").textContent = schedule ? `스케줄 수정 (#${schedule.id})` : "새 발신 스케줄";
+  $("scheduleFormSub").textContent = schedule
+    ? "값을 고친 뒤 '스케줄 수정 저장'을 누르면 바로 반영됩니다."
+    : "번호를 원하는 순서대로, 정해진 총 횟수만큼 예약 발신합니다";
+  $("createScheduleBtn").textContent = schedule ? "스케줄 수정 저장" : "스케줄 등록";
+  $("cancelScheduleEditBtn").style.display = schedule ? "" : "none";
+}
+
+function ensureDeviceOption(deviceId) {
+  if (!deviceId) return;
+  const select = $("schedDevice");
+  if (![...select.options].some((option) => option.value === deviceId)) {
+    const option = document.createElement("option");
+    option.value = deviceId;
+    option.textContent = `${deviceId} (기기 목록에 없음)`;
+    select.appendChild(option);
+  }
 }
 
 function defaultStartValue() {
@@ -886,10 +938,13 @@ function defaultStartValue() {
 }
 
 function resetScheduleForm() {
+  setScheduleEditMode(null);
   $("schedName").value = "";
   $("schedNumbers").value = "";
-  $("schedRepeat").value = "1";
-  $("schedOrder").value = "sequence";
+  state.totalCallsAuto = true;
+  $("sTotalCalls").value = "1";
+  $("sOrderGrouped").hidden = true;
+  $("sOrder").value = "sequence";
   $("schedMaxSec").value = "30";
   $("schedSmsBody").value = "";
   $("schedStart").value = defaultStartValue();
@@ -897,6 +952,36 @@ function resetScheduleForm() {
   $("schedDevice").value = "";
   document.querySelector('input[name="schedType"][value="call"]').checked = true;
   toggleTypeFields();
+  updateSummary();
+}
+
+function startEditSchedule(id) {
+  const schedule = state.schedules.find((item) => item.id === id);
+  if (!schedule) return;
+  setScheduleEditMode(schedule);
+  $("schedName").value = schedule.name || "";
+  $("schedNumbers").value = (schedule.numbers || []).join("\n");
+  state.totalCallsAuto = false;
+  const legacyTotal = (schedule.number_count || 1) * Math.max(1, schedule.repeat_count || 1);
+  $("sTotalCalls").value = String(schedule.total_calls != null ? schedule.total_calls : legacyTotal);
+  $("sOrderGrouped").hidden = schedule.order_mode !== "grouped";
+  $("sOrder").value = schedule.order_mode || "sequence";
+  $("schedMaxSec").value = String(schedule.max_call_duration_sec || 30);
+  $("schedSmsBody").value = schedule.sms_body || "";
+  $("schedStart").value = toLocalInput(schedule.start_at) || defaultStartValue();
+  $("schedRecurrence").value = schedule.recurrence || "once";
+  ensureDeviceOption(schedule.device_id);
+  $("schedDevice").value = schedule.device_id || "";
+  document.querySelector(`input[name="schedType"][value="${schedule.type}"]`).checked = true;
+  toggleTypeFields();
+  updateSummary();
+  $("pane-schedules").scrollIntoView({ behavior: "smooth", block: "start" });
+  toast(`#${schedule.id} 스케줄을 불러왔습니다. 값을 고친 뒤 저장하세요.`);
+}
+
+function cancelScheduleEdit() {
+  resetScheduleForm();
+  toast("수정을 취소했습니다.");
 }
 
 async function createSchedule() {
@@ -904,12 +989,18 @@ async function createSchedule() {
   if (!numbers.length) { toast("발신할 번호를 한 개 이상 입력하세요.", "err"); return; }
   if (!$("schedStart").value) { toast("실행 시각을 지정하세요.", "err"); return; }
   const type = scheduleType();
+  const editingId = state.editingScheduleId;
+  const rawTotal = parseInt($("sTotalCalls").value || "0", 10);
+  if (rawTotal > 5000) { toast("총 통화 횟수는 5000건까지 지정할 수 있습니다.", "err"); return; }
+  const totalCalls = rawTotal > 0 ? rawTotal : null;
   const payload = {
     name: $("schedName").value.trim(),
     type,
     numbers,
-    repeat_count: Math.max(1, parseInt($("schedRepeat").value || "1", 10)),
-    order_mode: $("schedOrder").value,
+    total_calls: totalCalls,
+    // 예전 앱/API 호환용. 총 건수가 지정되면 서버는 total_calls 를 기준으로 만든다.
+    repeat_count: totalCalls !== null ? Math.min(1000, Math.max(1, Math.ceil(totalCalls / numbers.length))) : 1,
+    order_mode: $("sOrder").value,
     start_at: $("schedStart").value,
     recurrence: $("schedRecurrence").value,
     device_id: $("schedDevice").value || null,
@@ -924,8 +1015,16 @@ async function createSchedule() {
   const button = $("createScheduleBtn");
   button.disabled = true;
   try {
-    const created = await api("/api/schedules", { method: "POST", body: JSON.stringify(payload) });
-    toast(`스케줄을 등록했습니다. (${created.schedule.tasks_per_run}건 × ${RECURRENCE[created.schedule.recurrence]})`, "ok");
+    const saved = editingId
+      ? await api(`/api/schedules/${editingId}`, { method: "PATCH", body: JSON.stringify(payload) })
+      : await api("/api/schedules", { method: "POST", body: JSON.stringify(payload) });
+    const schedule = saved.schedule;
+    toast(
+      editingId
+        ? `스케줄 #${editingId}을 수정했습니다. (총 ${schedule.tasks_per_run}건 × ${RECURRENCE[schedule.recurrence] || "1회"})`
+        : `스케줄을 등록했습니다. (총 ${schedule.tasks_per_run}건 × ${RECURRENCE[schedule.recurrence] || "1회"})`,
+      "ok"
+    );
     resetScheduleForm();
     loadSchedules();
   } catch (e) {
@@ -950,17 +1049,21 @@ async function loadSchedules() {
             ? `${progressBar(latest.done_tasks, latest.total_tasks)}<div style="margin-top:4px">${statusBadge(RUN_STATUS, latest.status)}</div>`
             : '<span class="muted">-</span>';
           const detail = s.type === "call" ? `${s.max_call_duration_sec}초 제한` : (s.sms_body || "").slice(0, 30);
+          const amountText = `총 ${s.tasks_per_run}회`;
+          const orderText = ORDER_MODE[s.order_mode] || s.order_mode || "순차";
+          const legacyText = s.total_calls == null ? ` (${s.number_count}개 × ${s.repeat_count}회)` : "";
           return `
           <tr>
             <td><b>${esc(s.name)}</b><div class="muted" style="font-size:11.5px">#${s.id} · ${esc(detail)}</div></td>
             <td>${typeTag(s.type)}</td>
-            <td class="nowrap">${s.number_count}개 × ${s.repeat_count}회<div class="muted mono" style="font-size:11.5px">${s.tasks_per_run}건/회</div></td>
+            <td class="nowrap"><b>${esc(amountText)}</b><div class="muted" style="font-size:11.5px">${esc(orderText)} · 번호 ${s.number_count}개${esc(legacyText)}</div></td>
             <td class="nowrap">${esc(RECURRENCE[s.recurrence] || s.recurrence)}<div class="muted" style="font-size:11.5px">${esc(s.start_at_text)}</div></td>
             <td class="nowrap">${s.next_run_at ? esc(s.next_run_text) : '<span class="muted">-</span>'}</td>
             <td style="min-width:130px">${latestCell}</td>
             <td>${statusBadge(SCHED_STATUS, s.status)}</td>
             <td>
               <div class="cell-actions">
+                <button class="btn sm" onclick="startEditSchedule(${s.id})">수정</button>
                 <button class="btn sm" onclick="runScheduleNow(${s.id})">지금 실행</button>
                 ${s.status === "active"
                   ? `<button class="btn sm" onclick="setScheduleStatus(${s.id},'pause')">일시정지</button>`
@@ -996,6 +1099,7 @@ async function deleteSchedule(id) {
   try {
     await api(`/api/schedules/${id}`, { method: "DELETE" });
     toast("스케줄을 삭제했습니다.", "ok");
+    if (state.editingScheduleId === id) resetScheduleForm();
     loadSchedules();
   } catch (e) { toast(e.message, "err"); }
 }

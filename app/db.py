@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     type                   TEXT NOT NULL CHECK (type IN ('call', 'sms')),
     numbers                TEXT NOT NULL,
     repeat_count           INTEGER NOT NULL DEFAULT 1,
+    total_calls            INTEGER,
     order_mode             TEXT NOT NULL DEFAULT 'sequence',
     max_call_duration_sec  INTEGER,
     sms_body               TEXT,
@@ -159,10 +160,24 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("COMMIT")
 
 
+def _migrate(conn: sqlite3.Connection) -> list[str]:
+    """기존 DB(운영 중인 Railway 볼륨)에 없는 컬럼을 조용히 추가한다."""
+    added: list[str] = []
+    schedule_columns = {row["name"] for row in conn.execute("PRAGMA table_info(schedules)")}
+    if "total_calls" not in schedule_columns:
+        # 총 발신 횟수(지정 시 번호 개수 × 반복 횟수 대신 사용). 기존 스케줄은 NULL = 기존 방식 유지.
+        conn.execute("ALTER TABLE schedules ADD COLUMN total_calls INTEGER")
+        added.append("schedules.total_calls")
+    return added
+
+
 def init_db(path: str | Path | None = None) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        added = _migrate(conn)
+        if added:
+            log(conn, f"DB 스키마 마이그레이션: {', '.join(added)} 컬럼 추가", "warning")
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, datetime('now'))",

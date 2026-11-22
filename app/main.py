@@ -30,7 +30,7 @@ from .models import (
     TelegramTest,
 )
 from . import telegram_client
-from .timeutil import iso, local_str, now, parse_dt
+from .timeutil import iso, local_str, next_occurrence, now, parse_dt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("auto-dialer")
@@ -191,6 +191,8 @@ def task_dict(row: sqlite3.Row) -> dict:
 
 def schedule_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     numbers = json_list(row["numbers"])
+    total_calls = row["total_calls"] if "total_calls" in row.keys() else None
+    per_run = total_calls if total_calls is not None else len(numbers) * max(1, row["repeat_count"] or 1)
     latest = conn.execute(
         "SELECT * FROM runs WHERE schedule_id = ? ORDER BY id DESC LIMIT 1", (row["id"],)
     ).fetchone()
@@ -205,6 +207,7 @@ def schedule_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "numbers": numbers,
         "number_count": len(numbers),
         "repeat_count": row["repeat_count"],
+        "total_calls": total_calls,
         "order_mode": row["order_mode"] or "sequence",
         "max_call_duration_sec": row["max_call_duration_sec"],
         "sms_body": row["sms_body"],
@@ -217,7 +220,7 @@ def schedule_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "next_run_text": local_str(row["next_run_at"], "%Y-%m-%d %H:%M") if row["next_run_at"] else "-",
         "last_run_at": row["last_run_at"],
         "run_count": row["run_count"],
-        "tasks_per_run": len(numbers) * max(1, row["repeat_count"] or 1),
+        "tasks_per_run": per_run,
         "pending_tasks": opens,
         "latest_run": (
             {
@@ -484,14 +487,15 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
     created = iso(now())
     with db.transaction(conn):
         cursor = conn.execute(
-            """INSERT INTO schedules(name, type, numbers, repeat_count, order_mode, max_call_duration_sec,
+            """INSERT INTO schedules(name, type, numbers, repeat_count, total_calls, order_mode, max_call_duration_sec,
                                      sms_body, start_at, recurrence, device_id, status, next_run_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
             (
                 payload.name,
                 payload.type,
                 json.dumps(payload.numbers, ensure_ascii=False),
                 payload.repeat_count,
+                payload.total_calls,
                 payload.order_mode,
                 payload.max_call_duration_sec,
                 payload.sms_body,
@@ -503,10 +507,15 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
             ),
         )
         schedule_id = int(cursor.lastrowid)
+        amount = (
+            f"총 {payload.total_calls}건"
+            if payload.total_calls is not None
+            else f"{len(payload.numbers)}개 번호 × {payload.repeat_count}회"
+        )
         db.log(
             conn,
-            f"스케줄 등록: '{payload.name}' {payload.type} {len(payload.numbers)}개 번호 × {payload.repeat_count}회 "
-            f"({payload.recurrence}, {iso(start_at)})",
+            f"스케줄 등록: '{payload.name}' {payload.type} {amount} "
+            f"({payload.order_mode}, {payload.recurrence}, {iso(start_at)})",
         )
     row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
     return {"ok": True, "schedule": schedule_dict(conn, row)}
@@ -520,22 +529,172 @@ def get_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn))
     return {"schedule": schedule_dict(conn, row)}
 
 
+def _next_run_after_edit(
+    start_at: datetime,
+    recurrence: str,
+    current: datetime,
+    allow_now: bool = False,
+    run_count: int = 0,
+) -> str | None:
+    """수정된 시작 시각/주기로 다음 실행 시각을 계산한다."""
+    if start_at > current:
+        return iso(start_at)
+    if recurrence != "once":
+        candidate: datetime | None = start_at
+        guard = 0
+        while candidate is not None and candidate <= current and guard < 1000:
+            candidate = next_occurrence(candidate, recurrence)
+            guard += 1
+        return iso(candidate) if candidate is not None else None
+    # 1회성인데 시작 시각이 이미 지난 경우
+    if allow_now:
+        return iso(current)
+    if run_count <= 0:
+        return iso(start_at)
+    return None
+
+
 @api.patch("/schedules/{schedule_id}")
 def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Connection = Depends(get_conn)):
     row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
-    if payload.name is not None:
-        conn.execute("UPDATE schedules SET name = ? WHERE id = ?", (payload.name[:120], schedule_id))
-    if payload.status is not None:
+
+    provided = set(payload.model_fields_set)
+    if not provided:
+        raise HTTPException(status_code=400, detail="수정할 항목을 하나 이상 보내야 합니다.")
+
+    new = {
+        "name": row["name"],
+        "type": row["type"],
+        "numbers": json_list(row["numbers"]),
+        "repeat_count": row["repeat_count"],
+        "total_calls": row["total_calls"] if "total_calls" in row.keys() else None,
+        "order_mode": row["order_mode"] or "sequence",
+        "max_call_duration_sec": row["max_call_duration_sec"],
+        "sms_body": row["sms_body"],
+        "start_at": row["start_at"],
+        "recurrence": row["recurrence"],
+        "device_id": row["device_id"],
+        "status": row["status"],
+    }
+    before = dict(new)
+
+    if "name" in provided and payload.name is not None:
+        new["name"] = payload.name.strip()
+    if "type" in provided and payload.type is not None:
+        new["type"] = payload.type
+    if "numbers" in provided:
+        new["numbers"] = list(payload.numbers or [])
+    if "repeat_count" in provided and payload.repeat_count is not None:
+        new["repeat_count"] = payload.repeat_count
+    if "total_calls" in provided:
+        new["total_calls"] = payload.total_calls
+    if "order_mode" in provided and payload.order_mode is not None:
+        new["order_mode"] = payload.order_mode
+    if "max_call_duration_sec" in provided:
+        new["max_call_duration_sec"] = payload.max_call_duration_sec
+    if "sms_body" in provided:
+        new["sms_body"] = payload.sms_body
+    if "start_at" in provided and payload.start_at is not None:
+        new["start_at"] = payload.start_at
+    if "recurrence" in provided and payload.recurrence is not None:
+        new["recurrence"] = payload.recurrence
+    if "device_id" in provided:
+        new["device_id"] = payload.device_id
+    if "status" in provided and payload.status is not None:
+        new["status"] = payload.status
+
+    # 발신 유형에 맞춰 필수 항목 점검
+    if new["type"] == "call":
+        if not new["max_call_duration_sec"]:
+            new["max_call_duration_sec"] = config.DEFAULT_CALL_MAX_SEC
+        new["sms_body"] = None
+    else:
+        if not (new["sms_body"] or "").strip():
+            raise HTTPException(status_code=400, detail="문자 발신에는 문자 내용(sms_body)이 필요합니다.")
+        new["sms_body"] = new["sms_body"].strip()
+        new["max_call_duration_sec"] = None
+
+    if not new["numbers"]:
+        raise HTTPException(status_code=400, detail="발신할 전화번호를 1개 이상 입력하세요.")
+
+    start_dt = parse_dt(new["start_at"]) or now()
+    if not new["name"]:
+        label = "전화" if new["type"] == "call" else "문자"
+        new["name"] = f"{label} 발신 {start_dt.strftime('%m-%d %H:%M')}"
+
+    # 다음 실행 시각 · 상태
+    current = now()
+    schedule_changed = bool({"start_at", "recurrence"} & provided)
+    explicitly_status = "status" in provided and payload.status is not None
+    if schedule_changed and not explicitly_status and new["status"] == "finished" and start_dt > current:
+        # 지난 1회성 일정의 실행 시각을 미래로 옮기면 다시 예약한다.
+        new["status"] = "active"
+
+    if new["status"] == "finished":
+        next_run = None
+    elif new["status"] == "paused":
+        # 일시정지는 예약을 잃지 않도록 기존 값을 두고, 시각이 바뀌었으면 다시 계산해 둔다.
         next_run = row["next_run_at"]
-        if payload.status == "active" and not next_run:
-            start_at = parse_dt(row["start_at"]) or now()
-            next_run = iso(start_at if start_at > now() else now())
-        conn.execute(
-            "UPDATE schedules SET status = ?, next_run_at = ? WHERE id = ?",
-            (payload.status, next_run, schedule_id),
+        if schedule_changed:
+            next_run = _next_run_after_edit(start_dt, new["recurrence"], current, run_count=row["run_count"] or 0)
+    elif schedule_changed or explicitly_status:
+        next_run = _next_run_after_edit(
+            start_dt,
+            new["recurrence"],
+            current,
+            allow_now=explicitly_status,
+            run_count=row["run_count"] or 0,
         )
+    else:
+        next_run = row["next_run_at"]
+
+    with db.transaction(conn):
+        conn.execute(
+            """UPDATE schedules SET name = ?, type = ?, numbers = ?, repeat_count = ?, total_calls = ?,
+                                  order_mode = ?, max_call_duration_sec = ?, sms_body = ?, start_at = ?,
+                                  recurrence = ?, device_id = ?, status = ?, next_run_at = ?
+               WHERE id = ?""",
+            (
+                new["name"][:120],
+                new["type"],
+                json.dumps(new["numbers"], ensure_ascii=False),
+                new["repeat_count"],
+                new["total_calls"],
+                new["order_mode"],
+                new["max_call_duration_sec"],
+                new["sms_body"],
+                iso(start_dt),
+                new["recurrence"],
+                new["device_id"],
+                new["status"],
+                next_run,
+                schedule_id,
+            ),
+        )
+        changes = []
+        if before["numbers"] != new["numbers"]:
+            changes.append(f"번호 {len(before['numbers'])}개→{len(new['numbers'])}개")
+        if before["total_calls"] != new["total_calls"]:
+            changes.append(f"총 발신 {before['total_calls'] or '-'}→{new['total_calls'] or '-'}회")
+        if before["order_mode"] != new["order_mode"]:
+            changes.append(f"순서 {before['order_mode']}→{new['order_mode']}")
+        if before["type"] != new["type"]:
+            changes.append(f"유형 {before['type']}→{new['type']}")
+        if before["start_at"] != iso(start_dt):
+            changes.append(f"실행 시각 {local_str(before['start_at'], '%m-%d %H:%M')}→{local_str(iso(start_dt), '%m-%d %H:%M')}")
+        if before["recurrence"] != new["recurrence"]:
+            changes.append(f"주기 {before['recurrence']}→{new['recurrence']}")
+        if (before["device_id"] or "") != (new["device_id"] or ""):
+            changes.append(f"기기 {before['device_id'] or '전체'}→{new['device_id'] or '전체'}")
+        if before["status"] != new["status"]:
+            changes.append(f"상태 {before['status']}→{new['status']}")
+        if before["name"] != new["name"]:
+            changes.append("이름 변경")
+        detail = f" ({', '.join(changes)})" if changes else ""
+        db.log(conn, f"스케줄 수정: #{schedule_id} '{new['name']}'{detail}")
+
     row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
     return {"ok": True, "schedule": schedule_dict(conn, row)}
 

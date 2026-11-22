@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import datetime, timedelta
 
 import pytest
@@ -934,3 +935,401 @@ def test_dashboard_has_queue_delete_controls(client):
     html = client.get("/").text
     for keyword in ("선택 삭제", "대기열 전체 삭제", "taskSelectAll", "bulk-delete"):
         assert keyword in html
+
+
+# --------------------------------------------------------------------------
+# 20. 총 발신 횟수(total_calls) · 순차/랜덤 순서 · 스케줄 수정(PATCH)
+# --------------------------------------------------------------------------
+def _tasks_of(client, schedule_id, limit=1000):
+    tasks = client.get("/api/tasks", params={"schedule_id": schedule_id, "limit": limit}).json()["tasks"]
+    return sorted(tasks, key=lambda t: t["seq"])
+
+
+@pytest.mark.parametrize("total_calls", [1, 2, 3, 4, 7])
+def test_expand_tasks_total_calls_sequence(total_calls):
+    numbers = ["A", "B", "C"]
+    pairs = scheduler.expand_tasks(numbers, 5, "sequence", total_calls=total_calls)
+    assert len(pairs) == total_calls
+    assert [number for number, _ in pairs] == [numbers[i % 3] for i in range(total_calls)]
+    assert [round_ for _, round_ in pairs] == [i // 3 + 1 for i in range(total_calls)]
+
+
+def test_expand_tasks_total_calls_overrides_repeat_count():
+    # 25개 번호에 총 10건 (번호 수보다 적게)
+    numbers = [f"N{i:02d}" for i in range(25)]
+    pairs = scheduler.expand_tasks(numbers, 4, "sequence", total_calls=10)
+    assert len(pairs) == 10
+    assert [number for number, _ in pairs] == numbers[:10]
+
+    # 25개 번호에 총 60건 (번호 수보다 많게)
+    pairs = scheduler.expand_tasks(numbers, 1, "sequence", total_calls=60)
+    assert len(pairs) == 60
+    assert [number for number, _ in pairs] == [numbers[i % 25] for i in range(60)]
+
+    # repeat_count 만 쓰는 기존 방식은 그대로
+    assert len(scheduler.expand_tasks(numbers, 4)) == 100
+    assert scheduler.expand_tasks(numbers, 4, "sequence", total_calls=None) == scheduler.expand_tasks(numbers, 4)
+
+
+@pytest.mark.parametrize("total_calls", [2, 3, 4, 7, 25, 60])
+def test_expand_tasks_total_calls_random(total_calls):
+    numbers = ["A", "B", "C", "D", "E"]
+    pairs = scheduler.expand_tasks(numbers, 1, "random", total_calls=total_calls)
+    assert len(pairs) == total_calls
+
+    phones = [number for number, _ in pairs]
+    assert set(phones) <= set(numbers)
+    # 바로 앞 번호가 연속으로 다시 나오지 않는다
+    assert all(previous != current for previous, current in zip(phones, phones[1:]))
+    assert [round_ for _, round_ in pairs] == [i // 5 + 1 for i in range(total_calls)]
+
+    counts = Counter(phones)
+    low, high = total_calls // 5, total_calls // 5 + (1 if total_calls % 5 else 0)
+    assert min(counts.values()) >= (low if low else 1)
+    assert max(counts.values()) <= max(high, 1)
+
+
+def test_expand_tasks_random_shuffles_order():
+    numbers = [f"N{i:02d}" for i in range(10)]
+    pairs = scheduler.expand_tasks(numbers, 1, "random", total_calls=50)
+    phones = [number for number, _ in pairs]
+    assert set(phones) == set(numbers)
+    assert phones != [numbers[i % 10] for i in range(50)]
+
+
+def test_expand_tasks_random_single_number_and_grouped():
+    assert scheduler.expand_tasks(["A"], 1, "random", total_calls=3) == [("A", 1), ("A", 2), ("A", 3)]
+
+    # grouped 는 기존 동작 유지 + 총 건수만큼 잘라내거나 이어 붙인다
+    assert scheduler.expand_tasks(["A", "B"], 2, "grouped") == [("A", 1), ("A", 2), ("B", 1), ("B", 2)]
+    assert scheduler.expand_tasks(["A", "B"], 2, "grouped", total_calls=3) == [("A", 1), ("A", 2), ("B", 1)]
+    assert scheduler.expand_tasks(["A", "B"], 2, "grouped", total_calls=6) == [
+        ("A", 1),
+        ("A", 2),
+        ("B", 1),
+        ("B", 2),
+        ("A", 3),
+        ("A", 4),
+    ]
+
+
+def test_expand_tasks_total_calls_capped_and_empty():
+    assert len(scheduler.expand_tasks(["A", "B"], 1, "sequence", total_calls=10**6)) == config.MAX_TOTAL_CALLS
+    assert scheduler.expand_tasks([], 3, "sequence", total_calls=5) == []
+    assert scheduler.expand_tasks(["A", " "], 1, "random", total_calls=2) == [("A", 1), ("A", 2)]
+
+
+def test_create_schedule_with_total_calls_and_random_order(client):
+    numbers = [f"010-8800-{index:04d}" for index in range(1, 26)]  # 25개
+    schedule = make_schedule(client, numbers=numbers, total_calls=60, order_mode="random")
+    assert schedule["number_count"] == 25
+    assert schedule["total_calls"] == 60
+    assert schedule["tasks_per_run"] == 60
+    assert schedule["order_mode"] == "random"
+
+    run = client.post(f"/api/schedules/{schedule['id']}/run-now").json()
+    assert run["run_id"]
+    tasks = _tasks_of(client, schedule["id"])
+    assert len(tasks) == 60
+    phones = [task["phone_number"] for task in tasks]
+    assert set(phones) <= set(numbers)
+    # 25개 번호가 60건에 고르게(2~3회) 나뉜다
+    assert set(Counter(phones).values()) <= {2, 3}
+    # 랜덤 순서지만 같은 번호가 연달아 나가지는 않는다
+    assert all(previous != current for previous, current in zip(phones, phones[1:]))
+    assert [task["repeat_index"] for task in tasks] == [i // 25 + 1 for i in range(60)]
+
+    # 대시보드 목록에서도 총 건수/순서가 보인다
+    listed = client.get("/api/schedules").json()["schedules"][0]
+    assert listed["total_calls"] == 60
+    assert listed["tasks_per_run"] == 60
+    assert listed["order_mode"] == "random"
+
+
+def test_create_schedule_total_calls_fewer_than_numbers(client):
+    numbers = ["010-9900-0001", "010-9900-0002", "010-9900-0003", "010-9900-0004", "010-9900-0005"]
+    schedule = make_schedule(client, numbers=numbers, total_calls=3, order_mode="sequence")
+    assert schedule["tasks_per_run"] == 3
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    tasks = _tasks_of(client, schedule["id"])
+    assert [task["phone_number"] for task in tasks] == numbers[:3]
+
+
+def test_create_schedule_legacy_repeat_count_has_no_total_calls(client):
+    schedule = make_schedule(client, numbers=["010-7700-0001", "010-7700-0002"], repeat_count=3)
+    assert schedule["total_calls"] is None
+    assert schedule["repeat_count"] == 3
+    assert schedule["tasks_per_run"] == 6
+
+
+@pytest.mark.parametrize("bad_total", [0, -1, config.MAX_TOTAL_CALLS + 1])
+def test_total_calls_out_of_range_rejected(client, bad_total):
+    response = client.post(
+        "/api/schedules",
+        json={
+            "type": "call",
+            "numbers": ["010-1234-0001"],
+            "start_at": "2026-11-23T09:00",
+            "total_calls": bad_total,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_create_schedule_rejects_unknown_order_mode(client):
+    response = client.post(
+        "/api/schedules",
+        json={"type": "call", "numbers": ["010-1234-0001"], "start_at": "2026-11-23T09:00", "order_mode": "shuffle"},
+    )
+    assert response.status_code == 422
+
+
+def test_update_schedule_changes_all_fields(client):
+    schedule = make_schedule(client, numbers=["010-6600-0001", "010-6600-0002", "010-6600-0003"], repeat_count=2)
+    new_numbers = ["010-6600-0011", "010-6600-0012", "010-6600-0013", "010-6600-0014"]
+
+    response = client.patch(
+        f"/api/schedules/{schedule['id']}",
+        json={
+            "name": "수정된 스케줄",
+            "numbers": new_numbers,
+            "total_calls": 10,
+            "order_mode": "random",
+            "max_call_duration_sec": 45,
+            "device_id": "DEV-9",
+            "start_at": "2026-11-25T14:30",
+            "recurrence": "weekly",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()["schedule"]
+    assert body["id"] == schedule["id"]
+    assert body["name"] == "수정된 스케줄"
+    assert body["numbers"] == new_numbers
+    assert body["number_count"] == 4
+    assert body["total_calls"] == 10
+    assert body["tasks_per_run"] == 10
+    assert body["order_mode"] == "random"
+    assert body["max_call_duration_sec"] == 45
+    assert body["device_id"] == "DEV-9"
+    assert body["recurrence"] == "weekly"
+    assert parse_dt(body["start_at"]) == datetime(2026, 11, 25, 14, 30, tzinfo=TZ)
+    assert parse_dt(body["next_run_at"]) == datetime(2026, 11, 25, 14, 30, tzinfo=TZ)
+
+    # 수정한 내용대로 실제 작업이 만들어진다
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    tasks = _tasks_of(client, schedule["id"])
+    assert len(tasks) == 10
+    assert {task["phone_number"] for task in tasks} <= set(new_numbers)
+    assert all(task["device_id"] == "DEV-9" for task in tasks)
+    assert all(task["max_call_duration_sec"] == 45 for task in tasks)
+    assert all(
+        previous != current
+        for previous, current in zip([t["phone_number"] for t in tasks], [t["phone_number"] for t in tasks][1:])
+    )
+
+
+def test_update_schedule_only_changes_given_fields(client):
+    schedule = make_schedule(
+        client,
+        numbers=["010-5500-0001", "010-5500-0002"],
+        repeat_count=2,
+        order_mode="grouped",
+        start_at="2026-11-23T09:00",
+        recurrence="daily",
+    )
+    updated = client.patch(f"/api/schedules/{schedule['id']}", json={"total_calls": 6}).json()["schedule"]
+    assert updated["total_calls"] == 6
+    assert updated["tasks_per_run"] == 6
+    assert updated["numbers"] == ["010-5500-0001", "010-5500-0002"]
+    assert updated["repeat_count"] == 2
+    assert updated["order_mode"] == "grouped"
+    assert updated["recurrence"] == "daily"
+    assert updated["start_at"] == schedule["start_at"]
+    assert updated["next_run_at"] == schedule["next_run_at"]
+
+    # total_calls 를 지우면(NULL) 기존 번호×반복 방식으로 돌아간다
+    cleared = client.patch(f"/api/schedules/{schedule['id']}", json={"total_calls": None}).json()["schedule"]
+    assert cleared["total_calls"] is None
+    assert cleared["tasks_per_run"] == 4
+
+
+def test_update_schedule_recomputes_next_run_on_recurrence(client):
+    schedule = make_schedule(client, start_at="2026-11-23T09:00", recurrence="once")
+    updated = client.patch(f"/api/schedules/{schedule['id']}", json={"recurrence": "daily"}).json()["schedule"]
+    assert updated["recurrence"] == "daily"
+    assert parse_dt(updated["next_run_at"]) == datetime(2026, 11, 23, 9, 0, tzinfo=TZ)
+
+
+def test_update_start_at_reactivates_finished_schedule(client):
+    schedule = make_schedule(client, start_at="2026-11-20T09:00", recurrence="once")
+    conn = _conn()
+    scheduler.run_due_schedules(conn, current=parse_dt("2026-11-20T09:01"))
+    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule["id"],)).fetchone()
+    assert row["status"] == "finished"
+    assert row["next_run_at"] is None
+    conn.close()
+
+    updated = client.patch(f"/api/schedules/{schedule['id']}", json={"start_at": "2026-11-26T10:00"}).json()["schedule"]
+    assert updated["status"] == "active"
+    assert parse_dt(updated["next_run_at"]) == datetime(2026, 11, 26, 10, 0, tzinfo=TZ)
+
+    # 상태를 명시해서 보내면 그 값이 우선한다
+    paused = client.patch(
+        f"/api/schedules/{schedule['id']}",
+        json={"start_at": "2026-11-27T10:00", "status": "paused"},
+    ).json()["schedule"]
+    assert paused["status"] == "paused"
+    assert parse_dt(paused["next_run_at"]) == datetime(2026, 11, 27, 10, 0, tzinfo=TZ)
+
+
+def test_update_schedule_status_patch_compatible(client):
+    schedule = make_schedule(client, start_at="2026-11-23T09:00", recurrence="daily")
+    paused = client.patch(f"/api/schedules/{schedule['id']}", json={"status": "paused"}).json()["schedule"]
+    assert paused["status"] == "paused"
+    assert paused["next_run_at"] == schedule["next_run_at"]
+
+    active = client.patch(f"/api/schedules/{schedule['id']}", json={"status": "active"}).json()["schedule"]
+    assert active["status"] == "active"
+    assert active["next_run_at"] is not None
+
+
+def test_update_schedule_type_switch(client):
+    schedule = make_schedule(client, numbers=["010-4400-0001"], repeat_count=2)
+
+    missing_body = client.patch(f"/api/schedules/{schedule['id']}", json={"type": "sms"})
+    assert missing_body.status_code == 400
+
+    switched = client.patch(
+        f"/api/schedules/{schedule['id']}",
+        json={"type": "sms", "sms_body": "  안내 문자입니다.  "},
+    ).json()["schedule"]
+    assert switched["type"] == "sms"
+    assert switched["sms_body"] == "안내 문자입니다."
+    assert switched["max_call_duration_sec"] is None
+    assert switched["tasks_per_run"] == 2
+
+    back = client.patch(f"/api/schedules/{schedule['id']}", json={"type": "call"}).json()["schedule"]
+    assert back["type"] == "call"
+    assert back["sms_body"] is None
+    assert back["max_call_duration_sec"] == config.DEFAULT_CALL_MAX_SEC
+
+
+@pytest.mark.parametrize(
+    "payload, status_code",
+    [
+        ({}, 422),
+        ({"name": "x"}, 404),
+        ({"numbers": []}, 422),
+        ({"numbers": ["abc"]}, 422),
+        ({"start_at": "언젠가"}, 422),
+        ({"total_calls": 0}, 422),
+        ({"total_calls": config.MAX_TOTAL_CALLS + 1}, 422),
+        ({"order_mode": "shuffle"}, 422),
+        ({"max_call_duration_sec": 0}, 422),
+        ({"device_id": None}, 200),
+    ],
+)
+def test_update_schedule_validation(client, payload, status_code):
+    schedule = make_schedule(client)
+    target = 999999 if status_code == 404 else schedule["id"]
+    response = client.patch(f"/api/schedules/{target}", json=payload)
+    assert response.status_code == status_code, response.text
+
+
+def test_update_schedule_is_logged(client):
+    schedule = make_schedule(client)
+    client.patch(
+        f"/api/schedules/{schedule['id']}",
+        json={"numbers": ["010-3300-0001"], "total_calls": 4, "order_mode": "random"},
+    )
+    logs = client.get("/api/logs").json()["logs"]
+    assert any("스케줄 수정" in entry["message"] and "random" in entry["message"] for entry in logs)
+
+
+OLD_SCHEDULES_SCHEMA = """
+CREATE TABLE schedules (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                   TEXT NOT NULL DEFAULT '',
+    type                   TEXT NOT NULL CHECK (type IN ('call', 'sms')),
+    numbers                TEXT NOT NULL,
+    repeat_count           INTEGER NOT NULL DEFAULT 1,
+    order_mode             TEXT NOT NULL DEFAULT 'sequence',
+    max_call_duration_sec  INTEGER,
+    sms_body               TEXT,
+    start_at               TEXT NOT NULL,
+    recurrence             TEXT NOT NULL DEFAULT 'once',
+    device_id              TEXT,
+    status                 TEXT NOT NULL DEFAULT 'active',
+    next_run_at            TEXT,
+    last_run_at            TEXT,
+    run_count              INTEGER NOT NULL DEFAULT 0,
+    created_at             TEXT NOT NULL
+);
+"""
+
+
+def test_db_migration_adds_total_calls_to_existing_db(tmp_path, monkeypatch):
+    import sqlite3
+
+    old_db = tmp_path / "old.db"
+    raw = sqlite3.connect(old_db)
+    raw.executescript(OLD_SCHEDULES_SCHEMA)
+    raw.execute(
+        """INSERT INTO schedules(name, type, numbers, repeat_count, order_mode, max_call_duration_sec,
+                                 start_at, recurrence, status, next_run_at, created_at)
+           VALUES ('기존 스케줄', 'call', ?, 2, 'sequence', 30, '2026-11-23T09:00:00+09:00', 'once',
+                   'active', '2026-11-23T09:00:00+09:00', '2026-11-20T10:00:00+09:00')""",
+        (json.dumps(["010-2200-0001", "010-2200-0002"]),),
+    )
+    raw.commit()
+    raw.close()
+
+    db.init_db(old_db)  # 운영 중인 DB 에 total_calls 컬럼 추가
+
+    conn = sqlite3.connect(old_db)
+    conn.row_factory = sqlite3.Row
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(schedules)")}
+    assert "total_calls" in columns
+    row = conn.execute("SELECT * FROM schedules").fetchone()
+    assert row["name"] == "기존 스케줄"
+    assert row["repeat_count"] == 2
+    assert row["total_calls"] is None
+    conn.close()
+
+    # 마이그레이션 후에도 기존 스케줄은 예전 방식(번호 × 반복)대로 동작한다
+    monkeypatch.setattr(config, "DB_PATH", old_db)
+    with TestClient(app) as migrated_client:
+        schedules = migrated_client.get("/api/schedules").json()["schedules"]
+        assert schedules[0]["total_calls"] is None
+        assert schedules[0]["tasks_per_run"] == 4
+        run = migrated_client.post(f"/api/schedules/{schedules[0]['id']}/run-now").json()
+        tasks = migrated_client.get("/api/tasks", params={"schedule_id": schedules[0]["id"]}).json()["tasks"]
+        assert run["run_id"]
+        assert len(tasks) == 4
+
+    # 두 번 실행해도 안전(마이그레이션 멱등)
+    db.init_db(old_db)
+    conn = sqlite3.connect(old_db)
+    assert {row[1] for row in conn.execute("PRAGMA table_info(schedules)")} >= {"total_calls"}
+    assert conn.execute("SELECT COUNT(*) FROM schedules").fetchone()[0] == 1
+    conn.close()
+
+
+def test_dashboard_has_total_calls_edit_mode_and_order_options(client):
+    html = client.get("/").text
+    for keyword in (
+        'id="sTotalCalls"',
+        'id="sOrder"',
+        "총 통화 횟수",
+        "발신량 / 순서",
+        "순차",
+        "랜덤",
+        "수정",
+        "스케줄 수정 저장",
+        "수정 취소",
+        "PATCH",
+        "startEditSchedule",
+        "cancelScheduleEdit",
+    ):
+        assert keyword in html, keyword

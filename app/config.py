@@ -60,6 +60,8 @@ TELEGRAM_MAX_ATTEMPTS = int(os.getenv("TELEGRAM_MAX_ATTEMPTS", "3"))
 DEFAULT_CALL_MAX_SEC = 30
 MAX_CALL_MAX_SEC = 3600
 MAX_REPEAT_COUNT = 1000
+# 한 스케줄 1회 실행에서 만들 수 있는 최대 발신 건수 (총 발신 횟수 상한)
+MAX_TOTAL_CALLS = 5000
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))

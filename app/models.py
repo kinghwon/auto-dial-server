@@ -63,22 +63,44 @@ class DeviceUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
-class ScheduleCreate(BaseModel):
+ORDER_MODES = ("sequence", "grouped", "random")
+
+
+class ScheduleBase(BaseModel):
+    """스케줄 생성/수정에서 같이 쓰는 번호·시각 검증기."""
+
+    @field_validator("numbers", check_fields=False)
+    @classmethod
+    def _numbers(cls, value):
+        return clean_numbers(value)
+
+    @field_validator("sms_body", check_fields=False)
+    @classmethod
+    def _sms_body(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("device_id", check_fields=False)
+    @classmethod
+    def _device(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ScheduleCreate(ScheduleBase):
     name: str = Field(default="", max_length=120)
     type: Literal["call", "sms"]
     numbers: list[str] | str
     repeat_count: int = Field(default=1, ge=1, le=config.MAX_REPEAT_COUNT)
-    order_mode: Literal["sequence", "grouped"] = "sequence"
+    # 총 발신 횟수. 지정하면 번호 개수 × repeat_count 대신 이 건수만큼 만든다.
+    total_calls: Optional[int] = Field(default=None, ge=1, le=config.MAX_TOTAL_CALLS)
+    order_mode: Literal["sequence", "grouped", "random"] = "sequence"
     max_call_duration_sec: Optional[int] = Field(default=None, ge=1, le=config.MAX_CALL_MAX_SEC)
     sms_body: Optional[str] = Field(default=None, max_length=2000)
     start_at: str
     recurrence: Literal["once", "daily", "weekly", "monthly"] = "once"
     device_id: Optional[str] = Field(default=None, max_length=64)
-
-    @field_validator("numbers")
-    @classmethod
-    def _numbers(cls, value):
-        return clean_numbers(value)
 
     @field_validator("start_at")
     @classmethod
@@ -86,19 +108,6 @@ class ScheduleCreate(BaseModel):
         if parse_dt(value) is None:
             raise ValueError("실행 시각을 입력하세요.")
         return value.strip()
-
-    @field_validator("sms_body")
-    @classmethod
-    def _sms_body(cls, value: str | None) -> str | None:
-        return value.strip() if isinstance(value, str) else value
-
-    @field_validator("device_id")
-    @classmethod
-    def _device(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        return value or None
 
     @model_validator(mode="after")
     def _check_type_fields(self):
@@ -118,9 +127,36 @@ class ScheduleCreate(BaseModel):
         return self
 
 
-class ScheduleUpdate(BaseModel):
+class ScheduleUpdate(ScheduleBase):
+    """스케줄 수정(PATCH). 보낸 항목만 바뀐다."""
+
     name: Optional[str] = Field(default=None, max_length=120)
+    type: Optional[Literal["call", "sms"]] = None
+    numbers: Optional[list[str] | str] = None
+    repeat_count: Optional[int] = Field(default=None, ge=1, le=config.MAX_REPEAT_COUNT)
+    total_calls: Optional[int] = Field(default=None, ge=1, le=config.MAX_TOTAL_CALLS)
+    order_mode: Optional[Literal["sequence", "grouped", "random"]] = None
+    max_call_duration_sec: Optional[int] = Field(default=None, ge=1, le=config.MAX_CALL_MAX_SEC)
+    sms_body: Optional[str] = Field(default=None, max_length=2000)
+    start_at: Optional[str] = None
+    recurrence: Optional[Literal["once", "daily", "weekly", "monthly"]] = None
+    device_id: Optional[str] = Field(default=None, max_length=64)
     status: Optional[Literal["active", "paused", "finished"]] = None
+
+    @field_validator("start_at")
+    @classmethod
+    def _start_at(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if parse_dt(value) is None:
+            raise ValueError("실행 시각을 입력하세요.")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _require_change(self):
+        if not self.model_fields_set:
+            raise ValueError("수정할 항목을 하나 이상 보내야 합니다.")
+        return self
 
 
 class TaskBulkDelete(BaseModel):
