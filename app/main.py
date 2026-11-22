@@ -24,6 +24,7 @@ from .models import (
     ScheduleCreate,
     ScheduleUpdate,
     SmsIncoming,
+    TaskBulkDelete,
     TaskResult,
     TelegramSettings,
     TelegramTest,
@@ -628,6 +629,170 @@ def claim_next_task(conn: sqlite3.Connection, device_id: str) -> dict | None:
         )
         fresh = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
         return task_dict(fresh) if fresh else None
+
+
+# 대기열 삭제에서 실제로 없애는 상태 / 취소로 처리하는 상태
+DELETABLE_STATUSES = ("pending", "assigned")
+ACTIVE_STATUSES = ("pending", "assigned", "running")
+
+
+def _recount_runs_after_delete(conn: sqlite3.Connection, run_ids: set[int]) -> list[dict]:
+    """작업이 사라진 실행 묶음(run)의 진행 집계와 상태를 다시 맞춘다.
+
+    남은 작업이 하나도 없거나 완료·실패 없이 취소만 남으면 'canceled' 로 표시해
+    "다 지운 묶음"이 완료(done)처럼 보이지 않게 한다.
+    """
+    updated: list[dict] = []
+    for run_id in sorted(run_ids):
+        counts = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+                      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                      SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
+                      SUM(CASE WHEN status IN ('pending','assigned','running') THEN 1 ELSE 0 END) AS open
+               FROM tasks WHERE run_id = ?""",
+            (run_id,),
+        ).fetchone()
+        total = counts["total"] or 0
+        done = counts["done"] or 0
+        failed = counts["failed"] or 0
+        skipped = counts["skipped"] or 0
+        open_count = counts["open"] or 0
+
+        if total == 0 or (open_count == 0 and done == 0 and failed == 0 and skipped > 0):
+            status = "canceled"
+            conn.execute(
+                """UPDATE runs SET status = 'canceled', total_tasks = ?, done_tasks = ?, failed_tasks = ?,
+                          finished_at = COALESCE(finished_at, ?) WHERE id = ?""",
+                (total - skipped, done, failed, iso(now()), run_id),
+            )
+        elif open_count == 0:
+            status = "done" if failed == 0 else ("failed" if done == 0 else "partial")
+            conn.execute(
+                """UPDATE runs SET status = ?, total_tasks = ?, done_tasks = ?, failed_tasks = ?,
+                          finished_at = COALESCE(finished_at, ?) WHERE id = ?""",
+                (status, total - skipped, done, failed, iso(now()), run_id),
+            )
+        else:
+            status = "running" if (done + failed) > 0 else "pending"
+            conn.execute(
+                """UPDATE runs SET status = ?, total_tasks = ?, done_tasks = ?, failed_tasks = ?
+                   WHERE id = ?""",
+                (status, total, done, failed, run_id),
+            )
+
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None:
+            updated.append(
+                {
+                    "id": row["id"],
+                    "status": row["status"],
+                    "total_tasks": row["total_tasks"],
+                    "done_tasks": row["done_tasks"],
+                    "failed_tasks": row["failed_tasks"],
+                }
+            )
+    return updated
+
+
+def _delete_queue_tasks(
+    conn: sqlite3.Connection,
+    task_ids: list[int] | None = None,
+    all_pending: bool = False,
+    run_id: int | None = None,
+) -> dict:
+    """대기열에서 작업을 지운다.
+
+    - pending(대기)·assigned(배정) 는 tasks 행을 실제로 삭제한다.
+    - running(발신 중) 은 폰이 이미 걸고 있어 되돌릴 수 없으므로 취소(skipped)로 표시한다.
+    - done/failed/skipped 는 기록이므로 건드리지 않고 protected_ids 로 알려 준다.
+    """
+    if all_pending:
+        clauses = ["status IN ('pending','assigned','running')"]
+        values: list = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            values.append(run_id)
+        rows = conn.execute(
+            f"SELECT id, run_id, status FROM tasks WHERE {' AND '.join(clauses)}", values
+        ).fetchall()
+        requested: list[int] = []
+    else:
+        requested = [int(item) for item in dict.fromkeys(task_ids or [])]
+        if not requested:
+            raise HTTPException(status_code=400, detail="삭제할 작업을 선택하세요.")
+        rows = conn.execute(
+            f"SELECT id, run_id, status FROM tasks WHERE id IN ({','.join('?' for _ in requested)})",
+            requested,
+        ).fetchall()
+
+    found_ids = {row["id"] for row in rows}
+    removed = [row["id"] for row in rows if row["status"] in DELETABLE_STATUSES]
+    canceled = [row["id"] for row in rows if row["status"] == "running"]
+    kept = [row["id"] for row in rows if row["status"] not in ACTIVE_STATUSES]
+    missing = [task_id for task_id in requested if task_id not in found_ids]
+
+    if not removed and not canceled:
+        if requested and not found_ids:
+            raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=409,
+            detail="대기·배정 중인 작업만 삭제할 수 있습니다. (완료·취소된 작업은 기록으로 남습니다)",
+        )
+
+    run_ids = {row["run_id"] for row in rows if row["status"] in ACTIVE_STATUSES}
+    finished = iso(now())
+    with db.transaction(conn):
+        if removed:
+            conn.execute(
+                f"DELETE FROM tasks WHERE id IN ({','.join('?' for _ in removed)})", removed
+            )
+        if canceled:
+            conn.execute(
+                f"""UPDATE tasks SET status = 'skipped', device_id = NULL, claimed_at = NULL,
+                          finished_at = ?,
+                          error = COALESCE(error, '대시보드에서 대기열 삭제(진행 중 취소)')
+                   WHERE id IN ({','.join('?' for _ in canceled)})""",
+                [finished] + canceled,
+            )
+        runs = _recount_runs_after_delete(conn, run_ids)
+        label = "전체" if all_pending else "선택"
+        detail = []
+        if removed:
+            detail.append(f"{len(removed)}건 삭제")
+        if canceled:
+            detail.append(f"진행 중 {len(canceled)}건 취소")
+        if kept:
+            detail.append(f"완료·취소 {len(kept)}건 유지")
+        db.log(conn, f"대기열 {label} 삭제: " + " · ".join(detail), "warning")
+
+    return {
+        "ok": True,
+        "deleted_count": len(removed),
+        "deleted_ids": removed,
+        "canceled_count": len(canceled),
+        "canceled_ids": canceled,
+        "protected_ids": kept,
+        "missing_ids": missing,
+        "runs": runs,
+    }
+
+
+@api.delete("/tasks/{task_id}")
+def delete_task(task_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """대기열 작업 1건 삭제(부분 삭제)."""
+    return _delete_queue_tasks(conn, task_ids=[task_id])
+
+
+@api.post("/tasks/bulk-delete")
+def bulk_delete_tasks(payload: TaskBulkDelete, conn: sqlite3.Connection = Depends(get_conn)):
+    """대기열 부분 삭제(task_ids) / 전체 삭제(all_pending)."""
+    return _delete_queue_tasks(
+        conn,
+        task_ids=payload.task_ids,
+        all_pending=payload.all_pending,
+        run_id=payload.run_id,
+    )
 
 
 @api.get("/tasks/poll")

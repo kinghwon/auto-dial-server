@@ -708,3 +708,220 @@ def test_disabled_device_does_not_block_other_devices(client):
     task = client.get("/api/tasks/poll", params={"device_id": "DEV-ON"}).json()["task"]
     assert task is not None
     assert task["phone_number"] == "010-9999-0100"
+
+
+# --------------------------------------------------------------------------
+# 10. 대기열 부분 삭제 / 전체 삭제
+# --------------------------------------------------------------------------
+def queue_tasks(client: TestClient, **params):
+    query = {"limit": 200, **params}
+    return client.get("/api/tasks", params=query).json()["tasks"]
+
+
+def pending_run(client: TestClient, numbers=("010-7777-0001", "010-7777-0002", "010-7777-0003")):
+    schedule = make_schedule(client, numbers=list(numbers), repeat_count=1)
+    run_id = client.post(f"/api/schedules/{schedule['id']}/run-now").json()["run_id"]
+    return schedule, run_id
+
+
+def run_of(client: TestClient, run_id: int) -> dict:
+    return [row for row in client.get("/api/runs").json()["runs"] if row["id"] == run_id][0]
+
+
+def test_delete_single_pending_task(client):
+    schedule, run_id = pending_run(client)
+    tasks = sorted(queue_tasks(client, schedule_id=schedule["id"]), key=lambda t: t["seq"])
+    target = tasks[0]
+
+    response = client.delete(f"/api/tasks/{target['id']}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["deleted_count"] == 1
+    assert body["deleted_ids"] == [target["id"]]
+    assert body["canceled_count"] == 0
+
+    remaining = sorted(queue_tasks(client, schedule_id=schedule["id"]), key=lambda t: t["seq"])
+    assert [t["id"] for t in remaining] == [tasks[1]["id"], tasks[2]["id"]]
+
+    # 실행 묶음 집계가 남은 작업 기준으로 다시 계산된다
+    run = run_of(client, run_id)
+    assert run["total_tasks"] == 2
+    assert run["status"] == "pending"
+
+    # 대시보드 통계에도 즉시 반영된다
+    assert client.get("/api/stats").json()["tasks"]["pending"] == 2
+    # 삭제 이력이 로그에 남는다
+    logs = client.get("/api/logs").json()["logs"]
+    assert any("대기열 선택 삭제" in entry["message"] for entry in logs)
+
+
+def test_delete_last_task_in_run_marks_run_canceled(client):
+    schedule, run_id = pending_run(client, numbers=["010-7777-0101"])
+    task = queue_tasks(client, schedule_id=schedule["id"])[0]
+
+    assert client.delete(f"/api/tasks/{task['id']}").status_code == 200
+    assert queue_tasks(client, schedule_id=schedule["id"]) == []
+    run = run_of(client, run_id)
+    assert run["status"] == "canceled"
+    assert run["total_tasks"] == 0
+
+
+def test_delete_unknown_task_returns_404(client):
+    assert client.delete("/api/tasks/12345").status_code == 404
+
+
+def test_delete_finished_task_is_rejected(client):
+    client.post("/api/devices", json={"device_id": "DEV-DONE"})
+    schedule, _ = pending_run(client, numbers=["010-7777-0201"])
+    task = client.get("/api/tasks/poll", params={"device_id": "DEV-DONE"}).json()["task"]
+    client.post(
+        f"/api/tasks/{task['id']}/result",
+        json={"device_id": "DEV-DONE", "status": "done", "result": "통화 종료"},
+    )
+
+    response = client.delete(f"/api/tasks/{task['id']}")
+    assert response.status_code == 409
+    kept = queue_tasks(client, schedule_id=schedule["id"])
+    assert len(kept) == 1 and kept[0]["status"] == "done"
+
+
+def test_delete_running_task_marks_it_canceled(client):
+    client.post("/api/devices", json={"device_id": "DEV-RUN"})
+    schedule, run_id = pending_run(client, numbers=["010-7777-0301"])
+    task = client.get("/api/tasks/poll", params={"device_id": "DEV-RUN"}).json()["task"]
+    client.post(f"/api/tasks/{task['id']}/start")
+
+    response = client.delete(f"/api/tasks/{task['id']}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["deleted_count"] == 0
+    assert body["canceled_count"] == 1
+    assert body["canceled_ids"] == [task["id"]]
+
+    row = queue_tasks(client, schedule_id=schedule["id"])[0]
+    assert row["status"] == "skipped"
+    assert row["device_id"] is None
+    run = run_of(client, run_id)
+    assert run["status"] == "canceled"
+    assert run["total_tasks"] == 0
+
+    # 폰이 걸고 있던 통화를 마치고 뒤늦게 보고해도 무시된다(중복 처리).
+    late = client.post(f"/api/tasks/{task['id']}/result", json={"device_id": "DEV-RUN", "status": "done"})
+    assert late.status_code == 200
+    assert late.json()["duplicate"] is True
+
+
+def test_bulk_delete_selected_tasks(client):
+    schedule, run_id = pending_run(
+        client,
+        numbers=["010-7777-0401", "010-7777-0402", "010-7777-0403", "010-7777-0404"],
+    )
+    tasks = sorted(queue_tasks(client, schedule_id=schedule["id"]), key=lambda t: t["seq"])
+    ids = [tasks[0]["id"], tasks[2]["id"]]
+
+    response = client.post("/api/tasks/bulk-delete", json={"task_ids": ids})
+    assert response.status_code == 200, response.text
+    assert response.json()["deleted_count"] == 2
+
+    remaining = sorted(queue_tasks(client, schedule_id=schedule["id"]), key=lambda t: t["seq"])
+    assert [t["phone_number"] for t in remaining] == ["010-7777-0402", "010-7777-0404"]
+    run = run_of(client, run_id)
+    assert run["status"] == "pending"
+    assert run["total_tasks"] == 2
+
+
+def test_bulk_delete_duplicate_ids_are_counted_once(client):
+    schedule, _ = pending_run(client, numbers=["010-7777-0501", "010-7777-0502"])
+    task = queue_tasks(client, schedule_id=schedule["id"])[0]
+    body = client.post("/api/tasks/bulk-delete", json={"task_ids": [task["id"], task["id"]]}).json()
+    assert body["deleted_count"] == 1
+    assert body["deleted_ids"] == [task["id"]]
+
+
+def test_bulk_delete_all_pending_queue(client):
+    client.post("/api/devices", json={"device_id": "DEV-KEEP"})
+    first, run_a = pending_run(client, numbers=["010-8888-0001", "010-8888-0002"])
+    second, run_b = pending_run(client, numbers=["010-8888-0003"])
+
+    # 한 건을 먼저 완료 처리해 둔다(전체 삭제는 이 기록을 건드리지 않아야 한다).
+    done_task = client.get("/api/tasks/poll", params={"device_id": "DEV-KEEP"}).json()["task"]
+    client.post(
+        f"/api/tasks/{done_task['id']}/result",
+        json={"device_id": "DEV-KEEP", "status": "done", "duration_sec": 5},
+    )
+
+    response = client.post("/api/tasks/bulk-delete", json={"all_pending": True})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["deleted_count"] == 2
+    assert body["protected_ids"] == []
+
+    assert queue_tasks(client, status="pending,assigned,running") == []
+    done = queue_tasks(client, status="done")
+    assert [t["id"] for t in done] == [done_task["id"]]
+
+    assert run_of(client, run_b)["status"] == "canceled"
+    run_a_row = run_of(client, run_a)
+    assert run_a_row["status"] == "done"  # 완료 1건 + 나머지 삭제
+    assert run_a_row["total_tasks"] == 1
+    assert run_a_row["done_tasks"] == 1
+
+    # 전체 삭제 후 스케줄은 그대로 남아 있다(다음 회차는 정상 실행).
+    schedules = client.get("/api/schedules").json()["schedules"]
+    assert {s["id"] for s in schedules} == {first["id"], second["id"]}
+
+
+def test_bulk_delete_all_pending_within_one_run(client):
+    schedule_a, run_a = pending_run(client, numbers=["010-9999-1001", "010-9999-1002"])
+    schedule_b, run_b = pending_run(client, numbers=["010-9999-1003"])
+
+    body = client.post("/api/tasks/bulk-delete", json={"all_pending": True, "run_id": run_a}).json()
+    assert body["deleted_count"] == 2
+    assert queue_tasks(client, schedule_id=schedule_a["id"]) == []
+    assert len(queue_tasks(client, schedule_id=schedule_b["id"])) == 1
+    assert run_of(client, run_a)["status"] == "canceled"
+    assert run_of(client, run_b)["status"] == "pending"
+
+
+def test_bulk_delete_reports_protected_and_missing(client):
+    client.post("/api/devices", json={"device_id": "DEV-MIX"})
+    schedule, _ = pending_run(client, numbers=["010-8888-1001", "010-8888-1002"])
+    first = client.get("/api/tasks/poll", params={"device_id": "DEV-MIX"}).json()["task"]
+    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-MIX", "status": "failed"})
+    pending = [t for t in queue_tasks(client, schedule_id=schedule["id"]) if t["status"] == "pending"]
+    assert len(pending) == 1
+
+    response = client.post(
+        "/api/tasks/bulk-delete",
+        json={"task_ids": [first["id"], pending[0]["id"], 98765]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["deleted_count"] == 1
+    assert body["protected_ids"] == [first["id"]]
+    assert body["missing_ids"] == [98765]
+    kept = queue_tasks(client, schedule_id=schedule["id"])
+    assert len(kept) == 1 and kept[0]["status"] == "failed"
+
+
+def test_bulk_delete_requires_target(client):
+    assert client.post("/api/tasks/bulk-delete", json={}).status_code == 422
+    assert client.post("/api/tasks/bulk-delete", json={"task_ids": []}).status_code == 422
+
+
+def test_bulk_delete_nothing_to_delete_is_conflict(client):
+    response = client.post("/api/tasks/bulk-delete", json={"all_pending": True})
+    assert response.status_code == 409
+
+
+def test_task_delete_requires_api_key(client, monkeypatch):
+    monkeypatch.setattr(config, "API_KEY", "secret-key")
+    assert client.delete("/api/tasks/1").status_code == 401
+    assert client.post("/api/tasks/bulk-delete", json={"all_pending": True}).status_code == 401
+
+
+def test_dashboard_has_queue_delete_controls(client):
+    html = client.get("/").text
+    for keyword in ("선택 삭제", "대기열 전체 삭제", "taskSelectAll", "bulk-delete"):
+        assert keyword in html

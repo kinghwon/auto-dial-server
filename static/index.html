@@ -182,6 +182,7 @@
   .hint-line{font-size:12px;color:var(--muted);margin-top:10px}
   .truncate{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .cell-actions{display:flex;gap:6px;flex-wrap:wrap}
+  .queue-check{width:16px;height:16px;accent-color:var(--primary);cursor:pointer;vertical-align:middle;margin:0}
   .dot-online{color:var(--ok)}
   .dot-offline{color:#9aa7ba}
   @media(max-width:640px){
@@ -437,8 +438,16 @@
           <button class="btn sm" onclick="loadTasks()">새로고침</button>
         </div>
       </div>
+      <div class="card-body" style="padding:12px 18px;border-bottom:1px solid var(--line)">
+        <div class="btn-row" style="align-items:center">
+          <button class="btn sm danger" id="deleteSelectedBtn" onclick="deleteSelectedTasks()" disabled>선택 삭제 (0)</button>
+          <button class="btn sm danger" id="deleteAllBtn" onclick="deleteAllPendingTasks()">🗑️ 대기열 전체 삭제</button>
+          <span class="spacer"></span>
+          <span class="muted" id="queueDeleteHint" style="font-size:12px">대기·배정된 작업을 선택해 삭제할 수 있습니다.</span>
+        </div>
+      </div>
       <div class="table-wrap"><table id="tasksTable">
-        <thead><tr><th>#</th><th>스케줄</th><th>유형</th><th>번호</th><th>회차</th><th>기기</th><th>상태</th><th>결과 / 오류</th><th>처리 시각</th></tr></thead>
+        <thead><tr><th style="width:36px"><input type="checkbox" id="taskSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllTasks(this)"></th><th>#</th><th>스케줄</th><th>유형</th><th>번호</th><th>회차</th><th>기기</th><th>상태</th><th>결과 / 오류</th><th>처리 시각</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -535,6 +544,8 @@ const state = {
   devices: [],
   schedules: [],
   taskFilter: "",
+  selectedTasks: new Set(),
+  visibleTasks: [],
   remoteDirty: false,
   timer: null,
   clockTimer: null,
@@ -999,14 +1010,124 @@ function setTaskFilter(button) {
   loadTasks();
 }
 
+function isDeletableTask(task) {
+  return ["pending", "assigned", "running"].includes(task.status);
+}
+
+function toggleTaskSelection(id, checked) {
+  if (checked) state.selectedTasks.add(Number(id)); else state.selectedTasks.delete(Number(id));
+  updateQueueToolbar();
+  syncSelectAllState();
+}
+
+function visibleActiveTasks() {
+  return (state.visibleTasks || []).filter(isDeletableTask);
+}
+
+function syncSelectAllState() {
+  const box = $("taskSelectAll");
+  if (!box) return;
+  const list = visibleActiveTasks();
+  const selected = list.filter((t) => state.selectedTasks.has(t.id)).length;
+  box.checked = list.length > 0 && selected === list.length;
+  box.indeterminate = selected > 0 && selected < list.length;
+  box.disabled = list.length === 0;
+}
+
+function toggleSelectAllTasks(box) {
+  const list = visibleActiveTasks();
+  if (box.checked) list.forEach((t) => state.selectedTasks.add(t.id));
+  else list.forEach((t) => state.selectedTasks.delete(t.id));
+  loadTasks();
+}
+
+function updateQueueToolbar() {
+  const count = state.selectedTasks.size;
+  const button = $("deleteSelectedBtn");
+  if (button) {
+    button.textContent = `선택 삭제 (${count})`;
+    button.disabled = count === 0;
+  }
+  const hint = $("queueDeleteHint");
+  if (hint) {
+    hint.textContent = count
+      ? `${count}건 선택됨 · 삭제하면 폰이 가져가기 전까지는 발신되지 않습니다.`
+      : "대기·배정된 작업을 선택해 삭제할 수 있습니다.";
+  }
+}
+
+function deleteResultMessage(result) {
+  const parts = [];
+  if (result.deleted_count) parts.push(`${result.deleted_count}건을 대기열에서 삭제했습니다.`);
+  if (result.canceled_count) parts.push(`발신 중이던 ${result.canceled_count}건은 취소로 바꿨습니다.`);
+  if (result.protected_ids && result.protected_ids.length) parts.push(`완료·취소된 ${result.protected_ids.length}건은 기록으로 남겼습니다.`);
+  return parts.join(" ") || "삭제할 작업이 없습니다.";
+}
+
+function refreshQueue() {
+  loadTasks();
+  loadRuns();
+  loadSchedules();
+}
+
+async function deleteTask(id) {
+  if (!confirm(`작업 #${id} 를 대기열에서 삭제할까요?\n폰이 아직 가져가지 않았다면 발신되지 않습니다.`)) return;
+  try {
+    const result = await api(`/api/tasks/${id}`, { method: "DELETE" });
+    state.selectedTasks.delete(Number(id));
+    toast(deleteResultMessage(result), "ok");
+    refreshQueue();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteSelectedTasks() {
+  const ids = Array.from(state.selectedTasks);
+  if (!ids.length) { toast("삭제할 작업을 선택하세요.", "err"); return; }
+  if (!confirm(`선택한 작업 ${ids.length}건을 대기열에서 삭제할까요?\n발신 중인 작업은 취소 표시됩니다.`)) return;
+  try {
+    const result = await api("/api/tasks/bulk-delete", {
+      method: "POST",
+      body: JSON.stringify({ task_ids: ids }),
+    });
+    state.selectedTasks.clear();
+    toast(deleteResultMessage(result), "ok");
+    refreshQueue();
+  } catch (e) {
+    toast(e.message, "err");
+    loadTasks();
+  }
+}
+
+async function deleteAllPendingTasks() {
+  try {
+    const data = await api("/api/tasks?status=pending,assigned,running&limit=1000");
+    const active = (data.tasks || []).filter(isDeletableTask);
+    if (!active.length) { toast("대기열에 남은 작업이 없습니다."); return; }
+    if (!confirm(`대기열의 대기·배정된 작업 ${active.length}건을 모두 삭제할까요?\n발신 중인 작업은 취소 표시됩니다. 삭제한 작업은 되돌릴 수 없습니다.`)) return;
+    const result = await api("/api/tasks/bulk-delete", {
+      method: "POST",
+      body: JSON.stringify({ all_pending: true }),
+    });
+    state.selectedTasks.clear();
+    toast(deleteResultMessage(result), "ok");
+    refreshQueue();
+  } catch (e) { toast(e.message, "err"); }
+}
+
 async function loadTasks() {
   try {
     const query = new URLSearchParams({ limit: "200" });
     if (state.taskFilter) query.set("status", state.taskFilter);
     const data = await api("/api/tasks?" + query.toString());
+    state.visibleTasks = data.tasks;
+    // 화면에서 사라졌거나 더 이상 지울 수 없는 작업은 선택에서 뺀다(자동 새로고침 대비).
+    const activeIds = new Set(data.tasks.filter(isDeletableTask).map((t) => t.id));
+    Array.from(state.selectedTasks).forEach((id) => { if (!activeIds.has(id)) state.selectedTasks.delete(id); });
+
     $("tasksTable").querySelector("tbody").innerHTML = data.tasks.length
       ? data.tasks.map((t) => `
         <tr>
+          <td>${isDeletableTask(t) ? `<input type="checkbox" class="queue-check" ${state.selectedTasks.has(t.id) ? "checked" : ""} onchange="toggleTaskSelection(${t.id}, this.checked)">` : ""}</td>
           <td class="muted mono">${t.id}</td>
           <td class="truncate">${esc(t.schedule_name || "-")}</td>
           <td>${typeTag(t.type)}</td>
@@ -1016,8 +1137,12 @@ async function loadTasks() {
           <td>${statusBadge(TASK_STATUS, t.status)}</td>
           <td class="truncate">${esc(t.error || t.result || "-")}${t.duration_sec ? `<span class="muted mono"> (${Number(t.duration_sec).toFixed(1)}초)</span>` : ""}</td>
           <td class="muted nowrap">${t.finished_at ? fmtTime(t.finished_at) : (t.claimed_at ? "진행 중" : "-")}</td>
+          <td class="nowrap">${isDeletableTask(t) ? `<button class="btn sm danger" onclick="deleteTask(${t.id})">${t.status === "running" ? "취소" : "삭제"}</button>` : ""}</td>
         </tr>`).join("")
-      : emptyRow(9, "표시할 작업이 없습니다.", "📋");
+      : emptyRow(11, "표시할 작업이 없습니다.", "📋");
+
+    updateQueueToolbar();
+    syncSelectAllState();
   } catch (e) { toast(e.message, "err"); }
 }
 
