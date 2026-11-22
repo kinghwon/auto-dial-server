@@ -21,9 +21,12 @@ CREATE TABLE IF NOT EXISTS devices (
     phone_number     TEXT DEFAULT '',
     note             TEXT DEFAULT '',
     enabled          INTEGER NOT NULL DEFAULT 1,
-    -- 대시보드에서 직접 고친 이름·번호. 1 이면 앱이 30초마다 보내는 등록 정보가 덮어쓰지 않는다.
-    name_customized  INTEGER NOT NULL DEFAULT 0,
-    phone_customized INTEGER NOT NULL DEFAULT 0,
+    -- 대시보드에서 직접 고친 이름·번호·모델·안드로이드 버전.
+    -- 1 이면 앱이 30초마다 보내는 등록 정보가 그 값을 덮어쓰지 않는다.
+    name_customized    INTEGER NOT NULL DEFAULT 0,
+    phone_customized   INTEGER NOT NULL DEFAULT 0,
+    model_customized   INTEGER NOT NULL DEFAULT 0,
+    android_customized INTEGER NOT NULL DEFAULT 0,
     last_seen        TEXT,
     created_at       TEXT NOT NULL
 );
@@ -247,10 +250,12 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
         conn.execute("ALTER TABLE sms_inbox ADD COLUMN attachment_paths TEXT")
         added.append("sms_inbox.attachment_paths")
 
-    # 대시보드에서 고친 기기 이름·번호를 앱 등록 정보가 덮어쓰지 않도록 표시한다.
+    # 대시보드에서 고친 기기 이름·번호·모델·안드로이드 버전을 앱 등록 정보가 덮어쓰지 않도록 표시한다.
     for column, note in (
         ("name_customized", "기기 이름 직접 수정 여부"),
         ("phone_customized", "기기 번호 직접 수정 여부"),
+        ("model_customized", "기기 모델명 직접 수정 여부"),
+        ("android_customized", "기기 안드로이드 버전 직접 수정 여부"),
     ):
         if column not in device_columns:
             conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")

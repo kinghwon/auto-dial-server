@@ -181,6 +181,7 @@
   .modal{position:fixed;inset:0;background:rgba(14,22,40,.45);display:none;place-items:center;z-index:90;padding:20px}
   .modal.show{display:grid}
   .modal .box{background:#fff;border-radius:16px;padding:24px;width:100%;max-width:440px;box-shadow:0 24px 60px rgba(10,20,40,.3)}
+  .modal .box.wide{max-width:640px;max-height:88vh;overflow:auto}
   .modal h3{font-size:16px;margin-bottom:6px}
   .modal p{font-size:13px;color:var(--muted);margin:0 0 16px}
 
@@ -714,23 +715,36 @@
 </div>
 
 <div class="modal" id="deviceModal">
-  <div class="box">
+  <div class="box wide">
     <h3>기기 정보 편집</h3>
-    <p id="deviceModalSub">이름·번호·메모를 고치면 앱이 다시 접속해도 그대로 유지됩니다.</p>
-    <div class="form-grid one">
+    <p id="deviceModalSub">여기서 고친 값은 앱이 다시 접속해도 그대로 유지됩니다.</p>
+    <div class="form-grid">
       <div class="field">
-        <label>기기명</label>
+        <label>표시 이름 (기기명)</label>
         <input type="text" id="devEditName" placeholder="예: 사무실폰" maxlength="80">
       </div>
       <div class="field">
         <label>수신 번호 <span class="hint">이 폰이 문자를 받는 번호</span></label>
         <input type="tel" id="devEditPhone" placeholder="예: 010-1234-5678" maxlength="30">
       </div>
+      <div class="field span2">
+        <label>기기 ID</label>
+        <input type="text" id="devEditDeviceId" placeholder="예: OFFICE-01" maxlength="64">
+        <div class="help">변경 시 연결된 스케줄·작업·수신문자 기록도 함께 옮겨지며, 폰 앱의 기기 ID도 맞춰야 합니다.</div>
+      </div>
       <div class="field">
+        <label>모델명 <span class="hint">비우면 앱이 알려주는 값</span></label>
+        <input type="text" id="devEditModel" placeholder="예: samsung SM-S916N" maxlength="80">
+      </div>
+      <div class="field">
+        <label>안드로이드 버전 <span class="hint">비우면 앱이 알려주는 값</span></label>
+        <input type="text" id="devEditAndroid" placeholder="예: 17" maxlength="40">
+      </div>
+      <div class="field span2">
         <label>메모</label>
         <input type="text" id="devEditNote" placeholder="예: 유심 2번, 충전기 연결됨" maxlength="400">
       </div>
-      <div class="field">
+      <div class="field span2">
         <label class="switch"><input type="checkbox" id="devEditEnabled"> 이 기기 사용(새 작업 배정)</label>
       </div>
     </div>
@@ -1091,7 +1105,7 @@ async function loadDevices() {
     // 마지막 연결 시각만 바뀐 경우에는 표를 다시 그리지 않는다(5초마다 버튼이 바뀌어 클릭이 끊기는 일 방지).
     const signature = JSON.stringify(data.devices.map((d) => [
       d.id, d.name, d.phone_number, d.note, d.enabled, d.online, d.battery, d.model,
-      d.android_version, d.name_customized, d.phone_customized,
+      d.android_version, d.name_customized, d.phone_customized, d.model_customized, d.android_customized,
     ]));
     if (signature !== state.devicesSignature) {
       state.devicesSignature = signature;
@@ -1191,16 +1205,19 @@ async function addDevice() {
   } catch (e) { toast(e.message, "err"); }
 }
 
-/* 등록된 기기 정보(이름·번호·메모·사용 여부)를 모달에서 편집한다. */
+/* 등록된 기기 정보(이름·ID·번호·모델·버전·메모·사용 여부)를 모달에서 편집한다. */
 function openDeviceEdit(id) {
   const device = (state.devices || []).find((d) => String(d.id) === String(id));
   if (!device) { toast("기기 정보를 찾을 수 없습니다.", "err"); return; }
   state.editingDeviceId = device.id;
   $("devEditName").value = device.name || "";
+  $("devEditDeviceId").value = device.id || "";
   $("devEditPhone").value = device.phone_number || "";
+  $("devEditModel").value = device.model || "";
+  $("devEditAndroid").value = device.android_version || "";
   $("devEditNote").value = device.note || "";
   $("devEditEnabled").checked = Boolean(device.enabled);
-  $("deviceModalSub").textContent = `기기 ID ${device.id} · 여기서 고친 이름·번호는 앱이 다시 접속해도 유지됩니다.`;
+  $("deviceModalSub").textContent = `기기 ID ${device.id} · 여기서 고친 이름·번호·모델·버전은 앱이 다시 접속해도 유지됩니다.`;
   $("deviceModal").classList.add("show");
   $("devEditName").focus();
 }
@@ -1210,27 +1227,45 @@ function closeDeviceEdit() {
   $("deviceModal").classList.remove("show");
 }
 
+/* 기기 정보를 저장한다. 바뀐 항목만 PATCH 로 보내고, 기기 ID 가 바뀌면 관련 목록도 다시 읽는다. */
 async function saveDeviceEdit() {
   const id = state.editingDeviceId;
   if (!id) return;
   const name = $("devEditName").value.trim();
-  const phone = $("devEditPhone").value.trim();
-  if (!name) { toast("기기명을 입력하세요.", "err"); return; }
+  const newId = $("devEditDeviceId").value.trim();
+  if (!name) { toast("표시 이름을 입력하세요.", "err"); return; }
+  if (!newId) { toast("기기 ID 를 입력하세요.", "err"); return; }
+  if (/[\/\\]/.test(newId)) { toast("기기 ID 에 / 또는 \\ 는 쓸 수 없습니다.", "err"); return; }
+
+  const payload = {};
+  if (name !== (state.devices.find((d) => String(d.id) === String(id)) || {}).name) payload.name = name;
+  if (newId !== id) {
+    if (!confirm(`기기 ID 를 ${id} → ${newId} 로 바꿀까요?\n연결된 스케줄·작업·수신 문자 기록이 새 ID 로 옮겨지고, 폰 앱의 기기 ID 도 맞춰야 합니다.`)) return;
+    payload.new_device_id = newId;
+  }
+  payload.phone_number = $("devEditPhone").value.trim();
+  payload.model = $("devEditModel").value.trim();
+  payload.android_version = $("devEditAndroid").value.trim();
+  payload.note = $("devEditNote").value.trim();
+  payload.enabled = $("devEditEnabled").checked;
+
   const button = $("devEditSaveBtn");
   button.disabled = true;
   try {
-    await api(`/api/devices/${encodeURIComponent(id)}`, {
+    const result = await api(`/api/devices/${encodeURIComponent(id)}`, {
       method: "PATCH",
-      body: JSON.stringify({
-        name,
-        phone_number: phone,
-        note: $("devEditNote").value.trim(),
-        enabled: $("devEditEnabled").checked,
-      }),
+      body: JSON.stringify(payload),
     });
-    toast(`기기 ${name} 정보를 저장했습니다.`, "ok");
+    const savedId = (result && result.device && result.device.id) || id;
+    toast(payload.new_device_id ? `기기 ID 를 ${savedId} 로 바꿨습니다.` : `기기 ${name} 정보를 저장했습니다.`, "ok");
     closeDeviceEdit();
+    // 기기명·ID 는 스케줄·대기열·수신 문자 목록에도 나오므로 함께 다시 읽는다.
     loadDevices();
+    loadSchedules();
+    loadTasks();
+    loadRuns();
+    loadSms();
+    if (payload.new_device_id) loadLogs();
   } catch (e) {
     toast(e.message, "err");
   } finally {

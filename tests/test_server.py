@@ -2864,6 +2864,103 @@ def test_device_phone_cleared_by_user_is_not_refilled_by_incoming_sms(client):
     assert client.get("/api/sms").json()["messages"][0]["receiver_number"] == "010-7777-8888"
 
 
+def test_device_patch_edits_model_and_android_version(client):
+    client.post(
+        "/api/devices",
+        json={"device_id": "DEV-SPEC", "name": "폰", "model": "samsung SM-S916N", "android_version": "17"},
+    )
+
+    body = client.patch(
+        "/api/devices/DEV-SPEC", json={"model": "Galaxy S23 (내가 고침)", "android_version": "14"}
+    ).json()["device"]
+    assert body["model"] == "Galaxy S23 (내가 고침)"
+    assert body["android_version"] == "14"
+    assert body["model_customized"] is True and body["android_customized"] is True
+    # 모델·버전만 고쳐도 다른 항목은 그대로다.
+    assert body["name"] == "폰" and body["enabled"] is True
+
+    # 앱은 30초마다 등록 정보를 다시 보낸다. 직접 고친 모델·버전은 덮어쓰지 않는다.
+    for payload in (
+        {"device_id": "DEV-SPEC", "model": "samsung SM-S916N", "android_version": "17"},
+        {"device_id": "DEV-SPEC"},
+    ):
+        device = client.post("/api/devices", json=payload).json()["device"]
+        assert device["model"] == "Galaxy S23 (내가 고침)"
+        assert device["android_version"] == "14"
+        assert device["model_customized"] is True and device["android_customized"] is True
+
+    # 비워 보내면 직접 지정을 풀어 앱이 알려주는 값으로 돌아간다.
+    body = client.patch("/api/devices/DEV-SPEC", json={"model": "", "android_version": ""}).json()["device"]
+    assert (body["model"], body["android_version"]) == ("", "")
+    assert body["model_customized"] is False and body["android_customized"] is False
+    device = client.post(
+        "/api/devices", json={"device_id": "DEV-SPEC", "model": "samsung SM-S916N", "android_version": "17"}
+    ).json()["device"]
+    assert (device["model"], device["android_version"]) == ("samsung SM-S916N", "17")
+
+
+def test_device_rename_moves_schedules_tasks_and_sms(client):
+    _register_device(client, "DEV-OLD", "옛 폰", "010-1111-2222")
+    schedule = make_schedule(
+        client, numbers=["010-1111-0001", "010-1111-0002"], total_calls=2, target_device_ids=["DEV-OLD"]
+    )
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    client.post("/api/sms/incoming", json={"device_id": "DEV-OLD", "sender": "010-2", "body": "옛 번호로 온 문자"})
+
+    body = client.patch("/api/devices/DEV-OLD", json={"new_device_id": "DEV-NEW", "name": "새 폰"}).json()
+    assert body["renamed_from"] == "DEV-OLD"
+    assert body["device"]["id"] == "DEV-NEW"
+    assert body["device"]["name"] == "새 폰"
+    assert [d["id"] for d in client.get("/api/devices").json()["devices"]] == ["DEV-NEW"]
+
+    moved = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
+    assert moved["device_id"] == "DEV-NEW"
+    assert moved["target_device_ids"] == ["DEV-NEW"]
+    assert moved["target_devices"][0]["device_id"] == "DEV-NEW"
+    assert moved["target_devices"][0]["name"] == "새 폰"
+    assert [t["device_id"] for t in client.get("/api/tasks").json()["tasks"]] == ["DEV-NEW", "DEV-NEW"]
+    message = client.get("/api/sms").json()["messages"][0]
+    assert message["device_id"] == "DEV-NEW"
+    assert message["device_name"] == "새 폰"
+
+    # 새 ID 로 작업을 받고, 옛 ID 로는 받지 않는다.
+    assert client.get("/api/tasks/poll", params={"device_id": "DEV-OLD"}).json()["task"] is None
+    task = client.get("/api/tasks/poll", params={"device_id": "DEV-NEW"}).json()["task"]
+    assert task["device_id"] == "DEV-NEW"
+
+
+def test_device_rename_keeps_multi_device_schedule_list(client):
+    _register_device(client, "DEV-A", "갤럭시 A")
+    _register_device(client, "DEV-B", "갤럭시 B")
+    schedule = make_schedule(client, target_device_ids=["DEV-A", "DEV-B"])
+
+    client.patch("/api/devices/DEV-A", json={"new_device_id": "DEV-A2"})
+    body = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
+    # 순서를 유지한 채 바뀐 기기만 새 ID 로 바뀐다.
+    assert body["target_device_ids"] == ["DEV-A2", "DEV-B"]
+    assert body["device_id"] is None
+
+
+def test_device_rename_rejects_duplicate_or_bad_id(client):
+    _register_device(client, "DEV-A", "A")
+    _register_device(client, "DEV-B", "B")
+
+    response = client.patch("/api/devices/DEV-A", json={"new_device_id": "DEV-B"})
+    assert response.status_code == 409
+    assert "DEV-B" in response.json()["detail"]
+    assert {d["id"] for d in client.get("/api/devices").json()["devices"]} == {"DEV-A", "DEV-B"}
+    assert client.get("/api/devices").json()["devices"][0]["name"] == "A"
+
+    for bad in ("BAD/ID", "BAD\\ID"):
+        assert client.patch("/api/devices/DEV-A", json={"new_device_id": bad}).status_code == 422
+    assert client.patch("/api/devices/NOPE", json={"new_device_id": "X"}).status_code == 404
+
+    # 같은 ID 를 보내면 바꿀 것 없이 그대로 둔다.
+    body = client.patch("/api/devices/DEV-A", json={"new_device_id": "DEV-A"}).json()
+    assert body["device"]["id"] == "DEV-A"
+    assert body["renamed_from"] is None
+
+
 # --------------------------------------------------------------------------
 # 25. 소프트 삭제(삭제 보관함) · 복원
 # --------------------------------------------------------------------------
@@ -3182,7 +3279,7 @@ def test_db_migration_adds_soft_delete_and_device_flags(tmp_path, monkeypatch):
     for table in ("schedules", "runs", "tasks", "sms_inbox"):
         assert "deleted_at" in {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
-    assert {"name_customized", "phone_customized"} <= device_columns
+    assert {"name_customized", "phone_customized", "model_customized", "android_customized"} <= device_columns
     assert "category" in {row["name"] for row in conn.execute("PRAGMA table_info(logs)")}
     assert conn.execute("SELECT COUNT(*) FROM logs WHERE category = 'device'").fetchone()[0] == 1
     for table in ("schedules", "runs", "tasks", "sms_inbox"):
@@ -3199,6 +3296,18 @@ def test_db_migration_adds_soft_delete_and_device_flags(tmp_path, monkeypatch):
         migrated.patch("/api/devices/5656", json={"name": "형원님 폰", "phone_number": "010-5656-3939"})
         device = migrated.post("/api/devices", json={"device_id": "5656", "name": "5656", "phone_number": ""}).json()["device"]
         assert device["name"] == "형원님 폰" and device["phone_number"] == "010-5656-3939"
+
+        # 예전 DB 에서도 모델명·안드로이드 버전 수정과 기기 ID 변경이 그대로 동작한다.
+        device = migrated.patch(
+            "/api/devices/5656",
+            json={"model": "samsung SM-S916N (내가 고침)", "android_version": "17", "new_device_id": "5656-NEW"},
+        ).json()["device"]
+        assert device["id"] == "5656-NEW"
+        assert device["model_customized"] is True and device["android_customized"] is True
+        device = migrated.post(
+            "/api/devices", json={"device_id": "5656-NEW", "model": "samsung SM-S916N", "android_version": "16"}
+        ).json()["device"]
+        assert device["model"] == "samsung SM-S916N (내가 고침)" and device["android_version"] == "17"
 
 
 # --------------------------------------------------------------------------
@@ -3243,19 +3352,34 @@ def test_dashboard_has_device_edit_controls(client):
     for keyword in (
         'id="deviceModal"',
         'id="devEditName"',
+        'id="devEditDeviceId"',
         'id="devEditPhone"',
+        'id="devEditModel"',
+        'id="devEditAndroid"',
         'id="devEditNote"',
         'id="devEditEnabled"',
         "openDeviceEdit(",
         "saveDeviceEdit(",
         "closeDeviceEdit(",
         "기기 정보 편집",
+        "표시 이름 (기기명)",
+        "기기 ID",
+        "수신 번호",
+        "모델명",
+        "안드로이드 버전",
+        "메모",
+        "스케줄·작업·수신문자 기록도 함께 옮겨지며",
         "devicesSignature",
         "data-lastseen",
     ):
         assert keyword in html, keyword
     # 기기 표의 액션은 편집 · 사용 중지 · 삭제 세 가지
     assert "편집</button>" in html
+    # 저장 후에는 기기·스케줄·대기열·수신 문자 목록을 함께 다시 읽는다.
+    save_fn = html.split("async function saveDeviceEdit()", 1)[1].split("async function deleteDevice", 1)[0]
+    for loader in ("loadDevices()", "loadSchedules()", "loadTasks()", "loadRuns()", "loadSms()"):
+        assert loader in save_fn, loader
+    assert "new_device_id" in save_fn
 
 
 def test_openapi_exposes_log_filters_and_archive(client):
@@ -3270,7 +3394,9 @@ def test_openapi_exposes_log_filters_and_archive(client):
     restore_schema = spec["components"]["schemas"]["ArchiveRestore"]
     assert {"kind", "id"} <= set(restore_schema["properties"])
     device_patch = spec["components"]["schemas"]["DeviceUpdate"]["properties"]
-    assert {"name", "phone_number", "note", "enabled"} <= set(device_patch)
+    assert {"name", "new_device_id", "phone_number", "model", "android_version", "note", "enabled"} <= set(
+        device_patch
+    )
 
 
 def test_archive_and_logs_require_api_key(client, monkeypatch):

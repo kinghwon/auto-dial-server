@@ -75,10 +75,17 @@ class Heartbeat(BaseModel):
 
 
 class DeviceUpdate(BaseModel):
+    """대시보드 ‘기기 정보 편집’. 빠짐(None)은 그대로 두고, 보낸 값만 바꾼다."""
+
     name: Optional[str] = Field(default=None, max_length=80)
+    # 기기 ID 변경(선택). 바꾸면 스케줄·작업·수신 문자 기록이 새 ID 로 함께 옮겨진다.
+    new_device_id: Optional[str] = Field(default=None, max_length=64)
     note: Optional[str] = Field(default=None, max_length=400)
     # 기기가 문자를 받는 번호. 빈 문자열을 보내면 지운다(None 이면 그대로 둔다).
     phone_number: Optional[str] = Field(default=None, max_length=30)
+    # 앱이 알려주는 기기 정보. 대시보드에서 고치면 앱 재등록이 덮어쓰지 않는다.
+    model: Optional[str] = Field(default=None, max_length=80)
+    android_version: Optional[str] = Field(default=None, max_length=40)
     enabled: Optional[bool] = None
 
     @field_validator("phone_number")
@@ -92,6 +99,26 @@ class DeviceUpdate(BaseModel):
     @classmethod
     def _name(cls, value: str | None) -> str | None:
         """이름은 공백만 보내면 비운 것으로 보고 기기 ID 로 되돌린다."""
+        if value is None:
+            return None
+        return value.strip()
+
+    @field_validator("new_device_id")
+    @classmethod
+    def _new_device_id(cls, value: str | None) -> str | None:
+        """새 기기 ID 는 앱이 보내는 기기 ID 와 같은 규칙으로 검사한다."""
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if "/" in value or "\\" in value:
+            raise ValueError("기기 ID 를 올바르게 입력하세요. (/ 또는 \\ 제외)")
+        return value
+
+    @field_validator("model", "android_version", "note")
+    @classmethod
+    def _strip_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         return value.strip()
