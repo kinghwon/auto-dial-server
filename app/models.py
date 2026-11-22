@@ -46,8 +46,8 @@ class DeviceRegister(BaseModel):
     @classmethod
     def _trim_id(cls, value: str) -> str:
         value = value.strip()
-        if not re.match(r"^[A-Za-z0-9._:\-]{1,64}$", value):
-            raise ValueError("기기 ID 는 영문/숫자/-/_/. 만 사용할 수 있습니다.")
+        if not value or "/" in value or "\\" in value:
+            raise ValueError("기기 ID 를 올바르게 입력하세요. (/ 또는 \\ 제외)")
         return value
 
 
