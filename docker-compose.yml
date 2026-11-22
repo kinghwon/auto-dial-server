@@ -1,0 +1,14 @@
+services:
+  auto-dialer:
+    build: .
+    container_name: auto-dialer
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      DB_PATH: /data/autodialer.db
+    volumes:
+      - ./data:/data

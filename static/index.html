@@ -1,0 +1,1045 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1b2a4a">
+<title>자동 발신 관리 · Auto Dialer</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --card:#ffffff; --line:#e4e9f2; --line-strong:#d3dbe8;
+    --text:#182033; --muted:#6d7b91; --primary:#2f6bed; --primary-dark:#1f52c4;
+    --ok:#0f9d58; --ok-bg:#e7f7ee; --warn:#c77700; --warn-bg:#fff4e0;
+    --danger:#d93a3f; --danger-bg:#fdecec; --info-bg:#eaf1ff; --info:#2456c9;
+    --radius:14px; --shadow:0 1px 2px rgba(16,24,40,.04), 0 8px 24px rgba(16,24,40,.05);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text); font-size:14px; line-height:1.5;
+    font-family:"Pretendard","Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--primary);text-decoration:none}
+  button{font-family:inherit;font-size:13px;cursor:pointer}
+  h1,h2,h3,h4{margin:0;font-weight:700}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 20px 64px}
+
+  /* 상단 바 */
+  .topbar{
+    background:linear-gradient(135deg,#16233d,#243a63); color:#fff;
+    padding:16px 0 14px; position:sticky; top:0; z-index:30;
+    box-shadow:0 2px 12px rgba(12,22,42,.18);
+  }
+  .topbar .wrap{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-bottom:0}
+  .brand{display:flex;align-items:center;gap:12px;font-size:19px;font-weight:800;letter-spacing:-.2px}
+  .brand .logo{
+    width:38px;height:38px;border-radius:11px;background:rgba(255,255,255,.14);
+    display:grid;place-items:center;font-size:19px
+  }
+  .brand small{display:block;font-size:11px;font-weight:500;color:#a8bad8;letter-spacing:.2px;margin-top:2px}
+  .top-actions{display:flex;align-items:center;gap:10px;font-size:12px;color:#c4d2e8}
+  .clock{font-variant-numeric:tabular-nums;background:rgba(255,255,255,.08);padding:6px 10px;border-radius:8px}
+  .conn{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.1)}
+  .conn i{width:8px;height:8px;border-radius:50%;background:#94a3b8;display:inline-block}
+  .conn.ok i{background:#34d399;box-shadow:0 0 0 3px rgba(52,211,153,.22)}
+  .conn.bad i{background:#f87171}
+
+  /* 탭 */
+  .tabs{display:flex;gap:6px;overflow-x:auto;margin:18px 0 20px;padding-bottom:2px;scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{
+    border:1px solid var(--line); background:#fff;color:#46536b;padding:9px 16px;border-radius:999px;
+    white-space:nowrap;font-weight:600;font-size:13.5px;transition:.15s
+  }
+  .tab:hover{border-color:var(--line-strong);color:var(--text)}
+  .tab.active{background:#16233d;border-color:#16233d;color:#fff;box-shadow:0 4px 12px rgba(22,35,61,.2)}
+  .tab .count{font-size:11px;opacity:.75;margin-left:4px}
+
+  section.tabpane{display:none}
+  section.tabpane.active{display:block}
+
+  /* 카드 */
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+  .card + .card{margin-top:18px}
+  .card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .card-head h2{font-size:15.5px}
+  .card-head .sub{font-size:12px;color:var(--muted);font-weight:500;margin-top:2px}
+  .card-body{padding:18px}
+
+  /* 통계 */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:14px}
+  .stat{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:16px 16px 14px;box-shadow:var(--shadow)}
+  .stat .label{font-size:12px;color:var(--muted);font-weight:600;display:flex;align-items:center;gap:6px}
+  .stat .value{font-size:27px;font-weight:800;letter-spacing:-.5px;margin-top:8px;font-variant-numeric:tabular-nums}
+  .stat .value small{font-size:13px;font-weight:600;color:var(--muted);margin-left:4px}
+  .stat .foot{font-size:11.5px;color:var(--muted);margin-top:4px}
+  .stat.accent{border-color:#cfdcff;background:linear-gradient(180deg,#f7faff,#fff)}
+
+  .grid2{display:grid;grid-template-columns:1.35fr 1fr;gap:18px}
+  @media(max-width:860px){.grid2{grid-template-columns:1fr}}
+
+  /* 테이블 */
+  .table-wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:11px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{font-size:11.5px;color:var(--muted);font-weight:700;background:#fafbfe;white-space:nowrap;letter-spacing:.1px}
+  tr:last-child td{border-bottom:none}
+  td.nowrap,th.nowrap{white-space:nowrap}
+  td.num{font-variant-numeric:tabular-nums;font-variant-numeric:tabular-nums}
+  .muted{color:var(--muted)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.2px}
+  .empty{padding:34px 12px;text-align:center;color:var(--muted);font-size:13px}
+  .empty .big{font-size:26px;margin-bottom:6px;opacity:.55}
+
+  /* 배지 */
+  .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;font-size:11.5px;font-weight:700;white-space:nowrap}
+  .badge i{width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block}
+  .b-ok{background:var(--ok-bg);color:var(--ok)}
+  .b-warn{background:var(--warn-bg);color:var(--warn)}
+  .b-danger{background:var(--danger-bg);color:var(--danger)}
+  .b-info{background:var(--info-bg);color:var(--info)}
+  .b-gray{background:#eef1f6;color:#5a6a80}
+  .badge.sq{border-radius:6px}
+
+  .type-tag{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:700;padding:3px 8px;border-radius:6px}
+  .t-call{background:#eef3ff;color:#2456c9}
+  .t-sms{background:#f0f9f2;color:#1c7c45}
+
+  /* 버튼 */
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line-strong);background:#fff;color:#2b3547;padding:9px 14px;border-radius:10px;font-weight:600;transition:.15s}
+  .btn:hover{background:#f7f9fd;border-color:#c3cee0}
+  .btn.primary{background:var(--primary);border-color:var(--primary);color:#fff;box-shadow:0 4px 12px rgba(47,107,237,.22)}
+  .btn.primary:hover{background:var(--primary-dark)}
+  .btn.danger{color:var(--danger);border-color:#f1c9c9;background:#fff}
+  .btn.danger:hover{background:var(--danger-bg)}
+  .btn.sm{padding:6px 10px;font-size:12px;border-radius:8px}
+  .btn.ghost{border-color:transparent;background:transparent;color:var(--muted)}
+  .btn.ghost:hover{background:#eef2f8;color:var(--text)}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn-row{display:flex;flex-wrap:wrap;gap:8px}
+
+  /* 폼 */
+  .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+  .form-grid.one{grid-template-columns:1fr}
+  @media(max-width:760px){.form-grid{grid-template-columns:1fr}}
+  .field{display:flex;flex-direction:column;gap:6px;min-width:0}
+  .field.span2{grid-column:span 2}
+  @media(max-width:760px){.field.span2{grid-column:auto}}
+  .field label{font-size:12.5px;font-weight:700;color:#3a465c;display:flex;align-items:center;gap:6px}
+  .field label .hint{font-weight:500;color:var(--muted);font-size:11.5px}
+  .field input[type=text],.field input[type=number],.field input[type=password],.field input[type=datetime-local],.field select,.field textarea{
+    width:100%;padding:10px 12px;border:1px solid var(--line-strong);border-radius:10px;background:#fff;
+    color:var(--text);font-size:13.5px;font-family:inherit;outline:none;transition:.15s
+  }
+  .field textarea{resize:vertical;min-height:96px;line-height:1.55}
+  .field input:focus,.field select:focus,.field textarea:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(47,107,237,.13)}
+  .field .help{font-size:11.5px;color:var(--muted)}
+  .seg{display:inline-flex;background:#f1f4fa;border-radius:10px;padding:3px;gap:3px;width:100%}
+  .seg label{flex:1;text-align:center;padding:8px 10px;border-radius:8px;font-size:13px;font-weight:700;color:#5a6a80;cursor:pointer;transition:.15s;margin:0}
+  .seg input{display:none}
+  .seg input:checked + span{color:#fff}
+  .seg label:has(input:checked){background:var(--primary);color:#fff;box-shadow:0 2px 8px rgba(47,107,237,.25)}
+  .summary{background:#f7f9fe;border:1px dashed #cfdcf6;border-radius:10px;padding:11px 13px;font-size:12.5px;color:#33456b}
+  .summary b{color:var(--primary)}
+  .switch{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:600;color:#3a465c}
+  .switch input{width:38px;height:22px;appearance:none;background:#d5dce8;border-radius:999px;position:relative;cursor:pointer;transition:.2s;outline:none}
+  .switch input:checked{background:var(--primary)}
+  .switch input:before{content:"";position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+  .switch input:checked:before{left:18px}
+
+  /* 진행 바 */
+  .progress{height:6px;background:#eef1f7;border-radius:999px;overflow:hidden;min-width:70px}
+  .progress > span{display:block;height:100%;background:linear-gradient(90deg,#4b8bf5,#2f6bed);border-radius:999px;transition:.3s}
+
+  /* 토스트 */
+  #toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:100;max-width:min(92vw,380px)}
+  .toast{background:#16233d;color:#fff;padding:11px 14px;border-radius:10px;font-size:13px;box-shadow:0 10px 30px rgba(10,20,40,.25);animation:pop .18s ease-out}
+  .toast.err{background:#a3262b}
+  .toast.ok{background:#0f7a45}
+  @keyframes pop{from{transform:translateY(6px);opacity:0}to{transform:none;opacity:1}}
+
+  /* 모달 */
+  .modal{position:fixed;inset:0;background:rgba(14,22,40,.45);display:none;place-items:center;z-index:90;padding:20px}
+  .modal.show{display:grid}
+  .modal .box{background:#fff;border-radius:16px;padding:24px;width:100%;max-width:440px;box-shadow:0 24px 60px rgba(10,20,40,.3)}
+  .modal h3{font-size:16px;margin-bottom:6px}
+  .modal p{font-size:13px;color:var(--muted);margin:0 0 16px}
+
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:13px}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0;font-weight:600}
+  .list-plain{list-style:none;margin:0;padding:0}
+  .list-plain li{padding:11px 0;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;font-size:13px;align-items:center}
+  .list-plain li:last-child{border-bottom:none}
+  .guide{font-size:12.8px;color:#3f4c63;line-height:1.75}
+  .guide ol{margin:6px 0 0;padding-left:20px}
+  .guide code{background:#f1f4fa;padding:1px 6px;border-radius:5px;font-size:12px}
+  .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .chip{border:1px solid var(--line);background:#fff;padding:6px 12px;border-radius:999px;font-size:12.5px;font-weight:600;color:#4b5a72}
+  .chip.active{background:#16233d;color:#fff;border-color:#16233d}
+  .spacer{flex:1}
+  .hint-line{font-size:12px;color:var(--muted);margin-top:10px}
+  .truncate{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cell-actions{display:flex;gap:6px;flex-wrap:wrap}
+  .dot-online{color:var(--ok)}
+  .dot-offline{color:#9aa7ba}
+  @media(max-width:640px){
+    .brand{font-size:16.5px}.brand small{display:none}
+    .top-actions .clock{display:none}
+    .wrap{padding:0 14px 48px}
+    h2{font-size:14.5px}
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <span class="logo">📞</span>
+      <div>자동 발신 관리<small>Auto Dialer &amp; SMS Gateway</small></div>
+    </div>
+    <div class="top-actions">
+      <span class="clock" id="clock">--:--:--</span>
+      <span class="conn" id="conn"><i></i><span id="connText">연결 확인 중</span></span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="dashboard">대시보드</button>
+    <button class="tab" data-tab="devices">기기 관리<span class="count" id="tabDeviceCount"></span></button>
+    <button class="tab" data-tab="schedules">발신 스케줄<span class="count" id="tabScheduleCount"></span></button>
+    <button class="tab" data-tab="tasks">대기열·로그</button>
+    <button class="tab" data-tab="sms">수신 문자<span class="count" id="tabSmsCount"></span></button>
+    <button class="tab" data-tab="telegram">텔레그램</button>
+  </nav>
+
+  <!-- ================= 대시보드 ================= -->
+  <section class="tabpane active" id="pane-dashboard">
+    <div class="stats" id="statCards"></div>
+
+    <div class="grid2" style="margin-top:18px">
+      <div class="card">
+        <div class="card-head">
+          <div><h2>최근 실행</h2><div class="sub">스케줄이 만들어낸 발신 묶음의 진행 상태</div></div>
+          <button class="btn sm" onclick="refreshAll()">새로고침</button>
+        </div>
+        <div class="table-wrap"><table id="recentRunsTable">
+          <thead><tr><th>스케줄</th><th>유형</th><th>시각</th><th>진행</th><th>상태</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div><h2>다음 예정</h2><div class="sub">가장 가까운 실행 순서</div></div></div>
+        <div class="card-body" id="upcomingList"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:18px">
+      <div class="card-head"><div><h2>서버 활동 로그</h2><div class="sub">기기 등록 · 스케줄 · 문자 수신 이력</div></div></div>
+      <div class="card-body" id="dashLogs" style="max-height:320px;overflow:auto"></div>
+    </div>
+  </section>
+
+  <!-- ================= 기기 관리 ================= -->
+  <section class="tabpane" id="pane-devices">
+    <div class="card">
+      <div class="card-head">
+        <div><h2>기기 추가</h2><div class="sub">앱의 “기기 ID”와 같은 값을 입력하면 자동으로 연결됩니다</div></div>
+      </div>
+      <div class="card-body">
+        <div class="form-grid">
+          <div class="field">
+            <label>기기 ID <span class="hint">영문/숫자/-/_</span></label>
+            <input type="text" id="devId" placeholder="예: OFFICE-01" maxlength="64">
+          </div>
+          <div class="field">
+            <label>표시 이름</label>
+            <input type="text" id="devName" placeholder="예: 사무실폰" maxlength="80">
+          </div>
+          <div class="field span2">
+            <label>메모 <span class="hint">선택</span></label>
+            <input type="text" id="devNote" placeholder="예: 유심 2번, 충전기 연결됨" maxlength="400">
+          </div>
+        </div>
+        <div class="btn-row" style="margin-top:16px">
+          <button class="btn primary" onclick="addDevice()">기기 등록</button>
+        </div>
+        <div class="hint-line">안드로이드 앱에서 서버 주소와 같은 기기 ID를 입력하고 “서비스 시작”을 누르면 하트비트가 들어옵니다. 기기를 미리 등록하지 않아도 앱이 접속하면 자동으로 목록에 나타납니다.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div><h2>등록된 기기</h2><div class="sub" id="deviceSummary">-</div></div>
+        <button class="btn sm" onclick="loadDevices()">새로고침</button>
+      </div>
+      <div class="table-wrap"><table id="devicesTable">
+        <thead><tr><th>상태</th><th>기기</th><th>모델 / 안드로이드</th><th>배터리</th><th>마지막 연결</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= 발신 스케줄 ================= -->
+  <section class="tabpane" id="pane-schedules">
+    <div class="card">
+      <div class="card-head">
+        <div><h2>새 발신 스케줄</h2><div class="sub">번호를 순서대로, 정해진 횟수만큼 예약 발신합니다</div></div>
+      </div>
+      <div class="card-body">
+        <div class="form-grid">
+          <div class="field span2">
+            <label>스케줄 이름 <span class="hint">비워두면 자동 생성</span></label>
+            <input type="text" id="schedName" placeholder="예: 오전 안내 전화" maxlength="120">
+          </div>
+
+          <div class="field span2">
+            <label>발신 유형</label>
+            <div class="seg">
+              <label><input type="radio" name="schedType" value="call" checked onchange="toggleTypeFields()"><span>📞 전화 발신</span></label>
+              <label><input type="radio" name="schedType" value="sms" onchange="toggleTypeFields()"><span>💬 문자 발신</span></label>
+            </div>
+          </div>
+
+          <div class="field span2">
+            <label>발신 번호 목록 <span class="hint">한 줄에 하나씩, 위에서부터 순서대로</span></label>
+            <textarea id="schedNumbers" placeholder="010-1234-5678&#10;010-9876-5432&#10;02-123-4567" oninput="updateSummary()"></textarea>
+            <div class="help">쉼표로도 구분할 수 있습니다. 최대 500개.</div>
+          </div>
+
+          <div class="field">
+            <label>반복 횟수 <span class="hint">각 번호에 대해</span></label>
+            <input type="number" id="schedRepeat" value="1" min="1" max="1000" oninput="updateSummary()">
+          </div>
+
+          <div class="field">
+            <label>반복 순서</label>
+            <select id="schedOrder" onchange="updateSummary()">
+              <option value="sequence">번호 순서대로 반복 (A,B,C → A,B,C)</option>
+              <option value="grouped">번호마다 연속 반복 (A,A,A → B,B,B)</option>
+            </select>
+          </div>
+
+          <div class="field" id="callDurationField">
+            <label>통화 제한 시간 <span class="hint">초</span></label>
+            <input type="number" id="schedMaxSec" value="30" min="1" max="3600">
+            <div class="help">연결 후 이 시간이 지나면 폰이 자동으로 통화를 끊습니다.</div>
+          </div>
+
+          <div class="field span2" id="smsBodyField" style="display:none">
+            <label>문자 내용</label>
+            <textarea id="schedSmsBody" placeholder="보낼 문자 내용을 입력하세요." maxlength="2000" oninput="updateSummary()"></textarea>
+            <div class="help">90자(한글 45자)가 넘으면 자동으로 나눠서 발송됩니다.</div>
+          </div>
+
+          <div class="field">
+            <label>실행 시각</label>
+            <input type="datetime-local" id="schedStart" onchange="updateSummary()">
+          </div>
+
+          <div class="field">
+            <label>반복 주기</label>
+            <select id="schedRecurrence">
+              <option value="once">1회만</option>
+              <option value="daily">매일</option>
+              <option value="weekly">매주</option>
+              <option value="monthly">매월</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label>발신 기기</label>
+            <select id="schedDevice"><option value="">전체 분배 (공유 대기열)</option></select>
+            <div class="help">“전체 분배”는 온라인 기기들이 하나씩 나눠서 발신합니다.</div>
+          </div>
+
+          <div class="field span2">
+            <div class="summary" id="schedSummary">번호와 반복 횟수를 입력하면 발신 건수가 표시됩니다.</div>
+          </div>
+        </div>
+        <div class="btn-row" style="margin-top:16px">
+          <button class="btn primary" id="createScheduleBtn" onclick="createSchedule()">스케줄 등록</button>
+          <button class="btn" onclick="resetScheduleForm()">초기화</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div><h2>등록된 스케줄</h2><div class="sub" id="scheduleSummary">-</div></div>
+        <button class="btn sm" onclick="loadSchedules()">새로고침</button>
+      </div>
+      <div class="table-wrap"><table id="schedulesTable">
+        <thead><tr><th>스케줄</th><th>유형</th><th>번호 × 횟수</th><th>주기</th><th>다음 실행</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= 대기열 / 로그 ================= -->
+  <section class="tabpane" id="pane-tasks">
+    <div class="card">
+      <div class="card-head">
+        <div><h2>발신 작업</h2><div class="sub">폰이 가져가기 전(pending) → 배정(assigned) → 완료/실패</div></div>
+        <div class="filters">
+          <button class="chip active" data-filter="" onclick="setTaskFilter(this)">전체</button>
+          <button class="chip" data-filter="pending,assigned,running" onclick="setTaskFilter(this)">진행 중</button>
+          <button class="chip" data-filter="done" onclick="setTaskFilter(this)">완료</button>
+          <button class="chip" data-filter="failed" onclick="setTaskFilter(this)">실패</button>
+          <button class="btn sm" onclick="loadTasks()">새로고침</button>
+        </div>
+      </div>
+      <div class="table-wrap"><table id="tasksTable">
+        <thead><tr><th>#</th><th>스케줄</th><th>유형</th><th>번호</th><th>회차</th><th>기기</th><th>상태</th><th>결과 / 오류</th><th>처리 시각</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div><h2>실행 묶음</h2><div class="sub">스케줄 1회 실행 = 1개 묶음</div></div></div>
+      <div class="table-wrap"><table id="runsTable">
+        <thead><tr><th>#</th><th>스케줄</th><th>유형</th><th>예정 시각</th><th>진행</th><th>상태</th><th>생성</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= 수신 문자 ================= -->
+  <section class="tabpane" id="pane-sms">
+    <div class="card">
+      <div class="card-head">
+        <div><h2>수신 문자</h2><div class="sub">안드로이드 폰이 받은 문자를 텔레그램으로 전달합니다</div></div>
+        <div class="filters"><span class="badge b-info" id="smsFwdState">전달 상태 확인 중</span><button class="btn sm" onclick="loadSms()">새로고침</button></div>
+      </div>
+      <div class="table-wrap"><table id="smsTable">
+        <thead><tr><th>수신 시각</th><th>기기</th><th>발신 번호</th><th>내용</th><th>텔레그램</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ================= 텔레그램 ================= -->
+  <section class="tabpane" id="pane-telegram">
+    <div class="grid2">
+      <div class="card">
+        <div class="card-head"><div><h2>텔레그램 봇 설정</h2><div class="sub">수신 문자를 실시간으로 받아보세요</div></div></div>
+        <div class="card-body">
+          <div class="form-grid one">
+            <div class="field">
+              <label>Bot Token</label>
+              <input type="text" id="tgToken" placeholder="123456789:AAExample..." autocomplete="off">
+              <div class="help">BotFather 에서 받은 토큰. 형식: 숫자:영문/숫자</div>
+            </div>
+            <div class="field">
+              <label>Chat ID</label>
+              <input type="text" id="tgChat" placeholder="예: 123456789 또는 -1001234567890" autocomplete="off">
+              <div class="help">개인 대화는 본인 숫자 ID, 단체방은 -100… 형태입니다.</div>
+            </div>
+            <div class="field">
+              <label class="switch"><input type="checkbox" id="tgForward"> 수신 문자를 텔레그램으로 전달</label>
+            </div>
+          </div>
+          <div class="btn-row" style="margin-top:16px">
+            <button class="btn primary" onclick="saveTelegram()">저장</button>
+            <button class="btn" onclick="testTelegram()">테스트 발송</button>
+          </div>
+          <div id="tgStatus" class="hint-line"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div><h2>준비 방법</h2><div class="sub">5분이면 끝납니다</div></div></div>
+        <div class="card-body guide">
+          <ol>
+            <li>텔레그램에서 <b>@BotFather</b> 를 검색해 대화를 시작합니다.</li>
+            <li><code>/newbot</code> → 이름과 사용자명을 정하면 <b>토큰</b>을 줍니다.</li>
+            <li>만든 봇과 대화를 열고 <b>아무 메시지나</b> 한 번 보냅니다.</li>
+            <li>브라우저에서 <code>https://api.telegram.org/bot&lt;토큰&gt;/getUpdates</code> 를 열어 <code>"chat":{"id":…}</code> 값을 확인합니다.</li>
+            <li>위 칸에 토큰과 Chat ID를 넣고 <b>저장 → 테스트 발송</b>을 누릅니다.</li>
+            <li>단체방으로 받으려면 봇을 방에 초대한 뒤 <code>getUpdates</code> 에서 <code>-100…</code> 로 시작하는 ID를 사용합니다.</li>
+          </ol>
+          <div class="hint-line">전달이 실패하면 자동으로 3회까지 재시도하고, 실패 사유를 “수신 문자” 목록에 남깁니다.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div id="toast"></div>
+
+<div class="modal" id="keyModal">
+  <div class="box">
+    <h3>API 키가 필요합니다</h3>
+    <p>서버에 <code>SERVER_API_KEY</code> 가 설정되어 있습니다. 대시보드에서 사용할 키를 입력하세요. (브라우저에만 저장됩니다)</p>
+    <div class="field"><input type="password" id="keyInput" placeholder="API 키"></div>
+    <div class="btn-row" style="margin-top:16px;justify-content:flex-end">
+      <button class="btn primary" onclick="saveKey()">저장 후 계속</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/* 상태                                                                */
+/* ------------------------------------------------------------------ */
+const state = {
+  apiKey: localStorage.getItem("autodialer_api_key") || "",
+  tab: "dashboard",
+  devices: [],
+  schedules: [],
+  taskFilter: "",
+  timer: null,
+  clockTimer: null,
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+}[ch]));
+
+/* ------------------------------------------------------------------ */
+/* API                                                                 */
+/* ------------------------------------------------------------------ */
+async function api(path, options = {}) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
+  if (state.apiKey) headers["X-API-Key"] = state.apiKey;
+  const response = await fetch(path, Object.assign({}, options, { headers }));
+  if (response.status === 401) {
+    $("keyModal").classList.add("show");
+    throw new Error("API 키가 필요합니다.");
+  }
+  let body = null;
+  try { body = await response.json(); } catch (e) { body = null; }
+  if (!response.ok) {
+    const detail = body && (body.detail || body.error);
+    let message = typeof detail === "string" ? detail : (Array.isArray(detail) ? detail.map(d => d.msg).join(", ") : `요청 실패 (${response.status})`);
+    throw new Error(message);
+  }
+  return body;
+}
+
+function saveKey() {
+  const value = $("keyInput").value.trim();
+  state.apiKey = value;
+  localStorage.setItem("autodialer_api_key", value);
+  $("keyModal").classList.remove("show");
+  refreshAll();
+}
+
+function toast(message, kind = "") {
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.textContent = message;
+  $("toast").appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; }, 2600);
+  setTimeout(() => el.remove(), 3000);
+}
+
+/* ------------------------------------------------------------------ */
+/* 표시 도우미                                                          */
+/* ------------------------------------------------------------------ */
+const TASK_STATUS = { pending: ["대기", "b-gray"], assigned: ["배정됨", "b-info"], running: ["발신 중", "b-warn"], done: ["완료", "b-ok"], failed: ["실패", "b-danger"], skipped: ["취소", "b-gray"] };
+const RUN_STATUS = { pending: ["대기", "b-gray"], running: ["진행 중", "b-warn"], done: ["완료", "b-ok"], partial: ["일부 실패", "b-warn"], failed: ["실패", "b-danger"], canceled: ["취소", "b-gray"] };
+const SCHED_STATUS = { active: ["활성", "b-ok"], paused: ["일시정지", "b-warn"], finished: ["종료", "b-gray"] };
+const TG_STATUS = { sent: ["전송됨", "b-ok"], pending: ["재시도 대기", "b-warn"], failed: ["전송 실패", "b-danger"], skipped: ["전달 안 함", "b-gray"], disabled: ["전달 꺼짐", "b-gray"] };
+const RECURRENCE = { once: "1회", daily: "매일", weekly: "매주", monthly: "매월" };
+
+function badge(text, cls) { return `<span class="badge ${cls}"><i></i>${esc(text)}</span>`; }
+function statusBadge(map, key) { const item = map[key] || [key, "b-gray"]; return badge(item[0], item[1]); }
+function typeTag(type) { return type === "sms" ? '<span class="type-tag t-sms">💬 문자</span>' : '<span class="type-tag t-call">📞 전화</span>'; }
+
+function fmtDateTime(iso) {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function fmtTime(iso) {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function progressBar(done, total) {
+  const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  return `<div style="display:flex;align-items:center;gap:8px"><div class="progress" style="flex:1"><span style="width:${pct}%"></span></div><span class="muted mono">${done}/${total}</span></div>`;
+}
+function emptyRow(cols, text, icon = "📭") {
+  return `<tr><td colspan="${cols}"><div class="empty"><div class="big">${icon}</div>${text}</div></td></tr>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* 탭                                                                  */
+/* ------------------------------------------------------------------ */
+document.querySelectorAll(".tab").forEach((button) => {
+  button.addEventListener("click", () => switchTab(button.dataset.tab));
+});
+
+function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  document.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + tab));
+  location.hash = tab;
+  loadTab();
+}
+
+function loadTab() {
+  if (state.tab === "dashboard") loadDashboard();
+  else if (state.tab === "devices") { loadDevices(); }
+  else if (state.tab === "schedules") { loadSchedules(); loadDevices(); }
+  else if (state.tab === "tasks") { loadTasks(); loadRuns(); }
+  else if (state.tab === "sms") loadSms();
+  else if (state.tab === "telegram") loadTelegram();
+}
+
+function refreshAll() {
+  loadTab();
+  loadHealth();
+}
+
+/* ------------------------------------------------------------------ */
+/* 대시보드                                                            */
+/* ------------------------------------------------------------------ */
+async function loadHealth() {
+  try {
+    const health = await fetch("/api/health").then((r) => r.json());
+    $("conn").className = "conn ok";
+    $("connText").textContent = health.ok ? "서버 연결됨" : "DB 오류";
+  } catch (e) {
+    $("conn").className = "conn bad";
+    $("connText").textContent = "서버 연결 끊김";
+  }
+}
+
+async function loadDashboard() {
+  try {
+    const stats = await api("/api/stats");
+    const cards = [
+      { label: "등록 기기", value: stats.devices.total, unit: "대", foot: `온라인 ${stats.devices.online}대`, accent: true },
+      { label: "활성 스케줄", value: stats.schedules.active, unit: "개", foot: "예약 대기 중" },
+      { label: "발신 대기", value: stats.tasks.pending, unit: "건", foot: "폰이 가져갈 작업" },
+      { label: "오늘 완료", value: stats.tasks.done_today, unit: "건", foot: `전화 ${stats.tasks.calls_today}건` },
+      { label: "오늘 실패", value: stats.tasks.failed_today, unit: "건", foot: stats.tasks.failed_today ? "확인 필요" : "문제 없음" },
+      { label: "오늘 수신 문자", value: stats.sms.today, unit: "건", foot: stats.sms.telegram_issue ? `전달 미완료 ${stats.sms.telegram_issue}건` : "모두 전달됨" },
+    ];
+    $("statCards").innerHTML = cards.map((c) => `
+      <div class="stat ${c.accent ? "accent" : ""}">
+        <div class="label">${c.label}</div>
+        <div class="value">${c.value}<small>${c.unit}</small></div>
+        <div class="foot">${esc(c.foot)}</div>
+      </div>`).join("");
+
+    $("recentRunsTable").querySelector("tbody").innerHTML = stats.recent_runs.length
+      ? stats.recent_runs.map((run) => `
+        <tr>
+          <td class="truncate">${esc(run.schedule_name || "-")}</td>
+          <td>${typeTag(run.type)}</td>
+          <td class="nowrap muted">${esc(run.created_at_text)}</td>
+          <td style="min-width:130px">${progressBar(run.done_tasks, run.total_tasks)}</td>
+          <td>${statusBadge(RUN_STATUS, run.status)}</td>
+        </tr>`).join("")
+      : emptyRow(5, "아직 실행된 스케줄이 없습니다.");
+
+    $("upcomingList").innerHTML = stats.upcoming.length
+      ? `<ul class="list-plain">${stats.upcoming.map((item) => `
+          <li>
+            <span>${typeTag(item.type)} <b style="margin-left:6px">${esc(item.name)}</b></span>
+            <span class="muted mono">${esc(item.next_run_text)}</span>
+          </li>`).join("")}</ul>`
+      : `<div class="empty"><div class="big">🗓️</div>예정된 스케줄이 없습니다.</div>`;
+
+    const logs = await api("/api/logs?limit=12");
+    $("dashLogs").innerHTML = logs.logs.length
+      ? logs.logs.map((log) => `
+        <div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px">
+          <span class="mono muted nowrap">${esc(log.created_at_text)}</span>
+          <span style="color:${log.level === "warning" ? "var(--warn)" : "var(--text)"}">${esc(log.message)}</span>
+        </div>`).join("")
+      : `<div class="empty">로그가 없습니다.</div>`;
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 기기                                                                */
+/* ------------------------------------------------------------------ */
+async function loadDevices() {
+  try {
+    const data = await api("/api/devices");
+    state.devices = data.devices;
+    const online = data.devices.filter((d) => d.online).length;
+    $("deviceSummary").textContent = `전체 ${data.devices.length}대 · 온라인 ${online}대`;
+    $("tabDeviceCount").textContent = data.devices.length ? ` ${online}/${data.devices.length}` : "";
+
+    const select = $("schedDevice");
+    const current = select.value;
+    select.innerHTML = '<option value="">전체 분배 (공유 대기열)</option>' +
+      data.devices.map((d) => `<option value="${esc(d.id)}">${esc(d.name)} (${esc(d.id)})${d.online ? "" : " · 오프라인"}</option>`).join("");
+    select.value = current;
+
+    $("devicesTable").querySelector("tbody").innerHTML = data.devices.length
+      ? data.devices.map((d) => `
+        <tr>
+          <td>${d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray")}</td>
+          <td><b>${esc(d.name)}</b><div class="muted mono">${esc(d.id)}</div>${d.note ? `<div class="muted" style="font-size:11.5px">${esc(d.note)}</div>` : ""}</td>
+          <td class="muted">${esc(d.model || "-")}<div style="font-size:11.5px">${d.android_version ? "Android " + esc(d.android_version) : ""}</div></td>
+          <td>${d.battery === null || d.battery === undefined ? '<span class="muted">-</span>' : `${d.battery}%`}</td>
+          <td class="muted nowrap">${esc(d.last_seen_text)}</td>
+          <td><button class="btn sm danger" onclick="deleteDevice('${esc(d.id)}')">삭제</button></td>
+        </tr>`).join("")
+      : emptyRow(6, "등록된 기기가 없습니다. 앱에서 서비스 시작을 누르면 자동 등록됩니다.", "📵");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function addDevice() {
+  const id = $("devId").value.trim();
+  const name = $("devName").value.trim();
+  const note = $("devNote").value.trim();
+  if (!id) { toast("기기 ID를 입력하세요.", "err"); return; }
+  try {
+    await api("/api/devices", { method: "POST", body: JSON.stringify({ device_id: id, name: name || id, note }) });
+    $("devId").value = ""; $("devName").value = ""; $("devNote").value = "";
+    toast("기기를 등록했습니다.", "ok");
+    loadDevices();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteDevice(id) {
+  if (!confirm(`기기 ${id} 를 삭제할까요?\n배정된 미완료 작업은 공유 대기열로 돌아갑니다.`)) return;
+  try {
+    await api(`/api/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
+    toast("기기를 삭제했습니다.", "ok");
+    loadDevices();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 스케줄                                                              */
+/* ------------------------------------------------------------------ */
+function scheduleType() {
+  const checked = document.querySelector('input[name="schedType"]:checked');
+  return checked ? checked.value : "call";
+}
+
+function toggleTypeFields() {
+  const isCall = scheduleType() === "call";
+  $("callDurationField").style.display = isCall ? "" : "none";
+  $("smsBodyField").style.display = isCall ? "none" : "";
+  updateSummary();
+}
+
+function parseNumbers(text) {
+  return text.split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
+}
+
+function updateSummary() {
+  const numbers = parseNumbers($("schedNumbers").value);
+  const repeat = Math.max(1, parseInt($("schedRepeat").value || "1", 10));
+  const order = $("schedOrder").value;
+  const type = scheduleType();
+  if (!numbers.length) {
+    $("schedSummary").textContent = "번호와 반복 횟수를 입력하면 발신 건수가 표시됩니다.";
+    return;
+  }
+  const total = numbers.length * repeat;
+  let preview;
+  if (order === "grouped") {
+    const first = numbers[0]; const second = numbers[1] || numbers[0];
+    preview = `${first} ×${repeat} → ${second} ×${repeat} …`;
+  } else {
+    const head = numbers.slice(0, 3).join(" → ");
+    preview = repeat > 1 ? `${head} → (다시) ${head} …` : head;
+  }
+  const extra = type === "sms" && !$("schedSmsBody").value.trim() ? " · 문자 내용을 입력하세요" : "";
+  $("schedSummary").innerHTML =
+    `총 <b>${total}건</b> ${type === "call" ? "전화" : "문자"} 발신 · 번호 ${numbers.length}개 × ${repeat}회<div class="muted" style="margin-top:4px">순서: ${esc(preview)}${esc(extra)}</div>`;
+}
+
+function defaultStartValue() {
+  const d = new Date(Date.now() + 10 * 60 * 1000);
+  d.setSeconds(0, 0);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function resetScheduleForm() {
+  $("schedName").value = "";
+  $("schedNumbers").value = "";
+  $("schedRepeat").value = "1";
+  $("schedOrder").value = "sequence";
+  $("schedMaxSec").value = "30";
+  $("schedSmsBody").value = "";
+  $("schedStart").value = defaultStartValue();
+  $("schedRecurrence").value = "once";
+  $("schedDevice").value = "";
+  document.querySelector('input[name="schedType"][value="call"]').checked = true;
+  toggleTypeFields();
+}
+
+async function createSchedule() {
+  const numbers = parseNumbers($("schedNumbers").value);
+  if (!numbers.length) { toast("발신할 번호를 한 개 이상 입력하세요.", "err"); return; }
+  if (!$("schedStart").value) { toast("실행 시각을 지정하세요.", "err"); return; }
+  const type = scheduleType();
+  const payload = {
+    name: $("schedName").value.trim(),
+    type,
+    numbers,
+    repeat_count: Math.max(1, parseInt($("schedRepeat").value || "1", 10)),
+    order_mode: $("schedOrder").value,
+    start_at: $("schedStart").value,
+    recurrence: $("schedRecurrence").value,
+    device_id: $("schedDevice").value || null,
+  };
+  if (type === "call") {
+    payload.max_call_duration_sec = Math.max(1, parseInt($("schedMaxSec").value || "30", 10));
+  } else {
+    const body = $("schedSmsBody").value.trim();
+    if (!body) { toast("문자 내용을 입력하세요.", "err"); return; }
+    payload.sms_body = body;
+  }
+  const button = $("createScheduleBtn");
+  button.disabled = true;
+  try {
+    const created = await api("/api/schedules", { method: "POST", body: JSON.stringify(payload) });
+    toast(`스케줄을 등록했습니다. (${created.schedule.tasks_per_run}건 × ${RECURRENCE[created.schedule.recurrence]})`, "ok");
+    resetScheduleForm();
+    loadSchedules();
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadSchedules() {
+  try {
+    const data = await api("/api/schedules");
+    state.schedules = data.schedules;
+    const active = data.schedules.filter((s) => s.status === "active").length;
+    $("scheduleSummary").textContent = `전체 ${data.schedules.length}개 · 활성 ${active}개`;
+    $("tabScheduleCount").textContent = data.schedules.length ? ` ${active}` : "";
+
+    $("schedulesTable").querySelector("tbody").innerHTML = data.schedules.length
+      ? data.schedules.map((s) => {
+          const latest = s.latest_run;
+          const latestCell = latest
+            ? `${progressBar(latest.done_tasks, latest.total_tasks)}<div style="margin-top:4px">${statusBadge(RUN_STATUS, latest.status)}</div>`
+            : '<span class="muted">-</span>';
+          const detail = s.type === "call" ? `${s.max_call_duration_sec}초 제한` : (s.sms_body || "").slice(0, 30);
+          return `
+          <tr>
+            <td><b>${esc(s.name)}</b><div class="muted" style="font-size:11.5px">#${s.id} · ${esc(detail)}</div></td>
+            <td>${typeTag(s.type)}</td>
+            <td class="nowrap">${s.number_count}개 × ${s.repeat_count}회<div class="muted mono" style="font-size:11.5px">${s.tasks_per_run}건/회</div></td>
+            <td class="nowrap">${esc(RECURRENCE[s.recurrence] || s.recurrence)}<div class="muted" style="font-size:11.5px">${esc(s.start_at_text)}</div></td>
+            <td class="nowrap">${s.next_run_at ? esc(s.next_run_text) : '<span class="muted">-</span>'}</td>
+            <td style="min-width:130px">${latestCell}</td>
+            <td>${statusBadge(SCHED_STATUS, s.status)}</td>
+            <td>
+              <div class="cell-actions">
+                <button class="btn sm" onclick="runScheduleNow(${s.id})">지금 실행</button>
+                ${s.status === "active"
+                  ? `<button class="btn sm" onclick="setScheduleStatus(${s.id},'pause')">일시정지</button>`
+                  : `<button class="btn sm" onclick="setScheduleStatus(${s.id},'resume')">재개</button>`}
+                <button class="btn sm danger" onclick="deleteSchedule(${s.id})">삭제</button>
+              </div>
+            </td>
+          </tr>`;
+        }).join("")
+      : emptyRow(8, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function runScheduleNow(id) {
+  if (!confirm("지금 바로 발신을 시작할까요?\n등록된 번호로 즉시 전화/문자가 나갑니다.")) return;
+  try {
+    await api(`/api/schedules/${id}/run-now`, { method: "POST" });
+    toast("실행을 시작했습니다.", "ok");
+    loadSchedules();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function setScheduleStatus(id, action) {
+  try {
+    await api(`/api/schedules/${id}/${action}`, { method: "POST" });
+    toast(action === "pause" ? "일시정지했습니다." : "재개했습니다.", "ok");
+    loadSchedules();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteSchedule(id) {
+  if (!confirm("스케줄을 삭제할까요?\n남은 발신 작업은 취소됩니다.")) return;
+  try {
+    await api(`/api/schedules/${id}`, { method: "DELETE" });
+    toast("스케줄을 삭제했습니다.", "ok");
+    loadSchedules();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 작업 / 실행 묶음                                                    */
+/* ------------------------------------------------------------------ */
+function setTaskFilter(button) {
+  document.querySelectorAll("#pane-tasks .chip").forEach((b) => b.classList.remove("active"));
+  button.classList.add("active");
+  state.taskFilter = button.dataset.filter;
+  loadTasks();
+}
+
+async function loadTasks() {
+  try {
+    const query = new URLSearchParams({ limit: "200" });
+    if (state.taskFilter) query.set("status", state.taskFilter);
+    const data = await api("/api/tasks?" + query.toString());
+    $("tasksTable").querySelector("tbody").innerHTML = data.tasks.length
+      ? data.tasks.map((t) => `
+        <tr>
+          <td class="muted mono">${t.id}</td>
+          <td class="truncate">${esc(t.schedule_name || "-")}</td>
+          <td>${typeTag(t.type)}</td>
+          <td class="mono nowrap">${esc(t.phone_number)}</td>
+          <td class="muted">${t.repeat_index}회차</td>
+          <td class="mono">${esc(t.device_id || "공유")}</td>
+          <td>${statusBadge(TASK_STATUS, t.status)}</td>
+          <td class="truncate">${esc(t.error || t.result || "-")}${t.duration_sec ? `<span class="muted mono"> (${Number(t.duration_sec).toFixed(1)}초)</span>` : ""}</td>
+          <td class="muted nowrap">${t.finished_at ? fmtTime(t.finished_at) : (t.claimed_at ? "진행 중" : "-")}</td>
+        </tr>`).join("")
+      : emptyRow(9, "표시할 작업이 없습니다.", "📋");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function loadRuns() {
+  try {
+    const data = await api("/api/runs?limit=30");
+    $("runsTable").querySelector("tbody").innerHTML = data.runs.length
+      ? data.runs.map((r) => `
+        <tr>
+          <td class="muted mono">${r.id}</td>
+          <td class="truncate">${esc(r.schedule_name || "-")}</td>
+          <td>${typeTag(r.type)}</td>
+          <td class="nowrap muted">${esc(r.scheduled_for_text)}</td>
+          <td style="min-width:130px">${progressBar(r.done_tasks, r.total_tasks)}</td>
+          <td>${statusBadge(RUN_STATUS, r.status)}</td>
+          <td class="muted nowrap">${esc(r.created_at_text)}</td>
+        </tr>`).join("")
+      : emptyRow(7, "실행 기록이 없습니다.", "🕒");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 수신 문자                                                           */
+/* ------------------------------------------------------------------ */
+async function loadSms() {
+  try {
+    const [data, settings] = await Promise.all([api("/api/sms?limit=100"), api("/api/settings")]);
+    const forward = settings.telegram.sms_forward_enabled && settings.telegram.configured;
+    $("smsFwdState").className = "badge " + (forward ? "b-ok" : "b-warn");
+    $("smsFwdState").textContent = forward ? "텔레그램 전달 중" : "텔레그램 설정 필요";
+    $("tabSmsCount").textContent = data.messages.length ? ` ${data.messages.length}` : "";
+
+    $("smsTable").querySelector("tbody").innerHTML = data.messages.length
+      ? data.messages.map((m) => `
+        <tr>
+          <td class="nowrap mono">${esc(m.received_at_text)}</td>
+          <td><b>${esc(m.device_name)}</b><div class="muted mono" style="font-size:11.5px">${esc(m.device_id)}</div></td>
+          <td class="mono nowrap">${esc(m.sender || "-")}</td>
+          <td style="max-width:380px"><div class="truncate" title="${esc(m.body)}">${esc(m.body)}</div></td>
+          <td>${statusBadge(TG_STATUS, m.telegram_status)}${m.telegram_error ? `<div class="muted" style="font-size:11px;margin-top:3px">${esc(m.telegram_error)}</div>` : ""}</td>
+          <td><button class="btn sm" onclick="resendSms(${m.id})">다시 전송</button></td>
+        </tr>`).join("")
+      : emptyRow(6, "수신된 문자가 없습니다.", "📨");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function resendSms(id) {
+  try {
+    const result = await api(`/api/sms/${id}/resend`, { method: "POST" });
+    toast(result.ok ? "텔레그램으로 전송했습니다." : ("전송 실패: " + (result.error || "")), result.ok ? "ok" : "err");
+    loadSms();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 텔레그램                                                            */
+/* ------------------------------------------------------------------ */
+async function loadTelegram() {
+  try {
+    const data = await api("/api/settings");
+    $("tgToken").value = data.telegram.bot_token || "";
+    $("tgChat").value = data.telegram.chat_id || "";
+    $("tgForward").checked = !!data.telegram.sms_forward_enabled;
+    $("tgStatus").textContent = data.telegram.configured
+      ? "✅ 텔레그램이 설정되었습니다."
+      : "아직 설정되지 않았습니다. 토큰과 Chat ID를 입력하세요.";
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function saveTelegram() {
+  try {
+    await api("/api/settings/telegram", {
+      method: "POST",
+      body: JSON.stringify({
+        bot_token: $("tgToken").value.trim(),
+        chat_id: $("tgChat").value.trim(),
+        sms_forward_enabled: $("tgForward").checked,
+      }),
+    });
+    toast("저장했습니다.", "ok");
+    loadTelegram();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function testTelegram() {
+  try {
+    await api("/api/telegram/test", { method: "POST", body: JSON.stringify({}) });
+    toast("테스트 메시지를 보냈습니다. 텔레그램을 확인하세요.", "ok");
+  } catch (e) { toast("테스트 실패: " + e.message, "err"); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 시작                                                                */
+/* ------------------------------------------------------------------ */
+function startClock() {
+  const tick = () => {
+    const now = new Date();
+    const p = (n) => String(n).padStart(2, "0");
+    const days = ["일", "월", "화", "수", "목", "금", "토"];
+    $("clock").textContent = `${p(now.getMonth() + 1)}-${p(now.getDate())}(${days[now.getDay()]}) ${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`;
+  };
+  tick();
+  setInterval(tick, 1000);
+}
+
+function startAutoRefresh() {
+  if (state.timer) clearInterval(state.timer);
+  state.timer = setInterval(() => {
+    if (document.hidden) return;
+    // 텔레그램 탭은 입력 중인 값이 지워지지 않도록 자동 갱신하지 않는다.
+    if (state.tab === "telegram") { loadHealth(); return; }
+    refreshAll();
+  }, 5000);
+}
+
+(function init() {
+  startClock();
+  resetScheduleForm();
+  toggleTypeFields();
+  const hash = (location.hash || "").replace("#", "");
+  if (hash && document.getElementById("pane-" + hash)) {
+    document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === hash));
+    document.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + hash));
+    state.tab = hash;
+  }
+  loadHealth();
+  loadTab();
+  startAutoRefresh();
+})();
+</script>
+</body>
+</html>
