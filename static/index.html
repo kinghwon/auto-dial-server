@@ -593,6 +593,7 @@ const state = {
   visibleSms: [],
   openSms: new Set(),
   smsTotal: 0,
+  smsSignature: "",
   remoteDirty: false,
   timer: null,
   clockTimer: null,
@@ -1335,6 +1336,8 @@ async function smsAttachmentBlobUrl(url) {
 function resetSmsBlobCache() {
   smsBlobCache.forEach((objectUrl) => URL.revokeObjectURL(objectUrl));
   smsBlobCache.clear();
+  // 사진 주소가 바뀌었으니 다음 목록 갱신 때 다시 그려 썸네일을 새로 받는다.
+  state.smsSignature = "";
 }
 
 function fmtBytes(bytes) {
@@ -1488,12 +1491,21 @@ async function loadSms() {
       ? `최근 ${data.messages.length}건 / 전체 ${state.smsTotal}건`
       : `전체 ${state.smsTotal}건`;
 
+    // 목록이 그대로면(5초 자동 갱신) 다시 그리지 않아 사진 클릭·펼치기가 끊기지 않게 한다.
+    const signature = JSON.stringify(data.messages.map((m) => [
+      m.id, m.received_at, m.device_name, m.device_id, m.sender, m.body,
+      m.telegram_status, m.telegram_error, m.attachment_count,
+    ]));
+    const listChanged = signature !== state.smsSignature;
+    state.smsSignature = signature;
+
     // 목록에서 사라진 문자가 선택에 남지 않게 한다(5초 자동 갱신 대비).
     const visibleIds = new Set(data.messages.map((m) => m.id));
     Array.from(state.selectedSms).forEach((id) => { if (!visibleIds.has(id)) state.selectedSms.delete(id); });
 
-    $("smsTable").querySelector("tbody").innerHTML = data.messages.length
-      ? data.messages.map((m) => `
+    if (listChanged) {
+      $("smsTable").querySelector("tbody").innerHTML = data.messages.length
+        ? data.messages.map((m) => `
         <tr>
           <td><input type="checkbox" class="queue-check sms-check" ${state.selectedSms.has(m.id) ? "checked" : ""} onchange="toggleSmsSelection(${m.id}, this.checked)"></td>
           <td class="nowrap mono">${esc(m.received_at_text)}</td>
@@ -1506,11 +1518,12 @@ async function loadSms() {
           <td>${statusBadge(TG_STATUS, m.telegram_status)}${m.telegram_error ? `<div class="muted" style="font-size:11px;margin-top:3px">${esc(m.telegram_error)}</div>` : ""}</td>
           <td><div class="cell-actions"><button class="btn sm" onclick="resendSms(${m.id})">다시 전송</button><button class="btn sm danger" onclick="deleteSms(${m.id})">삭제</button></div></td>
         </tr>`).join("")
-      : emptyRow(7, "수신된 문자가 없습니다.", "📨");
+        : emptyRow(7, "수신된 문자가 없습니다.", "📨");
+      hydrateSmsThumbs();
+    }
 
     updateSmsToolbar();
     syncSmsSelectAllState();
-    hydrateSmsThumbs();
   } catch (e) { toast(e.message, "err"); }
 }
 
