@@ -4,9 +4,11 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 from collections import Counter
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,6 +21,7 @@ from app.timeutil import TZ, add_months, next_occurrence, parse_dt
 @pytest.fixture(autouse=True)
 def isolate_db(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(config, "MEDIA_DIR", tmp_path / "media")
     monkeypatch.setattr(config, "SCHEDULER_ENABLED", False)
     monkeypatch.setattr(config, "API_KEY", "")
     db.init_db()
@@ -445,6 +448,237 @@ def test_sms_skipped_when_telegram_not_configured(client, monkeypatch):
     assert response.status_code == 200
     assert called == []
     assert client.get("/api/sms").json()["messages"][0]["telegram_status"] == "skipped"
+
+
+# --------------------------------------------------------------------------
+# 6-2. MMS 사진 첨부 전달
+# --------------------------------------------------------------------------
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+PHOTO_BYTES = b"\xff\xd8\xff\xe0" + b"jpeg-photo-bytes" * 8
+
+
+def _capture_telegram(monkeypatch):
+    """send_message / send_photo / send_document 호출을 기록한다."""
+    calls = {"text": [], "photo": [], "document": []}
+
+    def fake_message(token, chat_id, text, timeout=10.0):
+        calls["text"].append(text)
+        return True, None
+
+    def fake_photo(token, chat_id, image_bytes, filename, caption=None, **kwargs):
+        calls["photo"].append({"bytes": image_bytes, "filename": filename, "caption": caption})
+        return True, None
+
+    def fake_document(token, chat_id, file_bytes, filename, caption=None, **kwargs):
+        calls["document"].append({"bytes": file_bytes, "filename": filename, "caption": caption})
+        return True, None
+
+    monkeypatch.setattr(telegram_client, "send_message", fake_message)
+    monkeypatch.setattr(telegram_client, "send_photo", fake_photo)
+    monkeypatch.setattr(telegram_client, "send_document", fake_document)
+    return calls
+
+
+def _prepare_telegram(client):
+    client.post("/api/devices", json={"device_id": "DEV-MMS", "name": "갤23+"})
+    client.post(
+        "/api/settings/telegram",
+        json={"bot_token": "123456789:TESTTOKEN", "chat_id": "-100777"},
+    )
+
+
+def test_incoming_mms_photo_is_forwarded_as_photo(client, monkeypatch):
+    _prepare_telegram(client)
+    calls = _capture_telegram(monkeypatch)
+
+    response = client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": "DEV-MMS",
+            "sender": "010-1234-5678",
+            "body": "[MMS]\n제목: 매장 안내\n사진 보냅니다",
+            "received_at": "2026-11-22T20:30:00+09:00",
+            "attachments": [
+                {"filename": "photo.jpg", "content_type": "image/jpeg", "data_base64": _b64(PHOTO_BYTES)}
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    stored = client.get("/api/sms").json()["messages"][0]
+    assert stored["attachment_count"] == 1
+    assert stored["telegram_status"] == "sent"
+    assert stored["telegram_error"] is None
+
+    # 짧은 글은 사진 설명(caption)으로 한 번에 나간다(글 메시지 따로 없음).
+    assert calls["text"] == []
+    assert len(calls["photo"]) == 1
+    sent_photo = calls["photo"][0]
+    assert sent_photo["bytes"] == PHOTO_BYTES
+    assert sent_photo["filename"] == "photo.jpg"
+    assert "수신 문자" in sent_photo["caption"]
+    assert "갤23+ (DEV-MMS)" in sent_photo["caption"]
+    assert "제목: 매장 안내" in sent_photo["caption"]
+
+    # 첨부는 서버 파일로 남고, 대시보드에서 다시 내려받을 수 있다.
+    conn = _conn()
+    row = conn.execute("SELECT attachment_paths FROM sms_inbox WHERE id = ?", (stored["id"],)).fetchone()
+    conn.close()
+    saved = json.loads(row["attachment_paths"])
+    assert Path(saved[0]["path"]).read_bytes() == PHOTO_BYTES
+    assert saved[0]["content_type"] == "image/jpeg"
+
+    download = client.get(f"/api/sms/{stored['id']}/attachments/0")
+    assert download.status_code == 200
+    assert download.content == PHOTO_BYTES
+
+
+def test_incoming_mms_long_body_sends_text_then_photo(client, monkeypatch):
+    _prepare_telegram(client)
+    calls = _capture_telegram(monkeypatch)
+
+    long_body = "[MMS]\n" + ("긴 광고 문구입니다. " * 120)  # 1,000자 초과
+    response = client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": "DEV-MMS",
+            "sender": "1588-0000",
+            "body": long_body,
+            "attachments": [
+                {"filename": "a.jpg", "content_type": "image/jpeg", "data_base64": _b64(PHOTO_BYTES)}
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert len(calls["text"]) == 1
+    assert "긴 광고 문구입니다." in calls["text"][0]
+    assert len(calls["photo"]) == 1
+    assert calls["photo"][0]["caption"] is None
+
+
+def test_incoming_mms_multiple_photos_sent_in_order(client, monkeypatch):
+    _prepare_telegram(client)
+    calls = _capture_telegram(monkeypatch)
+    second = PHOTO_BYTES + b"-2"
+
+    client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": "DEV-MMS",
+            "sender": "010-2222-3333",
+            "body": "사진 두 장",
+            "attachments": [
+                {"filename": "1.jpg", "content_type": "image/jpeg", "data_base64": _b64(PHOTO_BYTES)},
+                {"filename": "2.png", "content_type": "image/png", "data_base64": _b64(second)},
+            ],
+        },
+    )
+    assert [item["filename"] for item in calls["photo"]] == ["1.jpg", "2.png"]
+    assert calls["photo"][0]["caption"] is not None
+    assert calls["photo"][1]["caption"] is None
+    assert client.get("/api/sms").json()["messages"][0]["attachment_count"] == 2
+
+
+def test_incoming_mms_non_image_attachment_uses_document(client, monkeypatch):
+    _prepare_telegram(client)
+    calls = _capture_telegram(monkeypatch)
+
+    client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": "DEV-MMS",
+            "sender": "010-4444-5555",
+            "body": "계약서 첨부",
+            "attachments": [
+                {"filename": "contract.pdf", "content_type": "application/pdf", "data_base64": _b64(b"%PDF-1.4 test")}
+            ],
+        },
+    )
+    assert len(calls["text"]) == 1
+    assert calls["text"][0].count("계약서 첨부") == 1
+    assert calls["photo"] == []
+    assert len(calls["document"]) == 1
+    assert calls["document"][0]["filename"] == "contract.pdf"
+
+
+def test_sms_without_attachments_keeps_text_only_path(client, monkeypatch):
+    _prepare_telegram(client)
+    calls = _capture_telegram(monkeypatch)
+
+    client.post("/api/sms/incoming", json={"device_id": "DEV-MMS", "sender": "010-1", "body": "사진 없는 문자"})
+    assert len(calls["text"]) == 1
+    assert calls["photo"] == []
+    assert calls["document"] == []
+
+
+def test_incoming_mms_broken_attachment_still_forwards_text(client, monkeypatch):
+    _prepare_telegram(client)
+    calls = _capture_telegram(monkeypatch)
+
+    response = client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": "DEV-MMS",
+            "sender": "010-6",
+            "body": "깨진 첨부",
+            "attachments": [{"filename": "x.jpg", "content_type": "image/jpeg", "data_base64": "!!!!"}],
+        },
+    )
+    assert response.status_code == 200
+    assert client.get("/api/sms").json()["messages"][0]["telegram_status"] == "sent"
+    assert len(calls["text"]) == 1
+    assert calls["photo"] == []
+
+
+def test_incoming_sms_rejects_too_many_attachments(client):
+    response = client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": "DEV-MMS",
+            "sender": "010-7",
+            "body": "첨부 11건",
+            "attachments": [
+                {"filename": f"{i}.jpg", "content_type": "image/jpeg", "data_base64": _b64(PHOTO_BYTES)}
+                for i in range(11)
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_resend_sms_uses_saved_photo(client, monkeypatch):
+    _prepare_telegram(client)
+    calls = _capture_telegram(monkeypatch)
+
+    created = client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": "DEV-MMS",
+            "sender": "010-8",
+            "body": "사진 다시 보내기",
+            "attachments": [
+                {"filename": "again.jpg", "content_type": "image/jpeg", "data_base64": _b64(PHOTO_BYTES)}
+            ],
+        },
+    ).json()
+
+    calls["photo"].clear()
+    calls["text"].clear()
+    resent = client.post(f"/api/sms/{created['id']}/resend")
+    assert resent.status_code == 200 and resent.json()["ok"] is True
+    assert len(calls["photo"]) == 1
+    assert calls["photo"][0]["bytes"] == PHOTO_BYTES
+    assert "사진 다시 보내기" in calls["photo"][0]["caption"]
+
+
+def test_incoming_sms_openapi_exposes_attachments(client):
+    schema = client.get("/openapi.json").json()
+    incoming = schema["components"]["schemas"]["SmsIncoming"]
+    assert "attachments" in incoming["properties"]
+    assert "SmsAttachment" in schema["components"]["schemas"]
 
 
 # --------------------------------------------------------------------------

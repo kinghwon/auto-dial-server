@@ -32,6 +32,8 @@ _load_env()
 
 DATA_DIR = Path(os.getenv("DATA_DIR") or (BASE_DIR / "data"))
 DB_PATH = Path(os.getenv("DB_PATH") or (DATA_DIR / "autodialer.db"))
+# MMS 첨부(사진)를 잠시 보관하는 곳. 재전송·재시도 때 파일을 다시 읽는다.
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR") or (DATA_DIR / "media"))
 
 TZ_NAME = os.getenv("APP_TZ", "Asia/Seoul")
 TZ = ZoneInfo(TZ_NAME)
@@ -56,6 +58,11 @@ DEFAULT_POLL_INTERVAL_SEC = int(os.getenv("DEFAULT_POLL_INTERVAL_SEC", "5"))
 
 # 텔레그램 전송 재시도 최대 횟수
 TELEGRAM_MAX_ATTEMPTS = int(os.getenv("TELEGRAM_MAX_ATTEMPTS", "3"))
+
+# MMS 첨부 한 건 최대 크기(바이트). 앱이 1.5MB 넘는 사진은 줄여서 보내지만 서버에서도 막는다.
+MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(6 * 1024 * 1024)))
+# 한 문자에 붙일 수 있는 첨부 개수
+MAX_SMS_ATTACHMENTS = 10
 
 DEFAULT_CALL_MAX_SEC = 30
 MAX_CALL_MAX_SEC = 3600

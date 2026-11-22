@@ -192,12 +192,23 @@ class TaskResult(BaseModel):
     duration_sec: Optional[float] = Field(default=None, ge=0, le=86400)
 
 
+class SmsAttachment(BaseModel):
+    """MMS 첨부(사진 등). 앱이 Base64 로 인코딩해 올린다."""
+
+    filename: str = Field(default="attachment", max_length=200)
+    content_type: str = Field(default="application/octet-stream", max_length=100)
+    # Base64 문자열 길이 상한(약 6MB 실제 데이터). 텔레그램 사진 한 장 한도(10MB) 안쪽.
+    data_base64: str = Field(min_length=1, max_length=8_000_000)
+
+
 class SmsIncoming(BaseModel):
     device_id: str = Field(min_length=1, max_length=64)
     sender: str = Field(default="", max_length=64)
     body: str = Field(default="", max_length=4000)
     received_at: Optional[str] = None
     received_ts: Optional[int] = None  # epoch millis (앱에서 보내는 경우)
+    # MMS 사진·파일 첨부(최대 10건). 비어 있으면 기존 문자 전용 경로 그대로 동작한다.
+    attachments: list[SmsAttachment] = Field(default_factory=list, max_length=10)
 
     @field_validator("sender")
     @classmethod

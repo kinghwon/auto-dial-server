@@ -1,6 +1,7 @@
 """FastAPI 애플리케이션 (중앙 서버)."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import sqlite3
@@ -239,6 +240,14 @@ def schedule_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     }
 
 
+def _row_value(row: sqlite3.Row, key: str, default=None):
+    """예전 DB(칼럼이 없을 수 있음)에서도 안전하게 값을 꺼낸다."""
+    try:
+        return row[key] if key in row.keys() else default
+    except (IndexError, KeyError):
+        return default
+
+
 def sms_dict(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
@@ -252,6 +261,7 @@ def sms_dict(row: sqlite3.Row) -> dict:
         "telegram_error": row["telegram_error"],
         "telegram_attempts": row["telegram_attempts"],
         "telegram_sent_at": row["telegram_sent_at"],
+        "attachment_count": int(_row_value(row, "attachment_count", 0) or 0),
     }
 
 
@@ -1105,7 +1115,14 @@ def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite
         (payload.device_id, payload.sender, payload.body, received_at, iso(now())),
     )
     sms_id = int(cursor.lastrowid)
-    db.log(conn, f"수신 문자 저장: {payload.sender} → {device['name']} (id={sms_id})")
+    saved = save_sms_attachments(sms_id, payload.attachments)
+    if saved:
+        conn.execute(
+            "UPDATE sms_inbox SET attachment_count = ?, attachment_paths = ? WHERE id = ?",
+            (len(saved), json.dumps(saved, ensure_ascii=False), sms_id),
+        )
+    attachment_note = f", 사진·첨부 {len(saved)}건" if saved else ""
+    db.log(conn, f"수신 문자 저장: {payload.sender} → {device['name']} (id={sms_id}{attachment_note})")
 
     settings = db.get_settings(conn)
     if settings.get("sms_forward_enabled", "1") == "1" and settings.get("telegram_bot_token") and settings.get("telegram_chat_id"):
@@ -1118,6 +1135,73 @@ def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite
 
     row = conn.execute("SELECT * FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
     return {"ok": True, "id": sms_id, "sms": sms_dict(row)}
+
+
+def _attachment_extension(content_type: str, filename: str) -> str:
+    """첨부 저장에 쓸 확장자. content-type 우선, 없으면 파일명에서."""
+    mapping = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/heic": ".heic",
+        "image/bmp": ".bmp",
+        "video/mp4": ".mp4",
+        "video/3gpp": ".3gp",
+        "audio/mpeg": ".mp3",
+        "audio/amr": ".amr",
+        "text/vcard": ".vcf",
+        "text/x-vcard": ".vcf",
+    }
+    base = (content_type or "").split(";")[0].strip().lower()
+    if base in mapping:
+        return mapping[base]
+    suffix = Path(filename or "").suffix.lower()
+    if suffix and len(suffix) <= 6 and suffix.isascii():
+        return suffix
+    return ".bin"
+
+
+def save_sms_attachments(sms_id: int, attachments) -> list[dict]:
+    """앱이 올린 Base64 첨부를 서버 파일로 저장한다(실패해도 문자 저장은 계속)."""
+    if not attachments:
+        return []
+    saved: list[dict] = []
+    target = config.MEDIA_DIR / "sms"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("첨부 저장 폴더를 만들지 못했습니다: %s", exc)
+        return []
+    for index, item in enumerate(attachments[: config.MAX_SMS_ATTACHMENTS]):
+        try:
+            raw = base64.b64decode(item.data_base64, validate=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("첨부 %s 디코딩 실패 (sms=%s): %s", index, sms_id, exc)
+            continue
+        if not raw:
+            continue
+        if len(raw) > config.MAX_ATTACHMENT_BYTES:
+            logger.warning("첨부가 너무 큼 (sms=%s, %s bytes)", sms_id, len(raw))
+            continue
+        content_type = (item.content_type or "application/octet-stream").strip()
+        extension = _attachment_extension(content_type, item.filename)
+        path = target / f"{sms_id}_{index}{extension}"
+        try:
+            path.write_bytes(raw)
+        except OSError as exc:
+            logger.warning("첨부 파일 저장 실패 (sms=%s): %s", sms_id, exc)
+            continue
+        saved.append(
+            {
+                "path": str(path),
+                "filename": (item.filename or f"attachment-{index}{extension}").strip()[:200],
+                "content_type": content_type,
+                "size": len(raw),
+            }
+        )
+    return saved
 
 
 def _forward_sms(sms_id: int) -> None:
@@ -1153,6 +1237,29 @@ def resend_sms(sms_id: int, conn: sqlite3.Connection = Depends(get_conn)):
     )
     ok, error = telegram_client.deliver_sms_notification(conn, sms_id)
     return {"ok": ok, "error": error}
+
+
+@api.get("/sms/{sms_id}/attachments/{index}")
+def get_sms_attachment(sms_id: int, index: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """MMS 첨부 파일 보기/내려받기(대시보드에서 확인용)."""
+    row = conn.execute("SELECT * FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="수신 문자를 찾을 수 없습니다.")
+    try:
+        items = json.loads(_row_value(row, "attachment_paths") or "[]")
+    except (TypeError, ValueError):
+        items = []
+    if not isinstance(items, list) or index < 0 or index >= len(items):
+        raise HTTPException(status_code=404, detail="첨부를 찾을 수 없습니다.")
+    item = items[index] if isinstance(items[index], dict) else {}
+    path = Path(str(item.get("path") or ""))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="첨부 파일이 서버에 남아 있지 않습니다.")
+    return FileResponse(
+        path,
+        media_type=str(item.get("content_type") or "application/octet-stream"),
+        filename=str(item.get("filename") or path.name),
+    )
 
 
 @api.get("/settings")

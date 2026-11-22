@@ -91,7 +91,9 @@ CREATE TABLE IF NOT EXISTS sms_inbox (
     telegram_status    TEXT NOT NULL DEFAULT 'pending',
     telegram_error     TEXT,
     telegram_attempts  INTEGER NOT NULL DEFAULT 0,
-    telegram_sent_at   TEXT
+    telegram_sent_at   TEXT,
+    attachment_count   INTEGER NOT NULL DEFAULT 0,
+    attachment_paths   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -168,6 +170,16 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
         # 총 발신 횟수(지정 시 번호 개수 × 반복 횟수 대신 사용). 기존 스케줄은 NULL = 기존 방식 유지.
         conn.execute("ALTER TABLE schedules ADD COLUMN total_calls INTEGER")
         added.append("schedules.total_calls")
+
+    sms_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sms_inbox)")}
+    if "attachment_count" not in sms_columns:
+        # MMS 사진 첨부 개수. 기존 문자는 0 = 첨부 없음.
+        conn.execute("ALTER TABLE sms_inbox ADD COLUMN attachment_count INTEGER NOT NULL DEFAULT 0")
+        added.append("sms_inbox.attachment_count")
+    if "attachment_paths" not in sms_columns:
+        # 서버에 저장한 첨부 파일 목록(JSON: path/filename/content_type).
+        conn.execute("ALTER TABLE sms_inbox ADD COLUMN attachment_paths TEXT")
+        added.append("sms_inbox.attachment_paths")
     return added
 
 
