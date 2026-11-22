@@ -183,6 +183,22 @@
   .truncate{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .cell-actions{display:flex;gap:6px;flex-wrap:wrap}
   .queue-check{width:16px;height:16px;accent-color:var(--primary);cursor:pointer;vertical-align:middle;margin:0}
+
+  /* 수신 문자(MMS 사진) */
+  .sms-body{max-width:400px;white-space:pre-wrap;word-break:break-word;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer}
+  .sms-body.open{display:block;-webkit-line-clamp:unset;max-height:320px;overflow:auto}
+  .sms-thumbs{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .sms-thumb{width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--line-strong);background:#f1f4fa;cursor:zoom-in;display:block}
+  .sms-thumb:hover{border-color:var(--primary)}
+  .sms-file{display:inline-flex;align-items:center;gap:5px;max-width:220px;font-size:11.5px;font-weight:600;color:#33456b;background:#fafbfe;border:1px solid var(--line);border-radius:7px;padding:4px 8px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sms-file:hover{border-color:var(--primary);color:var(--primary)}
+  .mms-tag{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700;color:#8a5a00;background:#fff4e0;border-radius:6px;padding:2px 7px;margin-left:6px}
+  .modal.lightbox .box{max-width:960px;background:#0d1524;color:#fff;padding:18px}
+  .modal.lightbox img{display:block;max-width:100%;max-height:72vh;margin:0 auto;border-radius:10px;background:#111a2b}
+  .modal.lightbox .lightbox-head{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .modal.lightbox .lightbox-head b{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .modal.lightbox .btn{background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.22);color:#fff}
+  .modal.lightbox .btn:hover{background:rgba(255,255,255,.2)}
   .dot-online{color:var(--ok)}
   .dot-offline{color:#9aa7ba}
   @media(max-width:640px){
@@ -468,11 +484,23 @@
   <section class="tabpane" id="pane-sms">
     <div class="card">
       <div class="card-head">
-        <div><h2>수신 문자</h2><div class="sub">안드로이드 폰이 받은 문자를 텔레그램으로 전달합니다</div></div>
-        <div class="filters"><span class="badge b-info" id="smsFwdState">전달 상태 확인 중</span><button class="btn sm" onclick="loadSms()">새로고침</button></div>
+        <div><h2>수신 문자</h2><div class="sub">폰이 받은 문자와 MMS 사진을 웹에서 확인하고, 필요 없는 문자는 삭제할 수 있습니다</div></div>
+        <div class="filters">
+          <span class="badge b-info" id="smsFwdState">전달 상태 확인 중</span>
+          <span class="muted" id="smsTotalLabel" style="font-size:12px"></span>
+          <button class="btn sm" onclick="loadSms()">새로고침</button>
+        </div>
+      </div>
+      <div class="card-body" style="padding:12px 18px;border-bottom:1px solid var(--line)">
+        <div class="btn-row" style="align-items:center">
+          <button class="btn sm danger" id="smsDeleteSelectedBtn" onclick="deleteSelectedSms()" disabled>선택 삭제 (0)</button>
+          <button class="btn sm danger" id="smsDeleteAllBtn" onclick="deleteAllSms()">🗑️ 수신문자 전체 삭제</button>
+          <span class="spacer"></span>
+          <span class="muted" id="smsDeleteHint" style="font-size:12px">문자를 선택해 삭제할 수 있습니다. 사진은 눌러서 크게 볼 수 있습니다.</span>
+        </div>
       </div>
       <div class="table-wrap"><table id="smsTable">
-        <thead><tr><th>수신 시각</th><th>기기</th><th>발신 번호</th><th>내용</th><th>텔레그램</th><th></th></tr></thead>
+        <thead><tr><th style="width:36px"><input type="checkbox" id="smsSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSms(this)"></th><th>수신 시각</th><th>기기</th><th>발신 번호</th><th>내용 / 사진</th><th>텔레그램</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -537,6 +565,18 @@
   </div>
 </div>
 
+<div class="modal lightbox" id="smsPhotoModal">
+  <div class="box">
+    <div class="lightbox-head">
+      <b id="smsPhotoName">사진</b>
+      <span class="spacer"></span>
+      <button class="btn sm" id="smsPhotoDownload">내려받기</button>
+      <button class="btn sm" onclick="closeSmsPhoto()">닫기</button>
+    </div>
+    <img id="smsPhotoImg" alt="MMS 사진">
+  </div>
+</div>
+
 <script>
 /* ------------------------------------------------------------------ */
 /* 상태                                                                */
@@ -549,6 +589,10 @@ const state = {
   taskFilter: "",
   selectedTasks: new Set(),
   visibleTasks: [],
+  selectedSms: new Set(),
+  visibleSms: [],
+  openSms: new Set(),
+  smsTotal: 0,
   remoteDirty: false,
   timer: null,
   clockTimer: null,
@@ -1271,36 +1315,203 @@ async function loadRuns() {
 /* ------------------------------------------------------------------ */
 /* 수신 문자                                                           */
 /* ------------------------------------------------------------------ */
+const smsBlobCache = new Map(); // 첨부 URL → objectURL (API 키 인증이 필요한 파일)
+
+async function smsAttachmentBlobUrl(url) {
+  if (smsBlobCache.has(url)) return smsBlobCache.get(url);
+  // <img src> 는 X-API-Key 헤더를 보낼 수 없으므로 직접 받아 blob URL 로 만든다.
+  const headers = state.apiKey ? { "X-API-Key": state.apiKey } : {};
+  const response = await fetch(url, { headers });
+  if (response.status === 401) {
+    $("keyModal").classList.add("show");
+    throw new Error("API 키가 필요합니다.");
+  }
+  if (!response.ok) throw new Error("사진·첨부를 불러오지 못했습니다.");
+  const objectUrl = URL.createObjectURL(await response.blob());
+  smsBlobCache.set(url, objectUrl);
+  return objectUrl;
+}
+
+function resetSmsBlobCache() {
+  smsBlobCache.forEach((objectUrl) => URL.revokeObjectURL(objectUrl));
+  smsBlobCache.clear();
+}
+
+function fmtBytes(bytes) {
+  const size = Number(bytes) || 0;
+  if (size < 1024) return `${size}B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(0)}KB`;
+  return `${(size / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function toggleSmsBody(el, id) {
+  el.classList.toggle("open");
+  if (el.classList.contains("open")) state.openSms.add(Number(id)); else state.openSms.delete(Number(id));
+}
+
+function attachmentPreview(m) {
+  const list = m.attachments || [];
+  if (!list.length) return "";
+  const images = list.filter((a) => a.is_image);
+  const files = list.filter((a) => !a.is_image);
+  let html = "";
+  if (images.length) {
+    html += `<div class="sms-thumbs">` + images.map((a) => `
+      <img class="sms-thumb" alt="MMS 사진 ${a.index + 1}" title="${esc(a.filename)} · 눌러서 크게 보기"
+           data-att-url="${esc(a.url)}" data-att-name="${esc(a.filename)}" onclick="openSmsPhoto(this)">`).join("") + `</div>`;
+  }
+  if (files.length) {
+    html += `<div class="sms-thumbs">` + files.map((a) => `
+      <button type="button" class="sms-file" title="${esc(a.filename)} 내려받기"
+              data-att-url="${esc(a.url)}" data-att-name="${esc(a.filename)}" onclick="downloadSmsAttachment(this)">📎 ${esc(a.filename)} <span class="muted">(${fmtBytes(a.size)})</span></button>`).join("") + `</div>`;
+  }
+  return html;
+}
+
+async function hydrateSmsThumbs() {
+  const images = Array.from(document.querySelectorAll("#smsTable img.sms-thumb[data-att-url]"))
+    .filter((img) => img.dataset.loaded !== "1");
+  // 한 번에 너무 많은 요청을 보내지 않도록 6개씩 나눠 병렬로 받아온다.
+  for (let i = 0; i < images.length; i += 6) {
+    await Promise.all(images.slice(i, i + 6).map(async (img) => {
+      const url = img.dataset.attUrl;
+      try {
+        img.src = await smsAttachmentBlobUrl(url);
+        img.dataset.loaded = "1";
+      } catch (e) {
+        img.classList.remove("sms-thumb");
+        img.style.cssText = "width:64px;height:64px;display:grid;place-items:center;border:1px dashed var(--line-strong);border-radius:8px;color:var(--muted);font-size:11px;text-align:center;padding:4px";
+        img.alt = "사진을 불러오지 못했습니다";
+        img.title = e.message;
+      }
+    }));
+  }
+}
+
+async function openSmsPhoto(img) {
+  const url = img.dataset.attUrl;
+  const name = img.dataset.attName || "사진";
+  try {
+    const blobUrl = await smsAttachmentBlobUrl(url);
+    $("smsPhotoImg").src = blobUrl;
+    $("smsPhotoName").textContent = name;
+    $("smsPhotoDownload").onclick = () => saveSmsAttachment(url, name);
+    $("smsPhotoModal").classList.add("show");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function closeSmsPhoto() {
+  $("smsPhotoModal").classList.remove("show");
+  $("smsPhotoImg").removeAttribute("src");
+}
+
+function downloadSmsAttachment(el) {
+  if (!el || !el.dataset) return;
+  saveSmsAttachment(el.dataset.attUrl, el.dataset.attName || "attachment");
+}
+
+async function saveSmsAttachment(url, name) {
+  try {
+    const blobUrl = await smsAttachmentBlobUrl(url);
+    const link = document.createElement("a");
+    link.href = blobUrl;
+    link.download = name || "attachment";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function toggleSmsSelection(id, checked) {
+  if (checked) state.selectedSms.add(Number(id)); else state.selectedSms.delete(Number(id));
+  updateSmsToolbar();
+  syncSmsSelectAllState();
+}
+
+function syncSmsSelectAllState() {
+  const box = $("smsSelectAll");
+  if (!box) return;
+  const list = state.visibleSms || [];
+  const selected = list.filter((m) => state.selectedSms.has(m.id)).length;
+  box.checked = list.length > 0 && selected === list.length;
+  box.indeterminate = selected > 0 && selected < list.length;
+  box.disabled = list.length === 0;
+}
+
+function toggleSelectAllSms(box) {
+  (state.visibleSms || []).forEach((m) => {
+    if (box.checked) state.selectedSms.add(m.id); else state.selectedSms.delete(m.id);
+  });
+  document.querySelectorAll("#smsTable input.sms-check").forEach((c) => { c.checked = box.checked; });
+  updateSmsToolbar();
+  syncSmsSelectAllState();
+}
+
+function updateSmsToolbar() {
+  const count = state.selectedSms.size;
+  const button = $("smsDeleteSelectedBtn");
+  if (button) {
+    button.textContent = `선택 삭제 (${count})`;
+    button.disabled = count === 0;
+  }
+  const hint = $("smsDeleteHint");
+  if (hint) {
+    hint.textContent = count
+      ? `${count}건 선택됨 · 삭제하면 목록과 MMS 사진이 서버에서 지워집니다.`
+      : "문자를 선택해 삭제할 수 있습니다. 사진은 눌러서 크게 볼 수 있습니다.";
+  }
+  const all = $("smsDeleteAllBtn");
+  if (all) all.disabled = !state.smsTotal;
+}
+
+function smsDeleteMessage(result) {
+  const parts = [];
+  if (result.deleted_count) parts.push(`수신 문자 ${result.deleted_count}건을 삭제했습니다.`);
+  else parts.push("삭제할 수신 문자가 없습니다.");
+  if (result.files_removed) parts.push(`사진·첨부 ${result.files_removed}개도 함께 정리했습니다.`);
+  if (result.files_kept) parts.push(`첨부 ${result.files_kept}개는 파일을 찾지 못해 그대로 두었습니다.`);
+  if (result.missing_ids && result.missing_ids.length) parts.push(`이미 지워진 ${result.missing_ids.length}건은 건너뛰었습니다.`);
+  return parts.join(" ");
+}
+
 async function loadSms() {
   try {
     const [data, settings] = await Promise.all([api("/api/sms?limit=100"), api("/api/settings")]);
     const forward = settings.telegram.sms_forward_enabled && settings.telegram.configured;
     $("smsFwdState").className = "badge " + (forward ? "b-ok" : "b-warn");
     $("smsFwdState").textContent = forward ? "텔레그램 전달 중" : "텔레그램 설정 필요";
-    $("tabSmsCount").textContent = data.messages.length ? ` ${data.messages.length}` : "";
+
+    state.visibleSms = data.messages;
+    state.smsTotal = data.total ?? data.messages.length;
+    $("tabSmsCount").textContent = state.smsTotal ? ` ${state.smsTotal}` : "";
+    $("smsTotalLabel").textContent = state.smsTotal > data.messages.length
+      ? `최근 ${data.messages.length}건 / 전체 ${state.smsTotal}건`
+      : `전체 ${state.smsTotal}건`;
+
+    // 목록에서 사라진 문자가 선택에 남지 않게 한다(5초 자동 갱신 대비).
+    const visibleIds = new Set(data.messages.map((m) => m.id));
+    Array.from(state.selectedSms).forEach((id) => { if (!visibleIds.has(id)) state.selectedSms.delete(id); });
 
     $("smsTable").querySelector("tbody").innerHTML = data.messages.length
       ? data.messages.map((m) => `
         <tr>
+          <td><input type="checkbox" class="queue-check sms-check" ${state.selectedSms.has(m.id) ? "checked" : ""} onchange="toggleSmsSelection(${m.id}, this.checked)"></td>
           <td class="nowrap mono">${esc(m.received_at_text)}</td>
           <td><b>${esc(m.device_name)}</b><div class="muted mono" style="font-size:11.5px">${esc(m.device_id)}</div></td>
-          <td class="mono nowrap">${esc(m.sender || "-")}</td>
-          <td style="max-width:380px"><div class="truncate" title="${esc(m.body)}">${esc(m.body)}</div>${attachmentLinks(m)}</td>
+          <td class="mono nowrap">${esc(m.sender || "-")}${m.has_mms ? '<span class="mms-tag">📷 MMS</span>' : ""}</td>
+          <td style="max-width:420px">
+            ${m.body ? `<div class="sms-body${state.openSms.has(m.id) ? " open" : ""}" title="눌러서 전체 보기" onclick="toggleSmsBody(this, ${m.id})">${esc(m.body)}</div>` : '<span class="muted">(내용 없음)</span>'}
+            ${attachmentPreview(m)}
+          </td>
           <td>${statusBadge(TG_STATUS, m.telegram_status)}${m.telegram_error ? `<div class="muted" style="font-size:11px;margin-top:3px">${esc(m.telegram_error)}</div>` : ""}</td>
-          <td><button class="btn sm" onclick="resendSms(${m.id})">다시 전송</button></td>
+          <td><div class="cell-actions"><button class="btn sm" onclick="resendSms(${m.id})">다시 전송</button><button class="btn sm danger" onclick="deleteSms(${m.id})">삭제</button></div></td>
         </tr>`).join("")
-      : emptyRow(6, "수신된 문자가 없습니다.", "📨");
-  } catch (e) { toast(e.message, "err"); }
-}
+      : emptyRow(7, "수신된 문자가 없습니다.", "📨");
 
-function attachmentLinks(m) {
-  const count = m.attachment_count || 0;
-  if (!count) return "";
-  let links = "";
-  for (let i = 0; i < Math.min(count, 5); i++) {
-    links += ` <a href="/api/sms/${m.id}/attachments/${i}" target="_blank" rel="noopener">사진 ${i + 1}</a>`;
-  }
-  return `<div class="muted" style="font-size:11.5px;margin-top:4px">📷 첨부 ${count}건${links}</div>`;
+    updateSmsToolbar();
+    syncSmsSelectAllState();
+    hydrateSmsThumbs();
+  } catch (e) { toast(e.message, "err"); }
 }
 
 async function resendSms(id) {
@@ -1308,6 +1519,56 @@ async function resendSms(id) {
     const result = await api(`/api/sms/${id}/resend`, { method: "POST" });
     toast(result.ok ? "텔레그램으로 전송했습니다." : ("전송 실패: " + (result.error || "")), result.ok ? "ok" : "err");
     loadSms();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteSms(id) {
+  const target = (state.visibleSms || []).find((m) => m.id === Number(id));
+  const label = target ? `${target.sender || "발신번호 없음"} · ${target.received_at_text}` : `#${id}`;
+  if (!confirm(`수신 문자 #${id} (${label}) 를 삭제할까요?\nMMS 사진·첨부도 서버에서 함께 지워집니다.`)) return;
+  try {
+    const result = await api(`/api/sms/${id}`, { method: "DELETE" });
+    state.selectedSms.delete(Number(id));
+    resetSmsBlobCache();
+    toast(smsDeleteMessage(result), "ok");
+    loadSms();
+    loadDashboard();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteSelectedSms() {
+  const ids = Array.from(state.selectedSms);
+  if (!ids.length) { toast("삭제할 문자를 선택하세요.", "err"); return; }
+  if (!confirm(`선택한 수신 문자 ${ids.length}건을 삭제할까요?\nMMS 사진·첨부도 서버에서 함께 지워집니다.`)) return;
+  try {
+    const result = await api("/api/sms/delete", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+    state.selectedSms.clear();
+    resetSmsBlobCache();
+    toast(smsDeleteMessage(result), "ok");
+    loadSms();
+    loadDashboard();
+  } catch (e) {
+    toast(e.message, "err");
+    loadSms();
+  }
+}
+
+async function deleteAllSms() {
+  if (!state.smsTotal) { toast("삭제할 수신 문자가 없습니다."); return; }
+  if (!confirm(`수신 문자 ${state.smsTotal}건을 모두 삭제할까요?\n이 작업은 되돌릴 수 없으며 MMS 사진·첨부도 서버에서 함께 지워집니다.\n(폰에 있는 원본 문자는 지워지지 않습니다)`)) return;
+  try {
+    const result = await api("/api/sms/delete", {
+      method: "POST",
+      body: JSON.stringify({ all_sms: true }),
+    });
+    state.selectedSms.clear();
+    resetSmsBlobCache();
+    toast(smsDeleteMessage(result), "ok");
+    loadSms();
+    loadDashboard();
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -1378,6 +1639,12 @@ function startAutoRefresh() {
   toggleTypeFields();
   ["rcPoll", "rcGap", "rcSms", "rcMms", "rcRec", "rcMuteVol", "rcMuteMic"].forEach((id) => $(id).addEventListener("input", markRemoteDirty));
   const hash = (location.hash || "").replace("#", "");
+  document.querySelectorAll(".modal.lightbox").forEach((el) => {
+    el.addEventListener("click", (ev) => { if (ev.target === el) closeSmsPhoto(); });
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeSmsPhoto();
+  });
   if (hash && document.getElementById("pane-" + hash)) {
     document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === hash));
     document.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + hash));

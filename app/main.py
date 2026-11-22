@@ -24,6 +24,7 @@ from .models import (
     RemoteSettings,
     ScheduleCreate,
     ScheduleUpdate,
+    SmsBulkDelete,
     SmsIncoming,
     TaskBulkDelete,
     TaskResult,
@@ -248,7 +249,39 @@ def _row_value(row: sqlite3.Row, key: str, default=None):
         return default
 
 
+def sms_attachment_list(row: sqlite3.Row) -> list[dict]:
+    """저장된 MMS 첨부 목록을 대시보드가 바로 쓸 수 있는 형태로 돌려준다."""
+    try:
+        items = json.loads(_row_value(row, "attachment_paths") or "[]")
+    except (TypeError, ValueError):
+        items = []
+    if not isinstance(items, list):
+        return []
+    result: list[dict] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        content_type = str(item.get("content_type") or "application/octet-stream")
+        base_type = content_type.split(";")[0].strip().lower()
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        result.append(
+            {
+                "index": index,
+                "filename": str(item.get("filename") or f"attachment-{index}"),
+                "content_type": content_type,
+                "size": size,
+                "is_image": base_type.startswith("image/"),
+                "url": f"/api/sms/{row['id']}/attachments/{index}",
+            }
+        )
+    return result
+
+
 def sms_dict(row: sqlite3.Row) -> dict:
+    attachments = sms_attachment_list(row)
     return {
         "id": row["id"],
         "device_id": row["device_id"],
@@ -262,6 +295,8 @@ def sms_dict(row: sqlite3.Row) -> dict:
         "telegram_attempts": row["telegram_attempts"],
         "telegram_sent_at": row["telegram_sent_at"],
         "attachment_count": int(_row_value(row, "attachment_count", 0) or 0),
+        "attachments": attachments,
+        "has_mms": bool(attachments),
     }
 
 
@@ -1215,15 +1250,28 @@ def _forward_sms(sms_id: int) -> None:
 
 
 @api.get("/sms")
-def list_sms(limit: int = Query(default=50, ge=1, le=500), conn: sqlite3.Connection = Depends(get_conn)):
-    rows = conn.execute("SELECT * FROM sms_inbox ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+def list_sms(
+    limit: int = Query(default=50, ge=1, le=500),
+    device_id: Optional[str] = Query(default=None, max_length=64),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """수신 문자 목록(최신 순). MMS 사진은 attachments[].url 로 바로 볼 수 있다."""
+    where = ""
+    values: list = []
+    if device_id:
+        where = " WHERE device_id = ?"
+        values.append(device_id)
+    rows = conn.execute(
+        f"SELECT * FROM sms_inbox{where} ORDER BY id DESC LIMIT ?", values + [limit]
+    ).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) AS c FROM sms_inbox{where}", values).fetchone()["c"]
     names = {row["id"]: (row["name"] or row["id"]) for row in conn.execute("SELECT id, name FROM devices")}
     items = []
     for row in rows:
         item = sms_dict(row)
         item["device_name"] = names.get(row["device_id"], row["device_id"])
         items.append(item)
-    return {"messages": items, "count": len(items)}
+    return {"messages": items, "count": len(items), "total": int(total or 0)}
 
 
 @api.post("/sms/{sms_id}/resend")
@@ -1245,21 +1293,137 @@ def get_sms_attachment(sms_id: int, index: int, conn: sqlite3.Connection = Depen
     row = conn.execute("SELECT * FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="수신 문자를 찾을 수 없습니다.")
+    attachments = sms_attachment_list(row)
+    if index < 0 or index >= len(attachments):
+        raise HTTPException(status_code=404, detail="첨부를 찾을 수 없습니다.")
+    items = _sms_attachment_items(row)
+    item = items[index] if index < len(items) and isinstance(items[index], dict) else {}
+    path = Path(str(item.get("path") or ""))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="첨부 파일이 서버에 남아 있지 않습니다.")
+    if not _inside_sms_media(path):
+        # DB 값이 임의로 바뀌었더라도 미디어 폴더 밖 파일은 내보내지 않는다.
+        raise HTTPException(status_code=403, detail="허용되지 않은 첨부 경로입니다.")
+    return FileResponse(
+        path,
+        media_type=str(item.get("content_type") or "application/octet-stream"),
+        filename=_safe_download_name(str(item.get("filename") or path.name)),
+    )
+
+
+# --------------------------------------------------------------------------
+# 수신 문자 삭제
+# --------------------------------------------------------------------------
+def _sms_attachment_items(row: sqlite3.Row) -> list:
     try:
         items = json.loads(_row_value(row, "attachment_paths") or "[]")
     except (TypeError, ValueError):
         items = []
-    if not isinstance(items, list) or index < 0 or index >= len(items):
-        raise HTTPException(status_code=404, detail="첨부를 찾을 수 없습니다.")
-    item = items[index] if isinstance(items[index], dict) else {}
-    path = Path(str(item.get("path") or ""))
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="첨부 파일이 서버에 남아 있지 않습니다.")
-    return FileResponse(
-        path,
-        media_type=str(item.get("content_type") or "application/octet-stream"),
-        filename=str(item.get("filename") or path.name),
-    )
+    return items if isinstance(items, list) else []
+
+
+def _sms_media_root() -> Path:
+    try:
+        return (Path(config.MEDIA_DIR) / "sms").resolve()
+    except OSError:
+        return Path(config.MEDIA_DIR) / "sms"
+
+
+def _inside_sms_media(path: Path) -> bool:
+    """첨부 파일이 미디어 폴더(media/sms) 안에 있는지 확인한다(경로 탈출 차단)."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    root = _sms_media_root()
+    return resolved == root or root in resolved.parents
+
+
+def _safe_download_name(name: str) -> str:
+    """내려받기 파일명에서 경로 구분자·제어문자를 없앤다."""
+    cleaned = Path(name.replace("\\", "/")).name
+    cleaned = "".join(ch for ch in cleaned if ch.isprintable())
+    return cleaned[:200] or "attachment"
+
+
+def _delete_sms_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> dict:
+    """수신 문자 행과 서버에 저장된 MMS 첨부 파일을 함께 지운다.
+
+    먼저 DB 행을 지우고(실패하면 파일도 그대로), 그 다음 미디어 폴더 안의 첨부 파일을 정리한다.
+    """
+    removed_ids: list[int] = []
+    files_removed = 0
+    files_kept = 0
+    targets: list[Path] = []
+    for row in rows:
+        removed_ids.append(int(row["id"]))
+        for item in _sms_attachment_items(row):
+            if not isinstance(item, dict):
+                continue
+            path = Path(str(item.get("path") or ""))
+            if path.is_file() and _inside_sms_media(path):
+                targets.append(path)
+            elif path.is_file():
+                # 미디어 폴더 밖 파일은 안전을 위해 지우지 않는다.
+                files_kept += 1
+
+    if removed_ids:
+        with db.transaction(conn):
+            conn.execute(
+                f"DELETE FROM sms_inbox WHERE id IN ({','.join('?' for _ in removed_ids)})",
+                removed_ids,
+            )
+            db.log(conn, f"수신 문자 삭제: {len(removed_ids)}건", "warning")
+
+    for path in targets:
+        try:
+            path.unlink()
+            files_removed += 1
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("첨부 파일을 지우지 못했습니다 (%s): %s", path.name, exc)
+            files_kept += 1
+
+    return {
+        "ok": True,
+        "deleted_count": len(removed_ids),
+        "deleted_ids": removed_ids,
+        "files_removed": files_removed,
+        "files_kept": files_kept,
+    }
+
+
+@api.delete("/sms/{sms_id}")
+def delete_sms(sms_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """수신 문자 1건 삭제(첨부 파일도 함께 정리)."""
+    row = conn.execute("SELECT * FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="수신 문자를 찾을 수 없습니다.")
+    return _delete_sms_rows(conn, [row])
+
+
+@api.post("/sms/delete")
+def bulk_delete_sms(payload: SmsBulkDelete, conn: sqlite3.Connection = Depends(get_conn)):
+    """수신 문자 부분 삭제(ids) / 전체 삭제(all_sms)."""
+    if payload.all_sms:
+        rows = conn.execute("SELECT * FROM sms_inbox").fetchall()
+        requested: list[int] = []
+    else:
+        requested = list(payload.ids)
+        rows = conn.execute(
+            f"SELECT * FROM sms_inbox WHERE id IN ({','.join('?' for _ in requested)})",
+            requested,
+        ).fetchall()
+    found_ids = {int(row["id"]) for row in rows}
+    result = _delete_sms_rows(conn, rows)
+    result["missing_ids"] = [sms_id for sms_id in requested if sms_id not in found_ids]
+    return result
+
+
+@api.delete("/sms")
+def delete_all_sms(conn: sqlite3.Connection = Depends(get_conn)):
+    """수신 문자 전체 삭제(POST /api/sms/delete + all_sms=true 와 같은 동작)."""
+    rows = conn.execute("SELECT * FROM sms_inbox").fetchall()
+    return _delete_sms_rows(conn, rows)
 
 
 @api.get("/settings")

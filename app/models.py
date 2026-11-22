@@ -184,6 +184,29 @@ class TaskBulkDelete(BaseModel):
         return self
 
 
+class SmsBulkDelete(BaseModel):
+    """수신 문자 부분 삭제(ids) / 전체 삭제(all_sms)."""
+
+    ids: list[int] = Field(default_factory=list, max_length=1000)
+    all_sms: bool = False
+
+    @field_validator("ids")
+    @classmethod
+    def _ids(cls, value: list[int]) -> list[int]:
+        cleaned: list[int] = []
+        for item in value:
+            number = int(item)
+            if number not in cleaned:
+                cleaned.append(number)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _require_target(self):
+        if not self.all_sms and not self.ids:
+            raise ValueError("삭제할 문자(ids)를 지정하거나 all_sms=true 를 보내야 합니다.")
+        return self
+
+
 class TaskResult(BaseModel):
     device_id: Optional[str] = None
     status: Literal["done", "failed", "skipped"]

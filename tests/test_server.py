@@ -1567,3 +1567,269 @@ def test_dashboard_has_total_calls_edit_mode_and_order_options(client):
         "cancelScheduleEdit",
     ):
         assert keyword in html, keyword
+
+
+# --------------------------------------------------------------------------
+# 21. 수신 문자 조회(MMS 미리보기) · 삭제
+# --------------------------------------------------------------------------
+def _post_sms(client, *, device_id="DEV-INBOX", sender="010-2222-3333", body="문자 본문", attachments=None):
+    response = client.post(
+        "/api/sms/incoming",
+        json={
+            "device_id": device_id,
+            "sender": sender,
+            "body": body,
+            "received_at": "2026-11-22T21:10:00+09:00",
+            "attachments": attachments or [],
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["sms"]
+
+
+def _post_photo_sms(client, *, body="사진 보냅니다"):
+    client.post("/api/devices", json={"device_id": "DEV-INBOX", "name": "사무실폰"})
+    return _post_sms(
+        client,
+        body=body,
+        attachments=[{"filename": "photo.jpg", "content_type": "image/jpeg", "data_base64": _b64(PHOTO_BYTES)}],
+    )
+
+
+def _attachment_paths(sms_id):
+    conn = _conn()
+    row = conn.execute("SELECT attachment_paths FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
+    conn.close()
+    return [Path(item["path"]) for item in json.loads(row["attachment_paths"])]
+
+
+def test_list_sms_returns_attachment_preview_metadata(client):
+    created = _post_photo_sms(client)
+
+    data = client.get("/api/sms").json()
+    assert data["count"] == 1
+    assert data["total"] == 1
+    item = data["messages"][0]
+    assert item["id"] == created["id"]
+    assert item["device_name"] == "사무실폰"
+    assert item["has_mms"] is True
+    assert item["attachment_count"] == 1
+
+    attachment = item["attachments"][0]
+    assert attachment["index"] == 0
+    assert attachment["filename"] == "photo.jpg"
+    assert attachment["content_type"] == "image/jpeg"
+    assert attachment["is_image"] is True
+    assert attachment["size"] == len(PHOTO_BYTES)
+    assert attachment["url"] == f"/api/sms/{created['id']}/attachments/0"
+
+    # 대시보드가 쓰는 URL 그대로 사진 원본을 받을 수 있다.
+    download = client.get(attachment["url"])
+    assert download.status_code == 200
+    assert download.content == PHOTO_BYTES
+
+
+def test_list_sms_marks_non_image_attachment(client):
+    created = _post_sms(
+        client,
+        body="계약서 첨부",
+        attachments=[{"filename": "contract.pdf", "content_type": "application/pdf", "data_base64": _b64(b"%PDF-1.4 test")}],
+    )
+    item = client.get("/api/sms").json()["messages"][0]
+    attachment = item["attachments"][0]
+    assert attachment["is_image"] is False
+    assert attachment["filename"] == "contract.pdf"
+    assert item["has_mms"] is True
+    assert client.get(f"/api/sms/{created['id']}/attachments/0").content == b"%PDF-1.4 test"
+
+
+def test_list_sms_text_only_has_empty_attachments(client):
+    _post_sms(client, body="사진 없는 문자")
+    item = client.get("/api/sms").json()["messages"][0]
+    assert item["attachments"] == []
+    assert item["has_mms"] is False
+    assert item["attachment_count"] == 0
+
+
+def test_list_sms_filter_by_device_counts_total(client):
+    _post_sms(client, device_id="DEV-A", body="A 기기 문자")
+    _post_sms(client, device_id="DEV-B", body="B 기기 문자")
+    _post_sms(client, device_id="DEV-B", body="B 기기 문자 2")
+
+    everything = client.get("/api/sms").json()
+    assert everything["total"] == 3
+    filtered = client.get("/api/sms", params={"device_id": "DEV-B"}).json()
+    assert filtered["total"] == 2
+    assert {m["device_id"] for m in filtered["messages"]} == {"DEV-B"}
+
+    limited = client.get("/api/sms", params={"limit": 1}).json()
+    assert limited["count"] == 1
+    assert limited["total"] == 3
+
+
+def test_sms_attachment_blocks_file_outside_media_dir(client, tmp_path):
+    created = _post_photo_sms(client)
+    outside = tmp_path / "secret.txt"
+    outside.write_text("서버 밖 파일", encoding="utf-8")
+
+    conn = _conn()
+    conn.execute(
+        "UPDATE sms_inbox SET attachment_paths = ? WHERE id = ?",
+        (
+            json.dumps(
+                [{"path": str(outside), "filename": "secret.txt", "content_type": "text/plain"}],
+                ensure_ascii=False,
+            ),
+            created["id"],
+        ),
+    )
+    conn.close()
+
+    response = client.get(f"/api/sms/{created['id']}/attachments/0")
+    assert response.status_code == 403
+    assert "서버 밖 파일" not in response.text
+
+
+def test_sms_attachment_bad_index_is_404(client):
+    created = _post_photo_sms(client)
+    assert client.get(f"/api/sms/{created['id']}/attachments/5").status_code == 404
+    assert client.get(f"/api/sms/{created['id']}/attachments/-1").status_code == 404
+    assert client.get("/api/sms/9999/attachments/0").status_code == 404
+
+
+def test_delete_single_sms_removes_row_and_attachment_file(client):
+    first = _post_photo_sms(client, body="첫 번째 문자")
+    second = _post_photo_sms(client, body="두 번째 문자")
+    first_files = _attachment_paths(first["id"])
+    assert first_files and all(path.is_file() for path in first_files)
+
+    response = client.delete(f"/api/sms/{first['id']}")
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["ok"] is True
+    assert result["deleted_count"] == 1
+    assert result["deleted_ids"] == [first["id"]]
+    assert result["files_removed"] == len(first_files)
+    assert not any(path.exists() for path in first_files)
+
+    remaining = client.get("/api/sms").json()
+    assert [m["id"] for m in remaining["messages"]] == [second["id"]]
+    assert remaining["total"] == 1
+
+    # 두 번째 문자와 그 사진은 그대로 남는다.
+    assert client.get(f"/api/sms/{second['id']}/attachments/0").status_code == 200
+    assert all(path.is_file() for path in _attachment_paths(second["id"]))
+
+    assert client.get(f"/api/sms/{first['id']}/attachments/0").status_code == 404
+    assert client.delete(f"/api/sms/{first['id']}").status_code == 404
+
+
+def test_delete_sms_without_attachments(client):
+    created = _post_sms(client, body="사진 없는 문자")
+    result = client.delete(f"/api/sms/{created['id']}").json()
+    assert result["deleted_count"] == 1
+    assert result["files_removed"] == 0
+    assert client.get("/api/sms").json()["total"] == 0
+
+
+def test_bulk_delete_selected_sms(client):
+    ids = [_post_sms(client, body=f"문자 {index}")["id"] for index in range(3)]
+
+    result = client.post("/api/sms/delete", json={"ids": [ids[0], ids[2], ids[0]]}).json()
+    assert result["ok"] is True
+    assert result["deleted_count"] == 2
+    assert sorted(result["deleted_ids"]) == sorted([ids[0], ids[2]])
+    assert result["missing_ids"] == []
+
+    remaining = [m["id"] for m in client.get("/api/sms").json()["messages"]]
+    assert remaining == [ids[1]]
+    assert client.delete(f"/api/sms/{ids[0]}").status_code == 404
+
+
+def test_bulk_delete_all_sms_cleans_attachment_files(client):
+    _post_photo_sms(client, body="전체 삭제 1")
+    _post_photo_sms(client, body="전체 삭제 2")
+    media_dir = config.MEDIA_DIR / "sms"
+    assert len(list(media_dir.glob("*"))) == 2
+
+    result = client.post("/api/sms/delete", json={"all_sms": True}).json()
+    assert result["deleted_count"] == 2
+    assert result["files_removed"] == 2
+    assert client.get("/api/sms").json()["total"] == 0
+    assert list(media_dir.glob("*")) == []
+
+    # 이미 비어 있어도 오류 없이 0건으로 응답한다.
+    again = client.post("/api/sms/delete", json={"all_sms": True})
+    assert again.status_code == 200
+    assert again.json()["deleted_count"] == 0
+
+
+def test_bulk_delete_reports_missing_ids(client):
+    created = _post_sms(client)
+    result = client.post("/api/sms/delete", json={"ids": [created["id"], 9999]}).json()
+    assert result["deleted_count"] == 1
+    assert result["deleted_ids"] == [created["id"]]
+    assert result["missing_ids"] == [9999]
+
+
+def test_bulk_delete_sms_requires_target(client):
+    assert client.post("/api/sms/delete", json={}).status_code == 422
+    assert client.post("/api/sms/delete", json={"ids": []}).status_code == 422
+
+
+def test_delete_all_sms_via_http_delete(client):
+    _post_photo_sms(client)
+    response = client.delete("/api/sms")
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 1
+    assert response.json()["files_removed"] == 1
+    assert client.get("/api/sms").json()["total"] == 0
+
+
+def test_sms_delete_requires_api_key(client, monkeypatch):
+    created = _post_sms(client)
+    monkeypatch.setattr(config, "API_KEY", "secret-key")
+    assert client.delete(f"/api/sms/{created['id']}").status_code == 401
+    assert client.delete("/api/sms").status_code == 401
+    assert client.post("/api/sms/delete", json={"all_sms": True}).status_code == 401
+
+    headers = {"X-API-Key": "secret-key"}
+    assert client.delete(f"/api/sms/{created['id']}", headers=headers).status_code == 200
+
+
+def test_openapi_exposes_sms_view_and_delete_endpoints(client):
+    spec = client.get("/openapi.json").json()
+    paths = spec["paths"]
+    assert "get" in paths["/api/sms"]
+    assert "delete" in paths["/api/sms"]
+    assert "delete" in paths["/api/sms/{sms_id}"]
+    assert "post" in paths["/api/sms/delete"]
+    assert "get" in paths["/api/sms/{sms_id}/attachments/{index}"]
+
+    bulk_schema = spec["components"]["schemas"]["SmsBulkDelete"]["properties"]
+    assert "ids" in bulk_schema and "all_sms" in bulk_schema
+    for route in ("/api/sms/{sms_id}", "/api/sms"):
+        header_params = [p for p in paths[route]["delete"].get("parameters", []) if p.get("in") == "header"]
+        assert any(p.get("name") == "X-API-Key" for p in header_params)
+
+
+def test_dashboard_has_sms_view_and_delete_controls(client):
+    html = client.get("/").text
+    for keyword in (
+        'id="smsTable"',
+        'id="smsSelectAll"',
+        'id="smsDeleteSelectedBtn"',
+        'id="smsDeleteAllBtn"',
+        "선택 삭제",
+        "수신문자 전체 삭제",
+        "/api/sms/delete",
+        "deleteSms(",
+        "deleteSelectedSms(",
+        "deleteAllSms(",
+        "openSmsPhoto(",
+        "attachmentPreview(",
+        "sms-thumb",
+        'id="smsPhotoModal"',
+        "smsAttachmentBlobUrl",
+    ):
+        assert keyword in html, keyword
