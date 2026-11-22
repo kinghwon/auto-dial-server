@@ -710,8 +710,8 @@ def test_stats_endpoint(client):
     assert stats["tasks"]["pending"] == 0
 
 
-def test_schedule_delete_removes_schedule_runs_and_tasks(client):
-    """실행된 스케줄을 지우면 실행 묶음·발신 작업도 함께 사라진다(고아·FK 오류 없음)."""
+def test_schedule_delete_soft_deletes_schedule_runs_and_tasks(client):
+    """실행된 스케줄을 지워도 행은 보관함에 남고, 목록·대기열에서는 사라진다."""
     schedule = make_schedule(client, numbers=["010-1234-0001"], repeat_count=1)
     client.post(f"/api/schedules/{schedule['id']}/run-now")
     task = client.get("/api/tasks").json()["tasks"][0]
@@ -723,6 +723,7 @@ def test_schedule_delete_removes_schedule_runs_and_tasks(client):
     assert body["deleted"] == 1
     assert body["deleted_runs"] == 1
     assert body["deleted_tasks"] == 1
+    assert body["soft_deleted"] is True
 
     assert client.get("/api/schedules").json()["schedules"] == []
     assert client.get("/api/tasks").json()["tasks"] == []
@@ -730,10 +731,20 @@ def test_schedule_delete_removes_schedule_runs_and_tasks(client):
 
     conn = _conn()
     try:
-        assert conn.execute("SELECT COUNT(*) AS c FROM tasks WHERE schedule_id = ?", (schedule["id"],)).fetchone()["c"] == 0
-        assert conn.execute("SELECT COUNT(*) AS c FROM runs WHERE schedule_id = ?", (schedule["id"],)).fetchone()["c"] == 0
+        # 행은 지우지 않고 deleted_at 만 채운다(삭제 보관함).
+        assert conn.execute("SELECT COUNT(*) AS c FROM tasks WHERE schedule_id = ?", (schedule["id"],)).fetchone()["c"] == 1
+        assert conn.execute("SELECT COUNT(*) AS c FROM runs WHERE schedule_id = ?", (schedule["id"],)).fetchone()["c"] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks WHERE schedule_id = ? AND deleted_at IS NULL", (schedule["id"],)
+        ).fetchone()["c"] == 0
+        assert conn.execute(
+            "SELECT status FROM schedules WHERE id = ?", (schedule["id"],)
+        ).fetchone()["status"] == "paused"
     finally:
         conn.close()
+
+    archive = client.get("/api/archive", params={"kind": "schedules"}).json()
+    assert [item["id"] for item in archive["items"]] == [schedule["id"]]
 
 
 def test_schedule_delete_with_running_task_leaves_no_orphans(client):
@@ -1944,7 +1955,7 @@ def test_sms_attachment_bad_index_is_404(client):
     assert client.get("/api/sms/9999/attachments/0").status_code == 404
 
 
-def test_delete_single_sms_removes_row_and_attachment_file(client):
+def test_delete_single_sms_soft_deletes_and_keeps_attachment_file(client):
     first = _post_photo_sms(client, body="첫 번째 문자")
     second = _post_photo_sms(client, body="두 번째 문자")
     first_files = _attachment_paths(first["id"])
@@ -1956,8 +1967,11 @@ def test_delete_single_sms_removes_row_and_attachment_file(client):
     assert result["ok"] is True
     assert result["deleted_count"] == 1
     assert result["deleted_ids"] == [first["id"]]
-    assert result["files_removed"] == len(first_files)
-    assert not any(path.exists() for path in first_files)
+    assert result["soft_deleted"] is True
+    # 사진·첨부 파일은 서버에 그대로 남아 보관함에서 다시 볼 수 있다.
+    assert result["files_removed"] == 0
+    assert result["files_kept"] == len(first_files)
+    assert all(path.is_file() for path in first_files)
 
     remaining = client.get("/api/sms").json()
     assert [m["id"] for m in remaining["messages"]] == [second["id"]]
@@ -1967,8 +1981,12 @@ def test_delete_single_sms_removes_row_and_attachment_file(client):
     assert client.get(f"/api/sms/{second['id']}/attachments/0").status_code == 200
     assert all(path.is_file() for path in _attachment_paths(second["id"]))
 
-    assert client.get(f"/api/sms/{first['id']}/attachments/0").status_code == 404
+    # 지운 문자도 보관함에서는 사진까지 볼 수 있고, 다시 지우면 404.
+    assert client.get(f"/api/sms/{first['id']}/attachments/0").status_code == 200
     assert client.delete(f"/api/sms/{first['id']}").status_code == 404
+    archived = client.get("/api/archive", params={"kind": "sms"}).json()["items"]
+    assert [item["id"] for item in archived] == [first["id"]]
+    assert archived[0]["has_mms"] is True
 
 
 def test_delete_sms_without_attachments(client):
@@ -1993,7 +2011,7 @@ def test_bulk_delete_selected_sms(client):
     assert client.delete(f"/api/sms/{ids[0]}").status_code == 404
 
 
-def test_bulk_delete_all_sms_cleans_attachment_files(client):
+def test_bulk_delete_all_sms_keeps_attachment_files_for_archive(client):
     _post_photo_sms(client, body="전체 삭제 1")
     _post_photo_sms(client, body="전체 삭제 2")
     media_dir = config.MEDIA_DIR / "sms"
@@ -2001,9 +2019,11 @@ def test_bulk_delete_all_sms_cleans_attachment_files(client):
 
     result = client.post("/api/sms/delete", json={"all_sms": True}).json()
     assert result["deleted_count"] == 2
-    assert result["files_removed"] == 2
+    assert result["files_removed"] == 0
+    assert result["files_kept"] == 2
     assert client.get("/api/sms").json()["total"] == 0
-    assert list(media_dir.glob("*")) == []
+    # 보관함에서 다시 볼 수 있도록 사진 파일은 지우지 않는다.
+    assert len(list(media_dir.glob("*"))) == 2
 
     # 이미 비어 있어도 오류 없이 0건으로 응답한다.
     again = client.post("/api/sms/delete", json={"all_sms": True})
@@ -2029,7 +2049,7 @@ def test_delete_all_sms_via_http_delete(client):
     response = client.delete("/api/sms")
     assert response.status_code == 200
     assert response.json()["deleted_count"] == 1
-    assert response.json()["files_removed"] == 1
+    assert response.json()["files_kept"] == 1
     assert client.get("/api/sms").json()["total"] == 0
 
 
@@ -2273,12 +2293,13 @@ def test_dashboard_sms_tab_has_receiver_number_column(client):
     for keyword in (
         "수신 번호",
         "m.receiver_number",
-        "editDevicePhone(",
-        "saveDevicePhone(",
+        "openDeviceEdit(",
+        "saveDeviceEdit(",
         'id="devPhone"',
         "phone_number: phoneNumber",
-        "state.devicePhoneEditing",
-        "cancelDevicePhone(",
+        "state.editingDeviceId",
+        "devEditPhone",
+        "devEditNote",
     ):
         assert keyword in html, keyword
 
@@ -2643,3 +2664,618 @@ def test_pause_and_resume_keep_multiple_target_devices(client):
     # 다른 항목만 고치는 PATCH 도 기기 목록을 건드리지 않는다
     patched = client.patch(f"/api/schedules/{schedule['id']}", json={"name": "이름만 변경"}).json()["schedule"]
     assert patched["target_device_ids"] == ["DEV-A", "DEV-B"]
+
+
+# --------------------------------------------------------------------------
+# 23. 서버 활동 로그: 검색 · 분류 · 기간 · 전체 보기 / 페이지 나누기
+# --------------------------------------------------------------------------
+def _seed_logs(entries):
+    """(메시지, 레벨, 작성시각) 목록을 DB 에 직접 넣는다(시간 필터 검증용)."""
+    conn = _conn()
+    for message, level, created in entries:
+        db.log(conn, message, level)
+        conn.execute("UPDATE logs SET created_at = ? WHERE id = last_insert_rowid()", (created,))
+    conn.close()
+
+
+LOG_SEED = [
+    ("기기 등록: ALPHA-1 (사무실폰)", "info", "2026-11-21T09:00:00+09:00"),
+    ("스케줄 등록: '아침 안내' call 총 3건", "info", "2026-11-21T10:30:00+09:00"),
+    ("수신 문자 저장: 010-2222-3333 → 사무실폰 (id=1)", "info", "2026-11-21T23:30:00+09:00"),
+    ("대기열 전체 삭제(보관함): 2건 보관함으로 이동", "warning", "2026-11-22T08:10:00+09:00"),
+]
+
+
+def test_logs_search_q_matches_message_category_and_level(client):
+    _seed_logs(LOG_SEED)
+
+    # 영문 대소문자 구분 없이 메시지 검색
+    data = client.get("/api/logs", params={"q": "alpha"}).json()
+    assert [log["message"] for log in data["logs"]] == [LOG_SEED[0][0]]
+    assert data["total"] == 1 and data["count"] == 1
+
+    # 한글 메시지 검색
+    data = client.get("/api/logs", params={"q": "아침 안내"}).json()
+    assert data["total"] == 1 and data["logs"][0]["category"] == "schedule"
+
+    # 분류 이름(schedule)으로도 찾힌다
+    data = client.get("/api/logs", params={"q": "schedule"}).json()
+    assert data["total"] == 1 and data["logs"][0]["category"] == "schedule"
+
+    # 레벨 이름(warning)으로도 찾힌다
+    data = client.get("/api/logs", params={"q": "warning"}).json()
+    assert data["total"] == 1 and data["logs"][0]["level"] == "warning"
+
+    # 아무 것도 맞지 않으면 0건
+    assert client.get("/api/logs", params={"q": "없는검색어"}).json()["total"] == 0
+
+
+def test_logs_filter_by_level_and_category(client):
+    _seed_logs(LOG_SEED)
+
+    warnings = client.get("/api/logs", params={"level": "warning"}).json()
+    assert warnings["total"] == 1
+    assert warnings["logs"][0]["level"] == "warning"
+
+    devices = client.get("/api/logs", params={"category": "device"}).json()
+    assert devices["total"] == 1
+    assert devices["logs"][0]["category_label"] == "기기"
+
+    both = client.get("/api/logs", params={"category": "device", "level": "warning"}).json()
+    assert both["total"] == 0
+
+    bad = client.get("/api/logs", params={"category": "nope"})
+    assert bad.status_code == 400
+
+
+def test_logs_time_range_start_and_end(client):
+    _seed_logs(LOG_SEED)
+
+    middle = client.get(
+        "/api/logs",
+        params={"start": "2026-11-21T10:00", "end": "2026-11-21T23:00"},
+    ).json()
+    assert [log["message"] for log in middle["logs"]] == [LOG_SEED[1][0]]
+
+    # 종료 날짜만 주면 그날 23:59:59 까지 포함한다.
+    day = client.get("/api/logs", params={"start": "2026-11-21", "end": "2026-11-21"}).json()
+    assert day["total"] == 3
+    assert day["logs"][0]["message"] == LOG_SEED[2][0]  # 최신(23:30)이 먼저
+
+    after = client.get("/api/logs", params={"start": "2026-11-22T00:00"}).json()
+    assert after["total"] == 1 and after["logs"][0]["level"] == "warning"
+
+    # ISO 오프셋(UTC)으로 줘도 KST 기준으로 해석한다.
+    utc = client.get("/api/logs", params={"start": "2026-11-21T01:00:00Z", "end": "2026-11-21T02:00:00Z"}).json()
+    assert utc["total"] == 1 and utc["logs"][0]["message"] == LOG_SEED[1][0]
+
+
+def test_logs_invalid_time_and_reversed_range_are_400(client):
+    _seed_logs(LOG_SEED)
+    assert client.get("/api/logs", params={"start": "어제"}).status_code == 400
+    assert client.get("/api/logs", params={"end": "2026-13-45T99:99"}).status_code == 400
+    reversed_range = client.get(
+        "/api/logs", params={"start": "2026-11-22T00:00", "end": "2026-11-21T00:00"}
+    )
+    assert reversed_range.status_code == 400
+    assert "늦습니다" in reversed_range.json()["detail"]
+
+
+def test_logs_limit_offset_total_and_all(client):
+    _seed_logs(LOG_SEED + [(f"기기 등록: EXTRA-{index}", "info", f"2026-11-22T10:0{index}:00+09:00") for index in range(3)])
+
+    page = client.get("/api/logs", params={"limit": 2, "offset": 1}).json()
+    assert page["total"] == 7
+    assert page["count"] == 2 and len(page["logs"]) == 2
+    assert page["offset"] == 1 and page["has_more"] is True
+    # 최신순 정렬이라 id 가 큰 것부터, offset 만큼 건너뛴다.
+    assert page["logs"][0]["message"] == "기기 등록: EXTRA-1"
+    assert page["logs"][1]["message"] == "기기 등록: EXTRA-0"
+
+    everyone = client.get("/api/logs", params={"all": True}).json()
+    assert everyone["total"] == 7 and everyone["count"] == 7
+    assert everyone["all"] is True and everyone["truncated"] is False
+
+    zero_limit = client.get("/api/logs", params={"limit": 0}).json()
+    assert zero_limit["count"] == 7 and zero_limit["all"] is True
+
+    last = client.get("/api/logs", params={"limit": 100, "offset": 5}).json()
+    assert last["count"] == 2 and last["has_more"] is False
+
+    # 기본 limit 은 200 이고, 조건에 맞는 전체 건수를 total 로 알려 준다.
+    default = client.get("/api/logs").json()
+    assert default["limit"] == 200
+    assert default["total"] == 7
+
+
+def test_logs_have_category_and_full_timestamp(client):
+    _seed_logs(LOG_SEED)
+    log = client.get("/api/logs", params={"q": "ALPHA-1"}).json()["logs"][0]
+    assert log["category"] == "device"
+    assert log["category_label"] == "기기"
+    assert log["created_at_full"] == "2026-11-21 09:00:00"
+    assert log["created_at_text"] == "11-21 09:00:00"
+
+
+# --------------------------------------------------------------------------
+# 24. 기기 정보 편집(이름·번호·메모·사용 여부) · 앱 등록이 덮어쓰지 않음
+# --------------------------------------------------------------------------
+def test_device_patch_edits_name_phone_note_and_enabled(client):
+    client.post("/api/devices", json={"device_id": "DEV-EDIT", "name": "앱이름"})
+
+    body = client.patch(
+        "/api/devices/DEV-EDIT",
+        json={"name": "사무실폰", "phone_number": "010-4444-5555", "note": "유심 2번", "enabled": False},
+    ).json()["device"]
+    assert body["name"] == "사무실폰"
+    assert body["phone_number"] == "010-4444-5555"
+    assert body["note"] == "유심 2번"
+    assert body["enabled"] is False
+    assert body["name_customized"] is True
+    assert body["phone_customized"] is True
+
+    # 이름만 고쳐도 번호·메모는 그대로 남는다.
+    body = client.patch("/api/devices/DEV-EDIT", json={"name": "거실폰"}).json()["device"]
+    assert (body["name"], body["phone_number"], body["note"]) == ("거실폰", "010-4444-5555", "유심 2번")
+    assert client.patch("/api/devices/NOPE", json={"name": "x"}).status_code == 404
+
+
+def test_device_customized_name_and_phone_survive_app_registration(client):
+    client.post(
+        "/api/devices",
+        json={"device_id": "DEV-KEEP", "name": "앱이 알려준 이름", "phone_number": "010-1111-0001"},
+    )
+    client.patch(
+        "/api/devices/DEV-KEEP",
+        json={"name": "내가 고친 이름", "phone_number": "010-2222-0002", "note": "책상 위"},
+    )
+
+    # 앱은 30초마다 등록 요청을 보낸다(이름·번호가 예전 값, 번호는 빈 값일 수도 있다).
+    for payload in (
+        {"device_id": "DEV-KEEP", "name": "앱이 알려준 이름", "phone_number": ""},
+        {"device_id": "DEV-KEEP", "name": "다른 이름", "phone_number": "010-9999-9999"},
+    ):
+        device = client.post("/api/devices", json=payload).json()["device"]
+        assert device["name"] == "내가 고친 이름"
+        assert device["phone_number"] == "010-2222-0002"
+        assert device["note"] == "책상 위"
+        assert device["name_customized"] is True and device["phone_customized"] is True
+
+
+def test_device_unmodified_name_follows_app_registration(client):
+    client.post("/api/devices", json={"device_id": "DEV-FOLLOW", "name": "예전 이름"})
+    device = client.post("/api/devices", json={"device_id": "DEV-FOLLOW", "name": "새 이름"}).json()["device"]
+    assert device["name"] == "새 이름"
+    assert device["name_customized"] is False
+
+
+def test_device_phone_cleared_by_user_is_not_refilled_by_incoming_sms(client):
+    client.post("/api/devices", json={"device_id": "DEV-NUM", "name": "폰", "phone_number": "010-1111-0001"})
+    client.patch("/api/devices/DEV-NUM", json={"phone_number": ""})
+
+    client.post(
+        "/api/sms/incoming",
+        json={"device_id": "DEV-NUM", "sender": "010-2", "body": "문자", "receiver_number": "010-7777-8888"},
+    )
+    device = client.get("/api/devices").json()["devices"][0]
+    assert device["phone_number"] == ""
+    assert device["phone_customized"] is True
+    # 문자에는 앱이 알려준 수신 번호가 그대로 보인다.
+    assert client.get("/api/sms").json()["messages"][0]["receiver_number"] == "010-7777-8888"
+
+
+# --------------------------------------------------------------------------
+# 25. 소프트 삭제(삭제 보관함) · 복원
+# --------------------------------------------------------------------------
+def _deleted_at_of(table, row_id):
+    conn = _conn()
+    row = conn.execute(f"SELECT deleted_at FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    conn.close()
+    return row["deleted_at"] if row else None
+
+
+def _archive(client, **params):
+    return client.get("/api/archive", params=params).json()
+
+
+def test_soft_delete_hides_every_list_and_stats(client):
+    schedule = make_schedule(client, numbers=["010-5000-0001"], repeat_count=1)
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    run_id = client.get("/api/runs").json()["runs"][0]["id"]
+    task_id = client.get("/api/tasks").json()["tasks"][0]["id"]
+    sms = _post_sms(client, body="보관함 테스트")
+
+    assert client.get("/api/stats").json()["tasks"]["pending"] == 1
+    assert client.get("/api/stats").json()["sms"]["today"] == 1
+
+    assert client.delete(f"/api/schedules/{schedule['id']}").status_code == 200
+    assert client.delete(f"/api/sms/{sms['id']}").status_code == 200
+
+    assert client.get("/api/schedules").json()["schedules"] == []
+    assert client.get("/api/runs").json()["runs"] == []
+    assert client.get("/api/tasks").json()["tasks"] == []
+    assert client.get("/api/sms").json()["total"] == 0
+    stats = client.get("/api/stats").json()
+    assert stats["tasks"]["pending"] == 0
+    assert stats["sms"]["today"] == 0
+
+    # 행은 남아 있고 deleted_at 만 채워진다.
+    assert _deleted_at_of("schedules", schedule["id"])
+    assert _deleted_at_of("runs", run_id)
+    assert _deleted_at_of("tasks", task_id)
+    assert _deleted_at_of("sms_inbox", sms["id"])
+
+    # 보관함에는 네 종류가 모두 보인다.
+    data = _archive(client)
+    assert {item["kind"] for item in data["items"]} == {"schedule", "run", "task", "sms"}
+    assert data["counts"] == {"schedules": 1, "runs": 1, "tasks": 1, "sms": 1, "total": 4}
+
+
+def test_schedule_soft_delete_cancels_tasks_so_phone_never_dials(client):
+    client.post("/api/devices", json={"device_id": "DEV-SOFT"})
+    schedule = make_schedule(client, numbers=["010-5000-0101"], repeat_count=1, device_id="DEV-SOFT")
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    first = client.get("/api/tasks/poll", params={"device_id": "DEV-SOFT"}).json()["task"]
+    assert first is not None
+    client.post(f"/api/tasks/{first['id']}/start")
+
+    body = client.delete(f"/api/schedules/{schedule['id']}").json()
+    assert body["canceled_tasks"] == 1
+
+    polled = client.get("/api/tasks/poll", params={"device_id": "DEV-SOFT"}).json()
+    assert polled["task"] is None
+    assert polled["pending_tasks"] == 0
+
+    conn = _conn()
+    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (first["id"],)).fetchone()["status"]
+    conn.close()
+    assert status == "skipped"
+
+    # 이미 발신 중이던 폰이 뒤늦게 결과를 보고해도 되살아나지 않는다.
+    assert client.post(
+        f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-SOFT", "status": "done"}
+    ).status_code == 404
+
+
+def test_deleted_schedule_is_not_picked_up_by_scheduler(client):
+    schedule = make_schedule(client, numbers=["010-5000-0201"], repeat_count=1, start_at="2026-11-20T09:00")
+    client.delete(f"/api/schedules/{schedule['id']}")
+
+    conn = _conn()
+    try:
+        created = scheduler.run_due_schedules(conn, parse_dt("2026-11-22T12:00:00"))
+        assert created == []
+        assert conn.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"] == 0
+        assert conn.execute("SELECT status FROM schedules WHERE id = ?", (schedule["id"],)).fetchone()["status"] == "paused"
+    finally:
+        conn.close()
+
+
+def test_archive_search_and_kind_filters(client):
+    first = make_schedule(client, name="보관함 검색 알파", numbers=["010-5000-0301"], repeat_count=1)
+    second = make_schedule(client, name="보관함 검색 베타", numbers=["010-5000-0302"], repeat_count=1)
+    client.delete(f"/api/schedules/{first['id']}")
+    client.delete(f"/api/schedules/{second['id']}")
+    sms = _post_sms(client, sender="010-8888-0001", body="보관함에 남는 문자")
+
+    found = _archive(client, kind="schedules", q="알파")
+    assert [item["id"] for item in found["items"]] == [first["id"]]
+    assert found["items"][0]["title"] == "보관함 검색 알파"
+    assert found["items"][0]["kind_label"] == "스케줄"
+
+    client.delete(f"/api/sms/{sms['id']}")
+    # 번호로도 문자를 찾을 수 있다.
+    by_number = _archive(client, kind="sms", q="8888")
+    assert [item["id"] for item in by_number["items"]] == [sms["id"]]
+
+    assert _archive(client, kind="runs")["items"] == []
+    assert _archive(client, kind="bogus").get("detail")
+
+
+def test_archive_kind_filter_and_counts(client):
+    schedule = make_schedule(client, numbers=["010-5000-0401"], repeat_count=1)
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    sms = _post_sms(client, body="보관함 개수")
+    client.delete(f"/api/schedules/{schedule['id']}")
+    client.delete(f"/api/sms/{sms['id']}")
+
+    runs = _archive(client, kind="runs")
+    assert [item["kind"] for item in runs["items"]] == ["run"]
+    assert runs["counts"]["schedules"] == 1 and runs["counts"]["sms"] == 1
+    assert runs["counts"]["total"] == 4
+
+    tasks = _archive(client, kind="tasks")
+    assert [item["kind"] for item in tasks["items"]] == ["task"]
+
+
+def test_archive_time_range_uses_item_time(client):
+    old = _post_sms(client, body="어제 받은 문자")
+    new = _post_sms(client, body="오늘 받은 문자")
+    conn = _conn()
+    conn.execute("UPDATE sms_inbox SET received_at = ? WHERE id = ?", ("2026-11-21T08:30:00+09:00", old["id"]))
+    conn.execute("UPDATE sms_inbox SET received_at = ? WHERE id = ?", ("2026-11-22T08:30:00+09:00", new["id"]))
+    conn.close()
+    client.post("/api/sms/delete", json={"all_sms": True})
+
+    day = _archive(client, kind="sms", start="2026-11-21", end="2026-11-21")
+    assert [item["id"] for item in day["items"]] == [old["id"]]
+    assert _archive(client, kind="sms", start="2026-11-22")["counts"]["sms"] == 2
+    assert [item["id"] for item in _archive(client, kind="sms", start="2026-11-22")["items"]] == [new["id"]]
+
+
+def test_archive_restore_schedule_brings_back_paused_with_children(client):
+    schedule = make_schedule(client, numbers=["010-5000-0501", "010-5000-0502"], repeat_count=1)
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    task = client.get("/api/tasks").json()["tasks"][0]
+    client.post(f"/api/tasks/{task['id']}/result", json={"status": "done", "result": "통화 성공"})
+    client.delete(f"/api/schedules/{schedule['id']}")
+
+    result = client.post("/api/archive/restore", json={"kind": "schedule", "id": schedule["id"]}).json()
+    assert result["ok"] is True
+    assert result["restored"] == 1
+    assert result["restored_runs"] == 1
+    assert result["restored_tasks"] == 2
+
+    restored = client.get("/api/schedules").json()["schedules"]
+    assert [s["id"] for s in restored] == [schedule["id"]]
+    # 복원된 스케줄은 일시정지 상태라 복원하자마자 발신되지 않는다.
+    assert restored[0]["status"] == "paused"
+    assert len(client.get("/api/runs").json()["runs"]) == 1
+    assert len(client.get("/api/tasks").json()["tasks"]) == 2
+    assert _archive(client)["items"] == []
+
+
+def test_archive_restore_run_and_task(client):
+    schedule = make_schedule(client, numbers=["010-5000-0601", "010-5000-0602"], repeat_count=1)
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    run_id = client.get("/api/runs").json()["runs"][0]["id"]
+    task_id = client.get("/api/tasks").json()["tasks"][0]["id"]
+
+    client.delete(f"/api/tasks/{task_id}")
+    assert [item["kind"] for item in _archive(client)["items"]] == ["task"]
+    assert client.post("/api/archive/restore", json={"kind": "task", "id": task_id}).json()["restored"] == 1
+    assert task_id in [t["id"] for t in client.get("/api/tasks").json()["tasks"]]
+
+    client.delete(f"/api/runs/{run_id}")
+    assert client.get("/api/tasks").json()["tasks"] == []
+    result = client.post("/api/archive/restore", json={"kind": "run", "id": run_id}).json()
+    assert result["restored"] == 1 and result["restored_tasks"] == 2
+    assert client.get("/api/runs").json()["runs"][0]["id"] == run_id
+    assert len(client.get("/api/tasks").json()["tasks"]) == 2
+    # 스케줄은 그대로 남아 있다.
+    assert [s["id"] for s in client.get("/api/schedules").json()["schedules"]] == [schedule["id"]]
+
+
+def test_archive_restore_sms_keeps_photo(client):
+    created = _post_photo_sms(client, body="보관함 사진")
+    client.delete(f"/api/sms/{created['id']}")
+
+    item = _archive(client, kind="sms")["items"][0]
+    assert item["has_mms"] is True
+    assert item["attachments"][0]["url"] == f"/api/sms/{created['id']}/attachments/0"
+    assert client.get(f"/api/sms/{created['id']}/attachments/0").status_code == 200
+
+    assert client.post("/api/archive/restore", json={"kind": "sms", "id": created["id"]}).json()["restored"] == 1
+    assert [m["id"] for m in client.get("/api/sms").json()["messages"]] == [created["id"]]
+    assert client.get("/api/sms").json()["messages"][0]["has_mms"] is True
+
+
+def test_archive_restore_unknown_and_bad_kind(client):
+    missing = client.post("/api/archive/restore", json={"kind": "sms", "id": 9999})
+    assert missing.status_code == 404
+    assert "보관함" in missing.json()["detail"]
+    assert client.post("/api/archive/restore", json={"kind": "device", "id": 1}).status_code == 422
+    assert client.post("/api/archive/restore", json={"kind": "sms", "id": 0}).status_code == 422
+
+
+def test_archive_restore_twice_is_404(client):
+    created = _post_sms(client, body="두 번 복원")
+    client.delete(f"/api/sms/{created['id']}")
+    assert client.post("/api/archive/restore", json={"kind": "sms", "id": created["id"]}).status_code == 200
+    assert client.post("/api/archive/restore", json={"kind": "sms", "id": created["id"]}).status_code == 404
+
+
+def test_bulk_deletes_are_soft_and_archived(client):
+    first = make_schedule(client, name="일괄 A", numbers=["010-5000-0701"], repeat_count=1)
+    second = make_schedule(client, name="일괄 B", numbers=["010-5000-0702"], repeat_count=1)
+    body = client.post("/api/schedules/delete", json={"ids": [first["id"], second["id"]]}).json()
+    assert body["deleted"] == 2 and body["soft_deleted"] is True
+    assert client.get("/api/schedules").json()["schedules"] == []
+    assert {item["id"] for item in _archive(client, kind="schedules")["items"]} == {first["id"], second["id"]}
+
+    # 실행 기록 일괄 삭제도 보관함으로
+    schedule = make_schedule(client, name="일괄 실행", numbers=["010-5000-0703"], repeat_count=1)
+    schedule["id"]
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    run_id = client.get("/api/runs").json()["runs"][0]["id"]
+    assert client.post("/api/runs/delete", json={"all_finished": True}).status_code == 404  # 아직 대기 중
+    body = client.post("/api/runs/delete", json={"ids": [run_id]}).json()
+    assert body["deleted"] == 1 and body["soft_deleted"] is True
+    assert [item["id"] for item in _archive(client, kind="runs")["items"]] == [run_id]
+
+
+def test_soft_deleted_items_survive_restart_and_init(client):
+    """소프트 삭제는 파일/DB 재시작 후에도 보관함에 남는다(스키마 마이그레이션 멱등)."""
+    created = _post_sms(client, body="재시작 후에도 보관")
+    client.delete(f"/api/sms/{created['id']}")
+    db.init_db()  # 다시 마이그레이션해도 deleted_at 은 유지된다.
+    assert [item["id"] for item in _archive(client, kind="sms")["items"]] == [created["id"]]
+
+
+# --------------------------------------------------------------------------
+# 26. 스키마 마이그레이션(소프트 삭제 · 기기 편집 플래그 · 로그 분류)
+# --------------------------------------------------------------------------
+def test_db_migration_adds_soft_delete_and_device_flags(tmp_path, monkeypatch):
+    import sqlite3
+
+    old_db = tmp_path / "old_soft.db"
+    raw = sqlite3.connect(old_db)
+    raw.executescript(
+        """
+        CREATE TABLE devices (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', model TEXT DEFAULT '',
+            android_version TEXT DEFAULT '', app_version TEXT DEFAULT '', battery INTEGER,
+            network TEXT DEFAULT '', phone_number TEXT DEFAULT '', note TEXT DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1, last_seen TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL DEFAULT '', type TEXT NOT NULL,
+            numbers TEXT NOT NULL, repeat_count INTEGER NOT NULL DEFAULT 1, total_calls INTEGER,
+            order_mode TEXT NOT NULL DEFAULT 'sequence', max_call_duration_sec INTEGER, sms_body TEXT,
+            start_at TEXT NOT NULL, recurrence TEXT NOT NULL DEFAULT 'once', device_id TEXT,
+            target_device_ids TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active',
+            next_run_at TEXT, last_run_at TEXT, run_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+        );
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id INTEGER, schedule_name TEXT DEFAULT '',
+            type TEXT NOT NULL DEFAULT 'call', scheduled_for TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            total_tasks INTEGER NOT NULL DEFAULT 0, done_tasks INTEGER NOT NULL DEFAULT 0,
+            failed_tasks INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, finished_at TEXT
+        );
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, schedule_id INTEGER,
+            schedule_name TEXT DEFAULT '', type TEXT NOT NULL, phone_number TEXT NOT NULL,
+            seq INTEGER NOT NULL DEFAULT 0, repeat_index INTEGER NOT NULL DEFAULT 1,
+            max_call_duration_sec INTEGER, sms_body TEXT, device_id TEXT, status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0, result TEXT, error TEXT, duration_sec REAL,
+            claimed_at TEXT, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE sms_inbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT, sender TEXT DEFAULT '',
+            receiver_number TEXT DEFAULT '', body TEXT DEFAULT '', received_at TEXT, created_at TEXT NOT NULL,
+            telegram_status TEXT NOT NULL DEFAULT 'pending', telegram_error TEXT,
+            telegram_attempts INTEGER NOT NULL DEFAULT 0, telegram_sent_at TEXT,
+            attachment_count INTEGER NOT NULL DEFAULT 0, attachment_paths TEXT
+        );
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+        CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL DEFAULT 'info',
+                           message TEXT NOT NULL, created_at TEXT NOT NULL);
+        """
+    )
+    raw.execute("INSERT INTO devices(id, name, created_at) VALUES ('5656', '5656', '2026-11-22T19:07:06+09:00')")
+    raw.execute(
+        """INSERT INTO schedules(name, type, numbers, start_at, status, created_at)
+           VALUES ('기존 스케줄', 'call', '["010-1"]', '2026-11-20T09:00:00+09:00', 'finished',
+                   '2026-11-20T08:00:00+09:00')"""
+    )
+    raw.execute(
+        """INSERT INTO runs(schedule_id, schedule_name, scheduled_for, status, created_at)
+           VALUES (1, '기존 스케줄', '2026-11-20T09:00:00+09:00', 'done', '2026-11-20T09:00:00+09:00')"""
+    )
+    raw.execute(
+        """INSERT INTO tasks(run_id, schedule_id, type, phone_number, status, created_at)
+           VALUES (1, 1, 'call', '010-1', 'done', '2026-11-20T09:00:00+09:00')"""
+    )
+    raw.execute(
+        """INSERT INTO sms_inbox(device_id, sender, body, received_at, created_at, telegram_status)
+           VALUES ('5656', '010-2', '기존 문자', '2026-11-21T10:00:00+09:00',
+                   '2026-11-21T10:00:01+09:00', 'sent')"""
+    )
+    raw.execute("INSERT INTO logs(level, message, created_at) VALUES ('info', '기기 등록: 5656', '2026-11-20T09:00:00+09:00')")
+    raw.commit()
+    raw.close()
+
+    db.init_db(old_db)
+
+    conn = sqlite3.connect(old_db)
+    conn.row_factory = sqlite3.Row
+    for table in ("schedules", "runs", "tasks", "sms_inbox"):
+        assert "deleted_at" in {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
+    assert {"name_customized", "phone_customized"} <= device_columns
+    assert "category" in {row["name"] for row in conn.execute("PRAGMA table_info(logs)")}
+    assert conn.execute("SELECT COUNT(*) FROM logs WHERE category = 'device'").fetchone()[0] == 1
+    for table in ("schedules", "runs", "tasks", "sms_inbox"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE deleted_at IS NULL").fetchone()[0] == 1
+    conn.close()
+
+    # 마이그레이션 뒤에도 기존 데이터가 그대로 보인다.
+    monkeypatch.setattr(config, "DB_PATH", old_db)
+    with TestClient(app) as migrated:
+        assert [s["id"] for s in migrated.get("/api/schedules").json()["schedules"]] == [1]
+        assert [m["id"] for m in migrated.get("/api/sms").json()["messages"]] == [1]
+        assert migrated.get("/api/archive").json()["counts"]["total"] == 0
+        # 대시보드에서 고친 이름·번호는 앱 재등록에도 유지된다.
+        migrated.patch("/api/devices/5656", json={"name": "형원님 폰", "phone_number": "010-5656-3939"})
+        device = migrated.post("/api/devices", json={"device_id": "5656", "name": "5656", "phone_number": ""}).json()["device"]
+        assert device["name"] == "형원님 폰" and device["phone_number"] == "010-5656-3939"
+
+
+# --------------------------------------------------------------------------
+# 27. 대시보드 UI · OpenAPI
+# --------------------------------------------------------------------------
+def test_dashboard_has_log_search_and_archive_controls(client):
+    html = client.get("/").text
+    for keyword in (
+        'id="logQuery"',
+        'oninput="markLogDirty()"',
+        'id="logStart"',
+        'id="logEnd"',
+        'id="logCategory"',
+        'id="logLevel"',
+        "전체 보기",
+        "더 보기",
+        "loadMoreLogs(",
+        "loadAllLogs(",
+        "setLogRange(",
+        'data-tab="archive"',
+        'id="pane-archive"',
+        'id="archiveTable"',
+        "restoreArchive(",
+        "/api/archive/restore",
+        "보관함",
+        "로그를 불러오지 못했습니다",
+    ):
+        assert keyword in html, keyword
+    # 로그 행에는 시각·분류·메시지가 함께 나온다.
+    assert "log.category_label" in html
+
+
+def test_dashboard_delete_confirmations_mention_archive(client):
+    html = client.get("/").text
+    assert "삭제 보관함에서" in html
+    assert "웹 목록에서 숨겨" in html.lower() or "웹 목록에서 숨김" in html or "웹 목록에서 숨겨" in html
+    assert "웹 목록에서 숨겨지고" in html
+
+
+def test_dashboard_has_device_edit_controls(client):
+    html = client.get("/").text
+    for keyword in (
+        'id="deviceModal"',
+        'id="devEditName"',
+        'id="devEditPhone"',
+        'id="devEditNote"',
+        'id="devEditEnabled"',
+        "openDeviceEdit(",
+        "saveDeviceEdit(",
+        "closeDeviceEdit(",
+        "기기 정보 편집",
+    ):
+        assert keyword in html, keyword
+    # 기기 표의 액션은 편집 · 사용 중지 · 삭제 세 가지
+    assert "편집</button>" in html
+
+
+def test_openapi_exposes_log_filters_and_archive(client):
+    spec = client.get("/openapi.json").json()
+    paths = spec["paths"]
+    log_params = {p["name"] for p in paths["/api/logs"]["get"].get("parameters", [])}
+    assert {"q", "level", "category", "start", "end", "all", "limit", "offset"} <= log_params
+    assert "get" in paths["/api/archive"]
+    assert "post" in paths["/api/archive/restore"]
+    archive_params = {p["name"] for p in paths["/api/archive"]["get"].get("parameters", [])}
+    assert {"kind", "q", "start", "end", "limit", "offset"} <= archive_params
+    restore_schema = spec["components"]["schemas"]["ArchiveRestore"]
+    assert {"kind", "id"} <= set(restore_schema["properties"])
+    device_patch = spec["components"]["schemas"]["DeviceUpdate"]["properties"]
+    assert {"name", "phone_number", "note", "enabled"} <= set(device_patch)
+
+
+def test_archive_and_logs_require_api_key(client, monkeypatch):
+    monkeypatch.setattr(config, "API_KEY", "secret-key")
+    assert client.get("/api/archive").status_code == 401
+    assert client.post("/api/archive/restore", json={"kind": "sms", "id": 1}).status_code == 401
+    assert client.get("/api/logs").status_code == 401
+    headers = {"X-API-Key": "secret-key"}
+    assert client.get("/api/archive", headers=headers).status_code == 200
+    assert client.get("/api/logs", headers=headers).status_code == 200

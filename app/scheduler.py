@@ -87,6 +87,9 @@ def create_run(conn, schedule_row, scheduled_for: datetime, source: str = "sched
     예) 기기 2대 × 총 10회 → 기기당 10건, 합쳐 20건 (랜덤 순서는 기기마다 따로 섞는다).
     기기 지정이 없으면 예전처럼 한 묶음을 공유 대기열(device_id = NULL)에 넣는다.
     """
+    # 삭제 보관함으로 옮긴 스케줄은 절대 실행하지 않는다.
+    if "deleted_at" in schedule_row.keys() and schedule_row["deleted_at"]:
+        return None
     numbers = db.json_list(schedule_row["numbers"])
     total_calls = schedule_row["total_calls"] if "total_calls" in schedule_row.keys() else None
     order_mode = schedule_row["order_mode"] or "sequence"
@@ -190,7 +193,9 @@ def create_run(conn, schedule_row, scheduled_for: datetime, source: str = "sched
 
 
 def run_schedule_now(conn, schedule_id: int) -> int | None:
-    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM schedules WHERE id = ? AND deleted_at IS NULL", (schedule_id,)
+    ).fetchone()
     if row is None:
         return None
     return create_run(conn, row, now(), source="manual")
@@ -215,7 +220,8 @@ def run_due_schedules(conn, current: datetime | None = None) -> list[int]:
     current = current or now()
     rows = conn.execute(
         """SELECT * FROM schedules
-           WHERE status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ?
+           WHERE status = 'active' AND deleted_at IS NULL
+             AND next_run_at IS NOT NULL AND next_run_at <= ?
            ORDER BY next_run_at ASC""",
         (iso(current),),
     ).fetchall()
@@ -240,7 +246,8 @@ def reap_stale_tasks(conn, current: datetime | None = None) -> int:
     limit = iso(current - timedelta(seconds=config.TASK_TIMEOUT_SEC))
     rows = conn.execute(
         """SELECT * FROM tasks
-           WHERE status IN ('assigned', 'running') AND claimed_at IS NOT NULL AND claimed_at <= ?""",
+           WHERE deleted_at IS NULL AND status IN ('assigned', 'running')
+             AND claimed_at IS NOT NULL AND claimed_at <= ?""",
         (limit,),
     ).fetchall()
     recovered = 0
@@ -271,7 +278,7 @@ def _refresh_run(conn, run_id: int) -> None:
              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
              SUM(CASE WHEN status IN ('pending', 'assigned', 'running') THEN 1 ELSE 0 END) AS open,
              COUNT(*) AS total
-           FROM tasks WHERE run_id = ?""",
+           FROM tasks WHERE run_id = ? AND deleted_at IS NULL""",
         (run_id,),
     ).fetchone()
     total = counts["total"] or 0
@@ -287,13 +294,15 @@ def _refresh_run(conn, run_id: int) -> None:
         else:
             status = "partial"
         conn.execute(
-            "UPDATE runs SET status = ?, done_tasks = ?, failed_tasks = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ?",
+            "UPDATE runs SET status = ?, done_tasks = ?, failed_tasks = ?, finished_at = COALESCE(finished_at, ?) "
+            "WHERE id = ? AND deleted_at IS NULL",
             (status, done, failed, iso(now()), run_id),
         )
     else:
         status = "running" if (done + failed) > 0 else "pending"
         conn.execute(
-            "UPDATE runs SET status = ?, done_tasks = ?, failed_tasks = ?, total_tasks = ? WHERE id = ?",
+            "UPDATE runs SET status = ?, done_tasks = ?, failed_tasks = ?, total_tasks = ? "
+            "WHERE id = ? AND deleted_at IS NULL",
             (status, done, failed, total, run_id),
         )
 
@@ -307,7 +316,7 @@ def retry_pending_telegram(conn, limit: int = 10) -> int:
     from .telegram_client import deliver_sms_notification
 
     rows = conn.execute(
-        "SELECT id FROM sms_inbox WHERE telegram_status = 'pending' ORDER BY id ASC LIMIT ?",
+        "SELECT id FROM sms_inbox WHERE deleted_at IS NULL AND telegram_status = 'pending' ORDER BY id ASC LIMIT ?",
         (limit,),
     ).fetchall()
     sent = 0

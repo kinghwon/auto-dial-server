@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS devices (
     phone_number     TEXT DEFAULT '',
     note             TEXT DEFAULT '',
     enabled          INTEGER NOT NULL DEFAULT 1,
+    -- 대시보드에서 직접 고친 이름·번호. 1 이면 앱이 30초마다 보내는 등록 정보가 덮어쓰지 않는다.
+    name_customized  INTEGER NOT NULL DEFAULT 0,
+    phone_customized INTEGER NOT NULL DEFAULT 0,
     last_seen        TEXT,
     created_at       TEXT NOT NULL
 );
@@ -43,6 +46,8 @@ CREATE TABLE IF NOT EXISTS schedules (
     next_run_at            TEXT,
     last_run_at            TEXT,
     run_count              INTEGER NOT NULL DEFAULT 0,
+    -- 삭제 시각(소프트 삭제). 값이 있으면 웹 목록에서는 숨기고 삭제 보관함에 남긴다.
+    deleted_at             TEXT DEFAULT NULL,
     created_at             TEXT NOT NULL
 );
 
@@ -56,6 +61,7 @@ CREATE TABLE IF NOT EXISTS runs (
     total_tasks   INTEGER NOT NULL DEFAULT 0,
     done_tasks    INTEGER NOT NULL DEFAULT 0,
     failed_tasks  INTEGER NOT NULL DEFAULT 0,
+    deleted_at    TEXT DEFAULT NULL,
     created_at    TEXT NOT NULL,
     finished_at   TEXT
 );
@@ -80,6 +86,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     claimed_at     TEXT,
     started_at     TEXT,
     finished_at    TEXT,
+    deleted_at     TEXT DEFAULT NULL,
     created_at     TEXT NOT NULL
 );
 
@@ -96,7 +103,8 @@ CREATE TABLE IF NOT EXISTS sms_inbox (
     telegram_attempts  INTEGER NOT NULL DEFAULT 0,
     telegram_sent_at   TEXT,
     attachment_count   INTEGER NOT NULL DEFAULT 0,
-    attachment_paths   TEXT
+    attachment_paths   TEXT,
+    deleted_at         TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -108,6 +116,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS logs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     level      TEXT NOT NULL DEFAULT 'info',
+    category   TEXT NOT NULL DEFAULT '',
     message    TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -121,6 +130,37 @@ CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(status, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_sms_created ON sms_inbox(created_at);
 CREATE INDEX IF NOT EXISTS idx_sms_telegram ON sms_inbox(telegram_status);
 """
+
+# 로그 분류. 메시지 앞부분으로 자동 분류하고, 대시보드에서 분류별로 걸러 볼 수 있다.
+LOG_CATEGORIES: dict[str, str] = {
+    "device": "기기",
+    "schedule": "스케줄",
+    "run": "실행 기록",
+    "queue": "대기열",
+    "sms": "수신 문자",
+    "telegram": "텔레그램",
+    "settings": "설정",
+    "system": "시스템",
+}
+
+_LOG_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("settings", ("설정 저장", "설정 변경")),
+    ("schedule", ("스케줄",)),
+    ("run", ("실행 기록", "실행 묶음")),
+    ("queue", ("대기열",)),
+    ("sms", ("수신 문자", "문자 전송")),
+    ("device", ("기기",)),
+    ("telegram", ("텔레그램",)),
+)
+
+
+def guess_log_category(message: str) -> str:
+    """로그 메시지로 분류를 정한다(알 수 없으면 system)."""
+    text = message or ""
+    for key, words in _LOG_CATEGORY_RULES:
+        if any(word in text for word in words):
+            return key
+    return "system"
 
 DEFAULT_SETTINGS = {
     "telegram_bot_token": "",
@@ -206,6 +246,34 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
         # 서버에 저장한 첨부 파일 목록(JSON: path/filename/content_type).
         conn.execute("ALTER TABLE sms_inbox ADD COLUMN attachment_paths TEXT")
         added.append("sms_inbox.attachment_paths")
+
+    # 대시보드에서 고친 기기 이름·번호를 앱 등록 정보가 덮어쓰지 않도록 표시한다.
+    for column, note in (
+        ("name_customized", "기기 이름 직접 수정 여부"),
+        ("phone_customized", "기기 번호 직접 수정 여부"),
+    ):
+        if column not in device_columns:
+            conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+            added.append(f"devices.{column} ({note})")
+
+    # 소프트 삭제(삭제 보관함). 예전 DB 에도 손실 없이 컬럼만 추가한다.
+    for table in ("schedules", "runs", "tasks", "sms_inbox"):
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "deleted_at" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN deleted_at TEXT DEFAULT NULL")
+            added.append(f"{table}.deleted_at")
+
+    # 로그 분류(검색·필터용). 기존 로그는 메시지로 분류를 채워 넣는다.
+    log_columns = {row["name"] for row in conn.execute("PRAGMA table_info(logs)")}
+    if "category" not in log_columns:
+        conn.execute("ALTER TABLE logs ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        added.append("logs.category")
+    for row in conn.execute("SELECT id, message, category FROM logs WHERE category IS NULL OR category = ''").fetchall():
+        conn.execute(
+            "UPDATE logs SET category = ? WHERE id = ?", (guess_log_category(row["message"]), row["id"])
+        )
+    # 분류 컬럼이 준비된 뒤에 인덱스를 만든다(예전 DB 는 컬럼이 없을 수 있다).
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_category ON logs(category)")
     return added
 
 
@@ -215,7 +283,12 @@ def init_db(path: str | Path | None = None) -> None:
         conn.executescript(SCHEMA)
         added = _migrate(conn)
         if added:
-            log(conn, f"DB 스키마 마이그레이션: {', '.join(added)} 컬럼 추가", "warning")
+            log(
+                conn,
+                f"DB 스키마 마이그레이션: {', '.join(added)} 컬럼 추가",
+                "warning",
+                category="system",
+            )
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value, updated_at) VALUES (?, ?, datetime('now'))",
@@ -256,10 +329,11 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
-def log(conn: sqlite3.Connection, message: str, level: str = "info") -> None:
+def log(conn: sqlite3.Connection, message: str, level: str = "info", category: str | None = None) -> None:
     from .timeutil import now_iso
 
+    kind = category or guess_log_category(message)
     conn.execute(
-        "INSERT INTO logs(level, message, created_at) VALUES (?, ?, ?)",
-        (level, message[:2000], now_iso()),
+        "INSERT INTO logs(level, category, message, created_at) VALUES (?, ?, ?, ?)",
+        (level, kind, message[:2000], now_iso()),
     )

@@ -88,6 +88,21 @@ class DeviceUpdate(BaseModel):
             return None
         return clean_phone_number(value)
 
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str | None) -> str | None:
+        """이름은 공백만 보내면 비운 것으로 보고 기기 ID 로 되돌린다."""
+        if value is None:
+            return None
+        return value.strip()
+
+
+class ArchiveRestore(BaseModel):
+    """삭제 보관함 복원. kind 는 schedule/run/task/sms."""
+
+    kind: Literal["schedule", "run", "task", "sms"]
+    id: int = Field(ge=1)
+
 
 ORDER_MODES = ("sequence", "grouped", "random")
 

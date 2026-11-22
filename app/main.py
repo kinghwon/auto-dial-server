@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config, db, scheduler
 from .db import json_list
 from .models import (
+    ArchiveRestore,
     DeviceRegister,
     DeviceUpdate,
     Heartbeat,
@@ -35,12 +36,16 @@ from .models import (
     TelegramTest,
 )
 from . import telegram_client
-from .timeutil import iso, local_str, next_occurrence, now, parse_dt
+from .timeutil import iso, local_str, next_occurrence, now, now_iso, parse_dt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("auto-dialer")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+# '전체 보기'에서 한 번에 돌려주는 최대 행 수(서버 보호용 안전 상한).
+LOG_ALL_LIMIT = 10000
+ARCHIVE_ALL_LIMIT = 5000
 
 
 @asynccontextmanager
@@ -109,6 +114,57 @@ def _setting_int(settings: dict, key: str, default: int, low: int, high: int) ->
     return max(low, min(high, value))
 
 
+def _is_date_only(text: str) -> bool:
+    """'2026-11-22' 처럼 날짜만 입력됐는지 확인한다(종료 시간은 그날 끝까지로 해석)."""
+    cleaned = (text or "").strip()
+    return len(cleaned) <= 10 and "T" not in cleaned and ":" not in cleaned
+
+
+def _time_param(value: str | None, label: str = "시간", end_of_day: bool = False) -> str | None:
+    """시간 필터 입력(ISO8601 · KST · 날짜만)을 DB 비교용 ISO 문자열로 바꾼다."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = parse_dt(text)
+    except ValueError as exc:  # noqa: F841
+        raise HTTPException(
+            status_code=400, detail=f"{label} 형식을 해석할 수 없습니다: {text} (예: 2026-11-22T09:00 또는 2026-11-22)"
+        ) from None
+    if dt is None:
+        return None
+    if end_of_day and _is_date_only(text):
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return iso(dt)
+
+
+def _time_range_clauses(column: str, start: str | None, end: str | None) -> tuple[list[str], list]:
+    """시작/종료 시간 조건. 저장값이 오프셋을 포함해도 맞도록 datetime() 으로 비교한다."""
+    clauses: list[str] = []
+    values: list = []
+    start_iso = _time_param(start, "시작 시간")
+    end_iso = _time_param(end, "종료 시간", end_of_day=True)
+    if start_iso and end_iso and start_iso > end_iso:
+        raise HTTPException(status_code=400, detail="시작 시간이 종료 시간보다 늦습니다.")
+    if start_iso:
+        clauses.append(f"datetime({column}) >= datetime(?)")
+        values.append(start_iso)
+    if end_iso:
+        clauses.append(f"datetime({column}) <= datetime(?)")
+        values.append(end_iso)
+    return clauses, values
+
+
+def _search_clause(columns: list[str], q: str | None) -> tuple[str | None, list]:
+    """여러 컬럼을 한 번에 대소문자 구분 없이 부분 일치 검색한다."""
+    term = (q or "").strip()
+    if not term:
+        return None, []
+    like = f"%{term.lower()}%"
+    clause = "(" + " OR ".join(f"LOWER(COALESCE({column}, '')) LIKE ?" for column in columns) + ")"
+    return clause, [like] * len(columns)
+
+
 def remote_config(conn: sqlite3.Connection, device_id: str | None = None) -> dict:
     """폰이 하트비트·풀링 때마다 받아가는 동작 설정.
 
@@ -146,6 +202,8 @@ def device_dict(row: sqlite3.Row, current: datetime | None = None) -> dict:
         "network": row["network"] or "",
         "phone_number": (_row_value(row, "phone_number") or ""),
         "note": row["note"] or "",
+        "name_customized": bool(_row_value(row, "name_customized", 0) or 0),
+        "phone_customized": bool(_row_value(row, "phone_customized", 0) or 0),
         "enabled": bool(row["enabled"]),
         "online": device_is_online(row, current),
         "last_seen": row["last_seen"],
@@ -251,10 +309,11 @@ def schedule_dict(
         target_ids = [row["device_id"]]
     target_devices = resolve_target_devices(conn, target_ids, devices)
     latest = conn.execute(
-        "SELECT * FROM runs WHERE schedule_id = ? ORDER BY id DESC LIMIT 1", (row["id"],)
+        "SELECT * FROM runs WHERE schedule_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", (row["id"],)
     ).fetchone()
     opens = conn.execute(
-        "SELECT COUNT(*) AS c FROM tasks WHERE schedule_id = ? AND status IN ('pending','assigned','running')",
+        """SELECT COUNT(*) AS c FROM tasks
+           WHERE schedule_id = ? AND deleted_at IS NULL AND status IN ('pending','assigned','running')""",
         (row["id"],),
     ).fetchone()["c"]
     return {
@@ -403,31 +462,37 @@ def stats(conn: sqlite3.Connection = Depends(get_conn)):
     online = sum(1 for row in devices if device_is_online(row, current))
     today_start = iso(current.replace(hour=0, minute=0, second=0, microsecond=0))
 
-    active_schedules = conn.execute("SELECT COUNT(*) AS c FROM schedules WHERE status = 'active'").fetchone()["c"]
+    active_schedules = conn.execute(
+        "SELECT COUNT(*) AS c FROM schedules WHERE status = 'active' AND deleted_at IS NULL"
+    ).fetchone()["c"]
     pending_tasks = conn.execute(
-        "SELECT COUNT(*) AS c FROM tasks WHERE status IN ('pending','assigned','running')"
+        "SELECT COUNT(*) AS c FROM tasks WHERE deleted_at IS NULL AND status IN ('pending','assigned','running')"
     ).fetchone()["c"]
     done_today = conn.execute(
-        "SELECT COUNT(*) AS c FROM tasks WHERE status = 'done' AND finished_at >= ?", (today_start,)
+        "SELECT COUNT(*) AS c FROM tasks WHERE deleted_at IS NULL AND status = 'done' AND finished_at >= ?",
+        (today_start,),
     ).fetchone()["c"]
     failed_today = conn.execute(
-        "SELECT COUNT(*) AS c FROM tasks WHERE status = 'failed' AND finished_at >= ?", (today_start,)
+        "SELECT COUNT(*) AS c FROM tasks WHERE deleted_at IS NULL AND status = 'failed' AND finished_at >= ?",
+        (today_start,),
     ).fetchone()["c"]
     calls_today = conn.execute(
-        "SELECT COUNT(*) AS c FROM tasks WHERE type = 'call' AND status IN ('done','failed') AND finished_at >= ?",
+        """SELECT COUNT(*) AS c FROM tasks
+           WHERE deleted_at IS NULL AND type = 'call' AND status IN ('done','failed') AND finished_at >= ?""",
         (today_start,),
     ).fetchone()["c"]
     sms_today = conn.execute(
-        "SELECT COUNT(*) AS c FROM sms_inbox WHERE created_at >= ?", (today_start,)
+        "SELECT COUNT(*) AS c FROM sms_inbox WHERE deleted_at IS NULL AND created_at >= ?", (today_start,)
     ).fetchone()["c"]
     telegram_failed = conn.execute(
-        "SELECT COUNT(*) AS c FROM sms_inbox WHERE telegram_status IN ('failed','pending')"
+        """SELECT COUNT(*) AS c FROM sms_inbox
+           WHERE deleted_at IS NULL AND telegram_status IN ('failed','pending')"""
     ).fetchone()["c"]
     upcoming = conn.execute(
-        """SELECT * FROM schedules WHERE status = 'active' AND next_run_at IS NOT NULL
+        """SELECT * FROM schedules WHERE status = 'active' AND deleted_at IS NULL AND next_run_at IS NOT NULL
            ORDER BY next_run_at ASC LIMIT 5"""
     ).fetchall()
-    recent_runs = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 5").fetchall()
+    recent_runs = conn.execute("SELECT * FROM runs WHERE deleted_at IS NULL ORDER BY id DESC LIMIT 5").fetchall()
 
     return {
         "devices": {"total": len(devices), "online": online},
@@ -499,12 +564,17 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
         )
         db.log(conn, f"기기 등록: {payload.device_id} ({payload.name})")
     else:
+        # 앱은 30초마다 같은 등록 요청을 보낸다. 대시보드에서 직접 고친 이름·번호는 덮어쓰지 않는다.
         conn.execute(
-            """UPDATE devices SET name = ?, model = ?, android_version = ?, app_version = ?,
-                      phone_number = COALESCE(NULLIF(?, ''), phone_number),
+            """UPDATE devices SET
+                      name = CASE WHEN COALESCE(name_customized, 0) = 1 THEN name
+                                  ELSE COALESCE(NULLIF(?, ''), name) END,
+                      model = ?, android_version = ?, app_version = ?,
+                      phone_number = CASE WHEN COALESCE(phone_customized, 0) = 1 THEN phone_number
+                                          ELSE COALESCE(NULLIF(?, ''), phone_number) END,
                       note = COALESCE(NULLIF(?, ''), note), last_seen = ? WHERE id = ?""",
             (
-                payload.name or row["name"] or payload.device_id,
+                payload.name or device_id,
                 payload.model or row["model"],
                 payload.android_version or row["android_version"],
                 payload.app_version or row["app_version"],
@@ -528,7 +598,7 @@ def device_heartbeat(device_id: str, payload: Heartbeat | None = None, conn: sql
         (iso(now()), body.battery, body.network, row["id"]),
     )
     pending = conn.execute(
-        "SELECT COUNT(*) AS c FROM tasks WHERE status = 'pending' AND (device_id IS NULL OR device_id = ?)",
+        "SELECT COUNT(*) AS c FROM tasks WHERE deleted_at IS NULL AND status = 'pending' AND (device_id IS NULL OR device_id = ?)",
         (device_id,),
     ).fetchone()["c"]
     return {
@@ -550,18 +620,23 @@ def update_device(device_id: str, payload: DeviceUpdate, conn: sqlite3.Connectio
     if payload.name is not None:
         updates.append("name = ?")
         values.append(payload.name[:80] or device_id)
+        # 대시보드에서 직접 고친 이름은 앱 등록 정보가 덮어쓰지 않도록 표시한다.
+        updates.append("name_customized = 1")
     if payload.note is not None:
         updates.append("note = ?")
         values.append(payload.note[:400])
     if payload.phone_number is not None:
         updates.append("phone_number = ?")
         values.append(payload.phone_number[:30])
+        # 빈 값으로 지운 경우에도 앱이 알려준 번호로 다시 채우지 않는다.
+        updates.append("phone_customized = 1")
     if payload.enabled is not None:
         updates.append("enabled = ?")
         values.append(1 if payload.enabled else 0)
     if updates:
         values.append(device_id)
         conn.execute(f"UPDATE devices SET {', '.join(updates)} WHERE id = ?", values)
+        db.log(conn, f"기기 정보 수정: {device_id}")
     row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
     return {"ok": True, "device": device_dict(row)}
 
@@ -601,7 +676,7 @@ def delete_device(device_id: str, conn: sqlite3.Connection = Depends(get_conn)):
 # --------------------------------------------------------------------------
 @api.get("/schedules")
 def list_schedules(conn: sqlite3.Connection = Depends(get_conn)):
-    rows = conn.execute("SELECT * FROM schedules ORDER BY id DESC").fetchall()
+    rows = conn.execute("SELECT * FROM schedules WHERE deleted_at IS NULL ORDER BY id DESC").fetchall()
     devices = device_lookup(conn)
     return {"schedules": [schedule_dict(conn, row, devices) for row in rows]}
 
@@ -652,7 +727,7 @@ def create_schedule(payload: ScheduleCreate, conn: sqlite3.Connection = Depends(
 
 @api.get("/schedules/{schedule_id}")
 def get_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn)):
-    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    row = conn.execute("SELECT * FROM schedules WHERE id = ? AND deleted_at IS NULL", (schedule_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
     return {"schedule": schedule_dict(conn, row)}
@@ -685,7 +760,7 @@ def _next_run_after_edit(
 
 @api.patch("/schedules/{schedule_id}")
 def update_schedule(schedule_id: int, payload: ScheduleUpdate, conn: sqlite3.Connection = Depends(get_conn)):
-    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    row = conn.execute("SELECT * FROM schedules WHERE id = ? AND deleted_at IS NULL", (schedule_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
 
@@ -858,7 +933,7 @@ def pause_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn
 
 @api.post("/schedules/{schedule_id}/resume")
 def resume_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn)):
-    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    row = conn.execute("SELECT * FROM schedules WHERE id = ? AND deleted_at IS NULL", (schedule_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
     start_at = parse_dt(row["start_at"]) or now()
@@ -886,7 +961,7 @@ def resume_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_con
 
 @api.post("/schedules/{schedule_id}/run-now")
 def run_schedule_now(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn)):
-    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    row = conn.execute("SELECT * FROM schedules WHERE id = ? AND deleted_at IS NULL", (schedule_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
     run_id = scheduler.run_schedule_now(conn, schedule_id)
@@ -895,74 +970,93 @@ def run_schedule_now(schedule_id: int, conn: sqlite3.Connection = Depends(get_co
     return {"ok": True, "run_id": run_id}
 
 
-def _purge_schedules(conn: sqlite3.Connection, schedule_ids: list[int]) -> dict:
-    """스케줄과 그 실행 기록(runs)·발신 작업(tasks)을 함께 지운다.
+def _archive_schedules(conn: sqlite3.Connection, schedule_ids: list[int]) -> dict:
+    """스케줄을 소프트 삭제해 삭제 보관함으로 옮긴다.
 
-    이미 실행된 스케줄을 지워도 실행 묶음·발신 작업이 고아(orphan)로 남지 않는다.
-    FK 제약이 걸린 DB에서도 자식 행을 먼저 지우므로 오류가 나지 않는다.
+    - 스케줄은 status='paused' + deleted_at 으로 바꿔 예약이 저절로 나가지 않게 한다.
+    - 대기·배정·진행 중 작업은 취소(skipped)해서 폰이 절대 발신하지 않게 한다.
+    - 실행 기록(runs)과 발신 작업(tasks)도 deleted_at 을 채워 함께 보관한다.
+      (행을 지우지 않으므로 나중에 삭제 보관함에서 찾아보거나 복원할 수 있다)
     """
+    empty = {
+        "deleted_ids": [],
+        "deleted": 0,
+        "deleted_runs": 0,
+        "deleted_tasks": 0,
+        "canceled_tasks": 0,
+        "missing_ids": [],
+        "soft_deleted": True,
+    }
     ids = [int(item) for item in dict.fromkeys(schedule_ids or [])]
     if not ids:
-        return {"deleted_ids": [], "deleted": 0, "deleted_runs": 0, "deleted_tasks": 0, "missing_ids": []}
+        return empty
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
-        f"SELECT id, name FROM schedules WHERE id IN ({placeholders})", ids
+        f"SELECT id, name FROM schedules WHERE id IN ({placeholders}) AND deleted_at IS NULL", ids
     ).fetchall()
     found = [row["id"] for row in rows]
     found_set = set(found)
     missing = [item for item in ids if item not in found_set]
     if not found:
-        return {"deleted_ids": [], "deleted": 0, "deleted_runs": 0, "deleted_tasks": 0, "missing_ids": missing}
+        return {**empty, "missing_ids": missing}
 
     found_placeholders = ",".join("?" for _ in found)
     run_ids = [
         row["id"]
         for row in conn.execute(
-            f"SELECT id FROM runs WHERE schedule_id IN ({found_placeholders})", found
+            f"SELECT id FROM runs WHERE schedule_id IN ({found_placeholders}) AND deleted_at IS NULL", found
         )
     ]
-
+    task_scope = f"schedule_id IN ({found_placeholders})"
+    task_values: list = list(found)
     if run_ids:
-        run_placeholders = ",".join("?" for _ in run_ids)
-        deleted_tasks = conn.execute(
-            f"SELECT COUNT(*) AS c FROM tasks WHERE schedule_id IN ({found_placeholders}) OR run_id IN ({run_placeholders})",
-            found + run_ids,
-        ).fetchone()["c"]
-        conn.execute(
-            f"DELETE FROM tasks WHERE schedule_id IN ({found_placeholders}) OR run_id IN ({run_placeholders})",
-            found + run_ids,
-        )
-        conn.execute(f"DELETE FROM runs WHERE id IN ({run_placeholders})", run_ids)
-    else:
-        deleted_tasks = conn.execute(
-            f"SELECT COUNT(*) AS c FROM tasks WHERE schedule_id IN ({found_placeholders})", found
-        ).fetchone()["c"]
-        conn.execute(f"DELETE FROM tasks WHERE schedule_id IN ({found_placeholders})", found)
+        task_scope += f" OR run_id IN ({','.join('?' for _ in run_ids)})"
+        task_values += run_ids
 
+    deleted_at = now_iso()
+    canceled = conn.execute(
+        f"""UPDATE tasks SET status = 'skipped', device_id = NULL, claimed_at = NULL, finished_at = ?,
+                          error = COALESCE(error, '스케줄 삭제로 취소(삭제 보관함)')
+           WHERE deleted_at IS NULL AND status IN ('pending','assigned','running') AND ({task_scope})""",
+        [deleted_at] + task_values,
+    ).rowcount
+    deleted_tasks = conn.execute(
+        f"UPDATE tasks SET deleted_at = ? WHERE ({task_scope}) AND deleted_at IS NULL",
+        [deleted_at] + task_values,
+    ).rowcount
+    deleted_runs = conn.execute(
+        f"UPDATE runs SET deleted_at = ? WHERE schedule_id IN ({found_placeholders}) AND deleted_at IS NULL",
+        [deleted_at] + found,
+    ).rowcount
     deleted_schedules = conn.execute(
-        f"DELETE FROM schedules WHERE id IN ({found_placeholders})", found
+        f"UPDATE schedules SET deleted_at = ?, status = 'paused' WHERE id IN ({found_placeholders}) AND deleted_at IS NULL",
+        [deleted_at] + found,
     ).rowcount
     return {
         "deleted_ids": found,
         "deleted": int(deleted_schedules or 0),
-        "deleted_runs": len(run_ids),
+        "deleted_runs": int(deleted_runs or 0),
         "deleted_tasks": int(deleted_tasks or 0),
+        "canceled_tasks": int(canceled or 0),
         "missing_ids": missing,
+        "soft_deleted": True,
     }
 
 
 @api.delete("/schedules/{schedule_id}")
 def delete_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn)):
-    """스케줄 1개 삭제. 이미 실행된 스케줄이어도 실행 기록·발신 작업까지 함께 지운다."""
-    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    """스케줄 1개 삭제(소프트 삭제). 삭제 보관함에서 다시 찾아 복원할 수 있다."""
+    row = conn.execute(
+        "SELECT * FROM schedules WHERE id = ? AND deleted_at IS NULL", (schedule_id,)
+    ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
     with db.transaction(conn):
-        result = _purge_schedules(conn, [schedule_id])
+        result = _archive_schedules(conn, [schedule_id])
         db.log(
             conn,
-            f"스케줄 삭제: #{schedule_id} '{row['name']}' "
-            f"(실행 기록 {result['deleted_runs']}개 · 발신 작업 {result['deleted_tasks']}건 함께 삭제)",
+            f"스케줄 삭제(보관함): #{schedule_id} '{row['name']}' "
+            f"(실행 기록 {result['deleted_runs']}개 · 발신 작업 {result['deleted_tasks']}건 함께 보관)",
             "warning",
         )
     return {"ok": True, "deleted": schedule_id, **result}
@@ -970,16 +1064,19 @@ def delete_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_con
 
 @api.post("/schedules/delete")
 def bulk_delete_schedules(payload: ScheduleBulkDelete, conn: sqlite3.Connection = Depends(get_conn)):
-    """스케줄 여러 개 삭제.
+    """스케줄 여러 개 삭제(소프트 삭제).
 
     - ids           : 선택한 스케줄
     - executed_only : 이미 실행된 적이 있고 다시 예약되지 않는 스케줄
                       (실행 기록이 있으면서 status='finished' 이거나 next_run_at 이 없는 것)
     - all_schedules : 등록된 모든 스케줄
-    실행 기록(runs)과 발신 작업(tasks)도 함께 지워 고아 기록이 남지 않는다.
+    실행 기록(runs)과 발신 작업(tasks)도 함께 보관함으로 옮긴다.
     """
     if payload.all_schedules:
-        ids = [row["id"] for row in conn.execute("SELECT id FROM schedules ORDER BY id")]
+        ids = [
+            row["id"]
+            for row in conn.execute("SELECT id FROM schedules WHERE deleted_at IS NULL ORDER BY id")
+        ]
         label = "전체"
     elif payload.executed_only:
         # 되풀이되어 다시 실행될 스케줄(매일·매주 등 활성/일시정지)은 건드리지 않는다.
@@ -987,8 +1084,9 @@ def bulk_delete_schedules(payload: ScheduleBulkDelete, conn: sqlite3.Connection 
             row["id"]
             for row in conn.execute(
                 """SELECT s.id FROM schedules s
-                   WHERE (s.run_count > 0 OR s.last_run_at IS NOT NULL
-                          OR EXISTS (SELECT 1 FROM runs r WHERE r.schedule_id = s.id))
+                   WHERE s.deleted_at IS NULL
+                     AND (s.run_count > 0 OR s.last_run_at IS NOT NULL
+                          OR EXISTS (SELECT 1 FROM runs r WHERE r.schedule_id = s.id AND r.deleted_at IS NULL))
                      AND (s.status = 'finished' OR s.next_run_at IS NULL)
                    ORDER BY s.id"""
             )
@@ -1002,10 +1100,10 @@ def bulk_delete_schedules(payload: ScheduleBulkDelete, conn: sqlite3.Connection 
         raise HTTPException(status_code=404, detail="삭제할 스케줄이 없습니다.")
 
     with db.transaction(conn):
-        result = _purge_schedules(conn, ids)
+        result = _archive_schedules(conn, ids)
         db.log(
             conn,
-            f"스케줄 {label} 삭제: {result['deleted']}개 "
+            f"스케줄 {label} 삭제(보관함): {result['deleted']}개 "
             f"(실행 기록 {result['deleted_runs']}개 · 발신 작업 {result['deleted_tasks']}건)",
             "warning",
         )
@@ -1023,7 +1121,7 @@ def copy_schedule(
     기본은 일시정지(paused) 상태로 만들어, 이미 지난 시각의 스케줄을 복사해도
     확인하기 전에 저절로 발신되지 않게 한다. body 에 enabled=true 를 보내면 활성으로 만든다.
     """
-    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    row = conn.execute("SELECT * FROM schedules WHERE id = ? AND deleted_at IS NULL", (schedule_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
 
@@ -1086,45 +1184,75 @@ def copy_schedule(
 FINISHED_RUN_STATUSES = ("done", "partial", "failed", "canceled")
 
 
-def _purge_runs(conn: sqlite3.Connection, run_ids: list[int]) -> tuple[int, int]:
-    """실행 묶음과 그 안의 발신 작업을 지운다. (지운 작업 수, 지운 묶음 수)"""
+def _archive_runs(conn: sqlite3.Connection, run_ids: list[int]) -> dict:
+    """실행 묶음과 그 안의 발신 작업을 소프트 삭제해 보관함으로 옮긴다.
+
+    대기 중이던 작업은 취소(skipped)해 폰이 발신하지 않게 한다.
+    """
     ids = [int(item) for item in dict.fromkeys(run_ids or [])]
+    result = {"deleted": 0, "deleted_tasks": 0, "canceled_tasks": 0, "deleted_ids": [], "missing_ids": []}
     if not ids:
-        return 0, 0
+        return result
     placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id FROM runs WHERE id IN ({placeholders}) AND deleted_at IS NULL", ids
+    ).fetchall()
+    found = [row["id"] for row in rows]
+    if not found:
+        return {**result, "missing_ids": ids}
+    found_set = set(found)
+    found_placeholders = ",".join("?" for _ in found)
+    deleted_at = now_iso()
+    canceled = conn.execute(
+        f"""UPDATE tasks SET status = 'skipped', device_id = NULL, claimed_at = NULL, finished_at = ?,
+                          error = COALESCE(error, '실행 기록 삭제로 취소(삭제 보관함)')
+           WHERE deleted_at IS NULL AND status IN ('pending','assigned','running')
+             AND run_id IN ({found_placeholders})""",
+        [deleted_at] + found,
+    ).rowcount
     deleted_tasks = conn.execute(
-        f"SELECT COUNT(*) AS c FROM tasks WHERE run_id IN ({placeholders})", ids
-    ).fetchone()["c"]
-    conn.execute(f"DELETE FROM tasks WHERE run_id IN ({placeholders})", ids)
-    deleted_runs = conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", ids).rowcount
-    return int(deleted_tasks or 0), int(deleted_runs or 0)
+        f"UPDATE tasks SET deleted_at = ? WHERE run_id IN ({found_placeholders}) AND deleted_at IS NULL",
+        [deleted_at] + found,
+    ).rowcount
+    deleted_runs = conn.execute(
+        f"UPDATE runs SET deleted_at = ? WHERE id IN ({found_placeholders}) AND deleted_at IS NULL",
+        [deleted_at] + found,
+    ).rowcount
+    return {
+        "deleted": int(deleted_runs or 0),
+        "deleted_tasks": int(deleted_tasks or 0),
+        "canceled_tasks": int(canceled or 0),
+        "deleted_ids": found,
+        "missing_ids": [item for item in ids if item not in found_set],
+    }
 
 
 @api.delete("/runs/{run_id}")
 def delete_run(run_id: int, conn: sqlite3.Connection = Depends(get_conn)):
-    """실행 묶음 1개 삭제(그 안의 발신 작업 포함)."""
-    row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    """실행 묶음 1개 삭제(소프트 삭제, 그 안의 발신 작업 포함)."""
+    row = conn.execute("SELECT * FROM runs WHERE id = ? AND deleted_at IS NULL", (run_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="실행 기록을 찾을 수 없습니다.")
     with db.transaction(conn):
-        deleted_tasks, deleted_runs = _purge_runs(conn, [run_id])
+        result = _archive_runs(conn, [run_id])
         db.log(
             conn,
-            f"실행 기록 삭제: run #{run_id} '{row['schedule_name']}' (발신 작업 {deleted_tasks}건)",
+            f"실행 기록 삭제(보관함): run #{run_id} '{row['schedule_name']}' (발신 작업 {result['deleted_tasks']}건)",
             "warning",
         )
-    return {"ok": True, "deleted": deleted_runs, "deleted_tasks": deleted_tasks}
+    return {"ok": True, "deleted": result["deleted"], "deleted_tasks": result["deleted_tasks"],
+            "canceled_tasks": result["canceled_tasks"], "soft_deleted": True}
 
 
 @api.post("/runs/delete")
 def bulk_delete_runs(payload: RunBulkDelete, conn: sqlite3.Connection = Depends(get_conn)):
-    """실행 기록 여러 개 삭제 / 이미 끝난 실행 기록 전체 삭제(all_finished)."""
+    """실행 기록 여러 개 삭제 / 이미 끝난 실행 기록 전체 삭제(all_finished). 소프트 삭제."""
     if payload.all_finished:
         placeholders = ",".join("?" for _ in FINISHED_RUN_STATUSES)
         ids = [
             row["id"]
             for row in conn.execute(
-                f"SELECT id FROM runs WHERE status IN ({placeholders}) ORDER BY id",
+                f"SELECT id FROM runs WHERE deleted_at IS NULL AND status IN ({placeholders}) ORDER BY id",
                 list(FINISHED_RUN_STATUSES),
             )
         ]
@@ -1132,27 +1260,22 @@ def bulk_delete_runs(payload: RunBulkDelete, conn: sqlite3.Connection = Depends(
         ids = list(payload.ids)
     if not ids:
         raise HTTPException(status_code=404, detail="삭제할 실행 기록이 없습니다.")
-    placeholders = ",".join("?" for _ in ids)
-    found = {
-        row["id"]
-        for row in conn.execute(f"SELECT id FROM runs WHERE id IN ({placeholders})", ids)
-    }
-    missing = [item for item in ids if item not in found]
-    target = [item for item in ids if item in found]
-    if not target:
-        raise HTTPException(status_code=404, detail="삭제할 실행 기록이 없습니다.")
     with db.transaction(conn):
-        deleted_tasks, deleted_runs = _purge_runs(conn, target)
+        result = _archive_runs(conn, ids)
+        if not result["deleted_ids"]:
+            raise HTTPException(status_code=404, detail="삭제할 실행 기록이 없습니다.")
         db.log(
             conn,
-            f"실행 기록 삭제: {deleted_runs}개 (발신 작업 {deleted_tasks}건)",
+            f"실행 기록 삭제(보관함): {result['deleted']}개 (발신 작업 {result['deleted_tasks']}건)",
             "warning",
         )
     return {
         "ok": True,
-        "deleted": deleted_runs,
-        "deleted_tasks": deleted_tasks,
-        "missing_ids": missing,
+        "deleted": result["deleted"],
+        "deleted_tasks": result["deleted_tasks"],
+        "canceled_tasks": result["canceled_tasks"],
+        "missing_ids": result["missing_ids"],
+        "soft_deleted": True,
     }
 
 
@@ -1166,6 +1289,8 @@ def claim_next_task(conn: sqlite3.Connection, device_id: str) -> dict | None:
             """SELECT t.* FROM tasks t
                JOIN runs r ON r.id = t.run_id
                WHERE t.status = 'pending'
+                 AND t.deleted_at IS NULL
+                 AND r.deleted_at IS NULL
                  AND r.status IN ('pending', 'running')
                  AND (t.device_id IS NULL OR t.device_id = ?)
                ORDER BY (CASE WHEN t.device_id IS NULL THEN 1 ELSE 0 END), t.id ASC
@@ -1181,7 +1306,8 @@ def claim_next_task(conn: sqlite3.Connection, device_id: str) -> dict | None:
             (device_id, claimed_at, row["id"]),
         )
         conn.execute(
-            "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'pending'", (row["run_id"],)
+            "UPDATE runs SET status = 'running' WHERE id = ? AND status = 'pending' AND deleted_at IS NULL",
+            (row["run_id"],),
         )
         fresh = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
         return task_dict(fresh) if fresh else None
@@ -1206,7 +1332,7 @@ def _recount_runs_after_delete(conn: sqlite3.Connection, run_ids: set[int]) -> l
                       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
                       SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
                       SUM(CASE WHEN status IN ('pending','assigned','running') THEN 1 ELSE 0 END) AS open
-               FROM tasks WHERE run_id = ?""",
+               FROM tasks WHERE run_id = ? AND deleted_at IS NULL""",
             (run_id,),
         ).fetchone()
         total = counts["total"] or 0
@@ -1219,25 +1345,25 @@ def _recount_runs_after_delete(conn: sqlite3.Connection, run_ids: set[int]) -> l
             status = "canceled"
             conn.execute(
                 """UPDATE runs SET status = 'canceled', total_tasks = ?, done_tasks = ?, failed_tasks = ?,
-                          finished_at = COALESCE(finished_at, ?) WHERE id = ?""",
+                          finished_at = COALESCE(finished_at, ?) WHERE id = ? AND deleted_at IS NULL""",
                 (total - skipped, done, failed, iso(now()), run_id),
             )
         elif open_count == 0:
             status = "done" if failed == 0 else ("failed" if done == 0 else "partial")
             conn.execute(
                 """UPDATE runs SET status = ?, total_tasks = ?, done_tasks = ?, failed_tasks = ?,
-                          finished_at = COALESCE(finished_at, ?) WHERE id = ?""",
+                          finished_at = COALESCE(finished_at, ?) WHERE id = ? AND deleted_at IS NULL""",
                 (status, total - skipped, done, failed, iso(now()), run_id),
             )
         else:
             status = "running" if (done + failed) > 0 else "pending"
             conn.execute(
                 """UPDATE runs SET status = ?, total_tasks = ?, done_tasks = ?, failed_tasks = ?
-                   WHERE id = ?""",
+                   WHERE id = ? AND deleted_at IS NULL""",
                 (status, total, done, failed, run_id),
             )
 
-        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        row = conn.execute("SELECT * FROM runs WHERE id = ? AND deleted_at IS NULL", (run_id,)).fetchone()
         if row is not None:
             updated.append(
                 {
@@ -1258,36 +1384,36 @@ def _delete_queue_tasks(
     all_tasks: bool = False,
     run_id: int | None = None,
 ) -> dict:
-    """대기열에서 작업을 지운다.
+    """대기열에서 작업을 소프트 삭제(보관함으로 이동)한다.
 
-    - pending/assigned/done/failed/skipped 는 tasks 행을 실제로 삭제해 목록에서도 지운다.
-    - running(발신 중) 은 폰이 이미 걸고 있어 되돌릴 수 없으므로 취소(skipped)로 표시한다.
+    - pending/assigned/done/failed/skipped 는 deleted_at 을 채워 목록에서 숨긴다(보관함에서 복원 가능).
+    - running(발신 중) 은 폰이 이미 걸고 있어 되돌릴 수 없으므로 취소(skipped)로 표시하고 목록에는 남긴다.
     """
     if all_tasks:
-        clauses: list[str] = []
+        clauses: list[str] = ["deleted_at IS NULL"]
         values: list = []
         if run_id is not None:
             clauses.append("run_id = ?")
             values.append(run_id)
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        where = f" WHERE {' AND '.join(clauses)}"
         rows = conn.execute(f"SELECT id, run_id, status FROM tasks{where}", values).fetchall()
         requested: list[int] = []
     elif all_pending:
-        clauses = ["status IN ('pending','assigned','running')"]
-        values: list = []
+        clauses = ["deleted_at IS NULL", "status IN ('pending','assigned','running')"]
+        values = []
         if run_id is not None:
             clauses.append("run_id = ?")
             values.append(run_id)
         rows = conn.execute(
             f"SELECT id, run_id, status FROM tasks WHERE {' AND '.join(clauses)}", values
         ).fetchall()
-        requested: list[int] = []
+        requested = []
     else:
         requested = [int(item) for item in dict.fromkeys(task_ids or [])]
         if not requested:
             raise HTTPException(status_code=400, detail="삭제할 작업을 선택하세요.")
         rows = conn.execute(
-            f"SELECT id, run_id, status FROM tasks WHERE id IN ({','.join('?' for _ in requested)})",
+            f"SELECT id, run_id, status FROM tasks WHERE deleted_at IS NULL AND id IN ({','.join('?' for _ in requested)})",
             requested,
         ).fetchall()
 
@@ -1311,7 +1437,8 @@ def _delete_queue_tasks(
     with db.transaction(conn):
         if removed:
             conn.execute(
-                f"DELETE FROM tasks WHERE id IN ({','.join('?' for _ in removed)})", removed
+                f"UPDATE tasks SET deleted_at = ? WHERE id IN ({','.join('?' for _ in removed)})",
+                [finished] + removed,
             )
         if canceled:
             conn.execute(
@@ -1325,12 +1452,12 @@ def _delete_queue_tasks(
         label = "전체" if (all_tasks or all_pending) else "선택"
         detail = []
         if removed:
-            detail.append(f"{len(removed)}건 삭제")
+            detail.append(f"{len(removed)}건 보관함으로 이동")
         if canceled:
             detail.append(f"진행 중 {len(canceled)}건 취소")
         if kept:
             detail.append(f"완료·취소 {len(kept)}건 유지")
-        db.log(conn, f"대기열 {label} 삭제: " + " · ".join(detail), "warning")
+        db.log(conn, f"대기열 {label} 삭제(보관함): " + " · ".join(detail), "warning")
 
     return {
         "ok": True,
@@ -1340,6 +1467,7 @@ def _delete_queue_tasks(
         "canceled_ids": canceled,
         "protected_ids": kept,
         "missing_ids": missing,
+        "soft_deleted": True,
         "runs": runs,
     }
 
@@ -1370,7 +1498,7 @@ def poll_task(device_id: str = Query(min_length=1, max_length=64), conn: sqlite3
     # 대시보드에서 '사용 중지'된 기기에는 작업을 배정하지 않는다.
     task = claim_next_task(conn, device_id) if cfg["device_enabled"] else None
     pending = conn.execute(
-        "SELECT COUNT(*) AS c FROM tasks WHERE status = 'pending' AND (device_id IS NULL OR device_id = ?)",
+        "SELECT COUNT(*) AS c FROM tasks WHERE deleted_at IS NULL AND status = 'pending' AND (device_id IS NULL OR device_id = ?)",
         (device_id,),
     ).fetchone()["c"]
     return {
@@ -1384,7 +1512,7 @@ def poll_task(device_id: str = Query(min_length=1, max_length=64), conn: sqlite3
 
 @api.post("/tasks/{task_id}/start")
 def start_task(task_id: int, payload: dict | None = None, conn: sqlite3.Connection = Depends(get_conn)):
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL", (task_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
     conn.execute(
@@ -1396,7 +1524,7 @@ def start_task(task_id: int, payload: dict | None = None, conn: sqlite3.Connecti
 
 @api.post("/tasks/{task_id}/result")
 def report_task_result(task_id: int, payload: TaskResult, conn: sqlite3.Connection = Depends(get_conn)):
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL", (task_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
     if row["device_id"] and payload.device_id and row["device_id"] != payload.device_id:
@@ -1431,6 +1559,8 @@ def list_tasks(
     conn: sqlite3.Connection = Depends(get_conn),
 ):
     clauses, values = [], []
+    # 삭제 보관함으로 옮긴 작업은 일반 목록에서 보이지 않는다.
+    clauses.append("deleted_at IS NULL")
     if status:
         statuses = [s.strip() for s in status.split(",") if s.strip()]
         if statuses:
@@ -1455,7 +1585,9 @@ def list_tasks(
 
 @api.get("/runs")
 def list_runs(limit: int = Query(default=30, ge=1, le=200), conn: sqlite3.Connection = Depends(get_conn)):
-    rows = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    rows = conn.execute(
+        "SELECT * FROM runs WHERE deleted_at IS NULL ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
     return {
         "runs": [
             {
@@ -1492,9 +1624,15 @@ def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite
         receiver_number = device_phone
     elif not device_phone:
         # 기기에 번호가 비어 있는데 앱이 실제 수신 번호를 알려 줬다면 기기 정보도 채워 둔다.
-        conn.execute("UPDATE devices SET phone_number = ? WHERE id = ?", (receiver_number[:30], payload.device_id))
-        device_phone = receiver_number
-        db.log(conn, f"기기 수신 번호 자동 등록: {payload.device_id} → {receiver_number}")
+        # 단, 대시보드에서 번호를 직접 지운 기기(phone_customized=1)는 다시 채우지 않는다.
+        cursor = conn.execute(
+            """UPDATE devices SET phone_number = ?
+               WHERE id = ? AND COALESCE(phone_customized, 0) = 0""",
+            (receiver_number[:30], payload.device_id),
+        )
+        if cursor.rowcount:
+            device_phone = receiver_number
+            db.log(conn, f"기기 수신 번호 자동 등록: {payload.device_id} → {receiver_number}")
 
     received_at = None
     if payload.received_at:
@@ -1619,10 +1757,10 @@ def list_sms(
     conn: sqlite3.Connection = Depends(get_conn),
 ):
     """수신 문자 목록(최신 순). MMS 사진은 attachments[].url 로 바로 볼 수 있다."""
-    where = ""
+    where = " WHERE deleted_at IS NULL"
     values: list = []
     if device_id:
-        where = " WHERE device_id = ?"
+        where += " AND device_id = ?"
         values.append(device_id)
     rows = conn.execute(
         f"SELECT * FROM sms_inbox{where} ORDER BY id DESC LIMIT ?", values + [limit]
@@ -1640,7 +1778,9 @@ def list_sms(
 
 @api.post("/sms/{sms_id}/resend")
 def resend_sms(sms_id: int, conn: sqlite3.Connection = Depends(get_conn)):
-    row = conn.execute("SELECT * FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM sms_inbox WHERE id = ? AND deleted_at IS NULL", (sms_id,)
+    ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="수신 문자를 찾을 수 없습니다.")
     conn.execute(
@@ -1710,84 +1850,359 @@ def _safe_download_name(name: str) -> str:
     return cleaned[:200] or "attachment"
 
 
-def _delete_sms_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> dict:
-    """수신 문자 행과 서버에 저장된 MMS 첨부 파일을 함께 지운다.
+def _archive_sms_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> dict:
+    """수신 문자를 소프트 삭제해 삭제 보관함으로 옮긴다.
 
-    먼저 DB 행을 지우고(실패하면 파일도 그대로), 그 다음 미디어 폴더 안의 첨부 파일을 정리한다.
+    DB 행을 지우지 않고 deleted_at 만 채우므로, 보관함에서 다시 찾아보거나 복원할 수 있다.
+    MMS 사진·첨부 파일은 서버 디스크에 그대로 둔다(보관함에서 계속 볼 수 있음).
     """
     removed_ids: list[int] = []
-    files_removed = 0
     files_kept = 0
-    targets: list[Path] = []
     for row in rows:
         removed_ids.append(int(row["id"]))
         for item in _sms_attachment_items(row):
-            if not isinstance(item, dict):
-                continue
-            path = Path(str(item.get("path") or ""))
-            if path.is_file() and _inside_sms_media(path):
-                targets.append(path)
-            elif path.is_file():
-                # 미디어 폴더 밖 파일은 안전을 위해 지우지 않는다.
+            if isinstance(item, dict) and Path(str(item.get("path") or "")).is_file():
                 files_kept += 1
 
     if removed_ids:
         with db.transaction(conn):
             conn.execute(
-                f"DELETE FROM sms_inbox WHERE id IN ({','.join('?' for _ in removed_ids)})",
-                removed_ids,
+                f"""UPDATE sms_inbox SET deleted_at = ?
+                    WHERE id IN ({','.join('?' for _ in removed_ids)}) AND deleted_at IS NULL""",
+                [now_iso()] + removed_ids,
             )
-            db.log(conn, f"수신 문자 삭제: {len(removed_ids)}건", "warning")
-
-    for path in targets:
-        try:
-            path.unlink()
-            files_removed += 1
-        except OSError as exc:  # noqa: BLE001
-            logger.warning("첨부 파일을 지우지 못했습니다 (%s): %s", path.name, exc)
-            files_kept += 1
+            db.log(
+                conn,
+                f"수신 문자 삭제(보관함): {len(removed_ids)}건 · 사진·첨부 {files_kept}개는 서버에 보관",
+                "warning",
+            )
 
     return {
         "ok": True,
         "deleted_count": len(removed_ids),
         "deleted_ids": removed_ids,
-        "files_removed": files_removed,
+        "files_removed": 0,
         "files_kept": files_kept,
+        "soft_deleted": True,
     }
 
 
 @api.delete("/sms/{sms_id}")
 def delete_sms(sms_id: int, conn: sqlite3.Connection = Depends(get_conn)):
-    """수신 문자 1건 삭제(첨부 파일도 함께 정리)."""
-    row = conn.execute("SELECT * FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
+    """수신 문자 1건 삭제(소프트 삭제). MMS 사진은 서버 보관함에 그대로 남는다."""
+    row = conn.execute(
+        "SELECT * FROM sms_inbox WHERE id = ? AND deleted_at IS NULL", (sms_id,)
+    ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="수신 문자를 찾을 수 없습니다.")
-    return _delete_sms_rows(conn, [row])
+    return _archive_sms_rows(conn, [row])
 
 
 @api.post("/sms/delete")
 def bulk_delete_sms(payload: SmsBulkDelete, conn: sqlite3.Connection = Depends(get_conn)):
-    """수신 문자 부분 삭제(ids) / 전체 삭제(all_sms)."""
+    """수신 문자 부분 삭제(ids) / 전체 삭제(all_sms). 소프트 삭제."""
     if payload.all_sms:
-        rows = conn.execute("SELECT * FROM sms_inbox").fetchall()
+        rows = conn.execute("SELECT * FROM sms_inbox WHERE deleted_at IS NULL").fetchall()
         requested: list[int] = []
     else:
         requested = list(payload.ids)
         rows = conn.execute(
-            f"SELECT * FROM sms_inbox WHERE id IN ({','.join('?' for _ in requested)})",
+            f"""SELECT * FROM sms_inbox
+                WHERE deleted_at IS NULL AND id IN ({','.join('?' for _ in requested)})""",
             requested,
         ).fetchall()
     found_ids = {int(row["id"]) for row in rows}
-    result = _delete_sms_rows(conn, rows)
+    result = _archive_sms_rows(conn, rows)
     result["missing_ids"] = [sms_id for sms_id in requested if sms_id not in found_ids]
     return result
 
 
 @api.delete("/sms")
 def delete_all_sms(conn: sqlite3.Connection = Depends(get_conn)):
-    """수신 문자 전체 삭제(POST /api/sms/delete + all_sms=true 와 같은 동작)."""
-    rows = conn.execute("SELECT * FROM sms_inbox").fetchall()
-    return _delete_sms_rows(conn, rows)
+    """수신 문자 전체 삭제(POST /api/sms/delete + all_sms=true 와 같은 동작). 소프트 삭제."""
+    rows = conn.execute("SELECT * FROM sms_inbox WHERE deleted_at IS NULL").fetchall()
+    return _archive_sms_rows(conn, rows)
+
+
+# --------------------------------------------------------------------------
+# 삭제 보관함 (소프트 삭제된 스케줄·실행 기록·발신 작업·수신 문자)
+# --------------------------------------------------------------------------
+ARCHIVE_KINDS = ("schedules", "runs", "tasks", "sms")
+ARCHIVE_KIND_LABELS = {"schedules": "스케줄", "runs": "실행 기록", "tasks": "발신 작업", "sms": "수신 문자"}
+ARCHIVE_TABLES = {"schedules": "schedules", "runs": "runs", "tasks": "tasks", "sms": "sms_inbox"}
+ARCHIVE_RESTORE_TABLES = {"schedule": "schedules", "run": "runs", "task": "tasks", "sms": "sms_inbox"}
+ARCHIVE_RESTORE_LABELS = {"schedule": "스케줄", "run": "실행 기록", "task": "발신 작업", "sms": "수신 문자"}
+
+
+def _archive_schedule_items(conn, q, start, end) -> list[dict]:
+    clauses = ["deleted_at IS NOT NULL"]
+    values: list = []
+    search, search_values = _search_clause(["name", "numbers"], q)
+    if search:
+        clauses.append(search)
+        values.extend(search_values)
+    time_clauses, time_values = _time_range_clauses("created_at", start, end)
+    clauses.extend(time_clauses)
+    values.extend(time_values)
+    rows = conn.execute(
+        f"SELECT * FROM schedules WHERE {' AND '.join(clauses)} ORDER BY deleted_at DESC LIMIT ?",
+        values + [ARCHIVE_ALL_LIMIT],
+    ).fetchall()
+    items = []
+    for row in rows:
+        numbers = json_list(row["numbers"])
+        start_at = parse_dt(row["start_at"])
+        items.append(
+            {
+                "kind": "schedule",
+                "kind_label": ARCHIVE_KIND_LABELS["schedules"],
+                "id": row["id"],
+                "title": row["name"] or f"스케줄 #{row['id']}",
+                "type": row["type"],
+                "detail": f"번호 {len(numbers)}개 · {row['recurrence']} · 실행 {local_str(row['start_at'], '%Y-%m-%d %H:%M')}",
+                "status": row["status"],
+                "numbers": numbers,
+                "number_count": len(numbers),
+                "recurrence": row["recurrence"],
+                "start_at": row["start_at"],
+                "start_at_text": local_str(row["start_at"], "%Y-%m-%d %H:%M") if start_at else "-",
+                "run_count": row["run_count"],
+                "created_at": row["created_at"],
+                "item_time": row["created_at"],
+                "item_time_text": local_str(row["created_at"], "%Y-%m-%d %H:%M"),
+                "deleted_at": row["deleted_at"],
+                "deleted_at_text": local_str(row["deleted_at"], "%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    return items
+
+
+def _archive_run_items(conn, q, start, end) -> list[dict]:
+    clauses = ["deleted_at IS NOT NULL"]
+    values: list = []
+    search, search_values = _search_clause(["schedule_name"], q)
+    if search:
+        clauses.append(search)
+        values.extend(search_values)
+    time_clauses, time_values = _time_range_clauses("created_at", start, end)
+    clauses.extend(time_clauses)
+    values.extend(time_values)
+    rows = conn.execute(
+        f"SELECT * FROM runs WHERE {' AND '.join(clauses)} ORDER BY deleted_at DESC LIMIT ?",
+        values + [ARCHIVE_ALL_LIMIT],
+    ).fetchall()
+    return [
+        {
+            "kind": "run",
+            "kind_label": ARCHIVE_KIND_LABELS["runs"],
+            "id": row["id"],
+            "title": row["schedule_name"] or f"실행 묶음 #{row['id']}",
+            "type": row["type"],
+            "detail": f"예정 {local_str(row['scheduled_for'], '%Y-%m-%d %H:%M')} · 완료 {row['done_tasks']}/{row['total_tasks']} · 실패 {row['failed_tasks']}",
+            "status": row["status"],
+            "schedule_id": row["schedule_id"],
+            "total_tasks": row["total_tasks"],
+            "done_tasks": row["done_tasks"],
+            "failed_tasks": row["failed_tasks"],
+            "created_at": row["created_at"],
+            "item_time": row["created_at"],
+            "item_time_text": local_str(row["created_at"], "%Y-%m-%d %H:%M"),
+            "deleted_at": row["deleted_at"],
+            "deleted_at_text": local_str(row["deleted_at"], "%Y-%m-%d %H:%M:%S"),
+        }
+        for row in rows
+    ]
+
+
+def _archive_task_items(conn, q, start, end) -> list[dict]:
+    clauses = ["deleted_at IS NOT NULL"]
+    values: list = []
+    search, search_values = _search_clause(["schedule_name", "phone_number", "result", "error"], q)
+    if search:
+        clauses.append(search)
+        values.extend(search_values)
+    time_clauses, time_values = _time_range_clauses("created_at", start, end)
+    clauses.extend(time_clauses)
+    values.extend(time_values)
+    rows = conn.execute(
+        f"SELECT * FROM tasks WHERE {' AND '.join(clauses)} ORDER BY deleted_at DESC LIMIT ?",
+        values + [ARCHIVE_ALL_LIMIT],
+    ).fetchall()
+    items = []
+    for row in rows:
+        note = row["error"] or row["result"] or ""
+        items.append(
+            {
+                "kind": "task",
+                "kind_label": ARCHIVE_KIND_LABELS["tasks"],
+                "id": row["id"],
+                "title": row["phone_number"],
+                "type": row["type"],
+                "detail": f"{row['schedule_name'] or '-'} · {row['seq']}번째 · {note[:80]}",
+                "status": row["status"],
+                "phone_number": row["phone_number"],
+                "device_id": row["device_id"],
+                "schedule_name": row["schedule_name"],
+                "result": row["result"],
+                "error": row["error"],
+                "run_id": row["run_id"],
+                "created_at": row["created_at"],
+                "item_time": row["created_at"],
+                "item_time_text": local_str(row["created_at"], "%Y-%m-%d %H:%M"),
+                "deleted_at": row["deleted_at"],
+                "deleted_at_text": local_str(row["deleted_at"], "%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    return items
+
+
+def _archive_sms_items(conn, q, start, end) -> list[dict]:
+    clauses = ["deleted_at IS NOT NULL"]
+    values: list = []
+    search, search_values = _search_clause(["sender", "body", "receiver_number"], q)
+    if search:
+        clauses.append(search)
+        values.extend(search_values)
+    time_clauses, time_values = _time_range_clauses("COALESCE(received_at, created_at)", start, end)
+    clauses.extend(time_clauses)
+    values.extend(time_values)
+    rows = conn.execute(
+        f"SELECT * FROM sms_inbox WHERE {' AND '.join(clauses)} ORDER BY deleted_at DESC LIMIT ?",
+        values + [ARCHIVE_ALL_LIMIT],
+    ).fetchall()
+    names = {row["id"]: (row["name"] or row["id"]) for row in conn.execute("SELECT id, name FROM devices")}
+    phones = {row["id"]: (_row_value(row, "phone_number") or "") for row in conn.execute("SELECT * FROM devices")}
+    items = []
+    for row in rows:
+        item = sms_dict(row, phones)
+        device_name = names.get(row["device_id"], row["device_id"])
+        preview = " ".join((row["body"] or "").split())[:120]
+        items.append(
+            {
+                "kind": "sms",
+                "kind_label": ARCHIVE_KIND_LABELS["sms"],
+                "id": row["id"],
+                "title": f"{row['sender'] or '발신번호 없음'} → {item['receiver_number'] or '-'}",
+                "detail": preview or ("📷 MMS 사진" if item["attachments"] else "(내용 없음)"),
+                "sender": row["sender"],
+                "receiver_number": item["receiver_number"],
+                "body": row["body"],
+                "device_id": row["device_id"],
+                "device_name": device_name,
+                "telegram_status": row["telegram_status"],
+                "attachment_count": item["attachment_count"],
+                "attachments": item["attachments"],
+                "has_mms": item["has_mms"],
+                "item_time": row["received_at"] or row["created_at"],
+                "item_time_text": local_str(row["received_at"] or row["created_at"], "%Y-%m-%d %H:%M:%S"),
+                "deleted_at": row["deleted_at"],
+                "deleted_at_text": local_str(row["deleted_at"], "%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    return items
+
+
+ARCHIVE_BUILDERS = {
+    "schedules": _archive_schedule_items,
+    "runs": _archive_run_items,
+    "tasks": _archive_task_items,
+    "sms": _archive_sms_items,
+}
+
+
+@api.get("/archive")
+def list_archive(
+    kind: str = Query(default="all"),
+    q: Optional[str] = Query(default=None, max_length=200),
+    start: Optional[str] = Query(default=None, max_length=40),
+    end: Optional[str] = Query(default=None, max_length=40),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """삭제 보관함 목록. 웹에서 삭제한 스케줄·실행 기록·발신 작업·수신 문자(MMS 사진 포함)를 보여 준다."""
+    if kind not in ("all", *ARCHIVE_KINDS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"알 수 없는 종류입니다: {kind} (all, {', '.join(ARCHIVE_KINDS)} 중 하나)",
+        )
+
+    counts = {key: int(conn.execute(f"SELECT COUNT(*) AS c FROM {table} WHERE deleted_at IS NOT NULL").fetchone()["c"] or 0)
+              for key, table in ARCHIVE_TABLES.items()}
+    counts["total"] = sum(counts.values())
+
+    targets = ARCHIVE_KINDS if kind == "all" else (kind,)
+    items: list[dict] = []
+    filtered_total = 0
+    for key in targets:
+        found = ARCHIVE_BUILDERS[key](conn, q, start, end)
+        filtered_total += len(found)
+        items.extend(found)
+    items.sort(key=lambda item: (item.get("deleted_at") or "", item["kind"], item["id"]), reverse=True)
+    page = items[offset : offset + limit]
+    return {
+        "items": page,
+        "count": len(page),
+        "total": filtered_total,
+        "counts": counts,
+        "kind": kind,
+        "kinds": ARCHIVE_KIND_LABELS,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < filtered_total,
+    }
+
+
+@api.post("/archive/restore")
+def restore_archive(payload: ArchiveRestore, conn: sqlite3.Connection = Depends(get_conn)):
+    """삭제 보관함에서 항목을 복원한다.
+
+    스케줄은 일시정지 상태로 돌아와 복원하자마자 저절로 발신되지 않는다.
+    함께 삭제된 실행 기록·발신 작업(같은 삭제 시점)도 같이 되살린다.
+    """
+    table = ARCHIVE_RESTORE_TABLES[payload.kind]
+    row = conn.execute(
+        f"SELECT * FROM {table} WHERE id = ? AND deleted_at IS NOT NULL", (payload.id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="삭제 보관함에서 항목을 찾을 수 없습니다.")
+    deleted_at = row["deleted_at"]
+    restored_runs = 0
+    restored_tasks = 0
+    with db.transaction(conn):
+        if payload.kind == "schedule":
+            conn.execute(
+                "UPDATE schedules SET deleted_at = NULL, status = 'paused' WHERE id = ?", (payload.id,)
+            )
+            restored_runs = conn.execute(
+                "UPDATE runs SET deleted_at = NULL WHERE schedule_id = ? AND deleted_at = ?",
+                (payload.id, deleted_at),
+            ).rowcount
+            restored_tasks = conn.execute(
+                "UPDATE tasks SET deleted_at = NULL WHERE schedule_id = ? AND deleted_at = ?",
+                (payload.id, deleted_at),
+            ).rowcount
+        elif payload.kind == "run":
+            conn.execute("UPDATE runs SET deleted_at = NULL WHERE id = ?", (payload.id,))
+            restored_tasks = conn.execute(
+                "UPDATE tasks SET deleted_at = NULL WHERE run_id = ? AND deleted_at = ?",
+                (payload.id, deleted_at),
+            ).rowcount
+        else:
+            conn.execute(f"UPDATE {table} SET deleted_at = NULL WHERE id = ?", (payload.id,))
+        db.log(
+            conn,
+            f"삭제 보관함 복원: {ARCHIVE_RESTORE_LABELS[payload.kind]} #{payload.id}"
+            + (f" (실행 기록 {restored_runs}개 · 발신 작업 {restored_tasks}건)" if restored_runs or restored_tasks else ""),
+        )
+    return {
+        "ok": True,
+        "kind": payload.kind,
+        "id": payload.id,
+        "restored": 1,
+        "restored_runs": restored_runs,
+        "restored_tasks": restored_tasks,
+    }
 
 
 @api.get("/settings")
@@ -1882,19 +2297,85 @@ def telegram_test(payload: TelegramTest | None = None, conn: sqlite3.Connection 
 
 
 @api.get("/logs")
-def list_logs(limit: int = Query(default=100, ge=1, le=500), conn: sqlite3.Connection = Depends(get_conn)):
-    rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+def list_logs(
+    q: Optional[str] = Query(default=None, max_length=200),
+    level: Optional[str] = Query(default=None, max_length=20),
+    category: Optional[str] = Query(default=None, max_length=20),
+    start: Optional[str] = Query(default=None, max_length=40),
+    end: Optional[str] = Query(default=None, max_length=40),
+    all: bool = False,
+    limit: int = Query(default=200, ge=0, le=5000),
+    offset: int = Query(default=0, ge=0),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """서버 활동 로그. 검색어·분류·레벨·시간 범위로 걸러 보고 전체/나눠서 볼 수 있다.
+
+    - q        : 메시지·분류·레벨에서 대소문자 구분 없이 부분 일치 검색
+    - level    : info / warning / error
+    - category : device / schedule / run / queue / sms / telegram / settings / system
+    - start/end: ISO8601 · KST · 날짜만(종료는 그날 23:59:59까지)
+    - all=true 또는 limit=0 : 조건에 맞는 로그를 한 번에(안전 상한 LOG_ALL_LIMIT)
+    """
+    if category and category not in db.LOG_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"알 수 없는 분류입니다: {category} ({', '.join(db.LOG_CATEGORIES)} 중 하나)",
+        )
+
+    clauses: list[str] = []
+    values: list = []
+    search, search_values = _search_clause(["message", "category", "level"], q)
+    if search:
+        clauses.append(search)
+        values.extend(search_values)
+    if level:
+        clauses.append("LOWER(level) = ?")
+        values.append(level.strip().lower())
+    if category:
+        clauses.append("category = ?")
+        values.append(category)
+    time_clauses, time_values = _time_range_clauses("created_at", start, end)
+    clauses.extend(time_clauses)
+    values.extend(time_values)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    total = int(conn.execute(f"SELECT COUNT(*) AS c FROM logs{where}", values).fetchone()["c"] or 0)
+    capped = bool(all or limit == 0)
+    truncated = False
+    if capped:
+        rows = conn.execute(
+            f"SELECT * FROM logs{where} ORDER BY id DESC LIMIT ? OFFSET ?", values + [LOG_ALL_LIMIT, offset]
+        ).fetchall()
+        truncated = total - offset > len(rows)
+    else:
+        rows = conn.execute(
+            f"SELECT * FROM logs{where} ORDER BY id DESC LIMIT ? OFFSET ?", values + [limit, offset]
+        ).fetchall()
+
+    items = [
+        {
+            "id": row["id"],
+            "level": row["level"],
+            "category": _row_value(row, "category", "") or "",
+            "category_label": db.LOG_CATEGORIES.get(_row_value(row, "category", "") or "", "기타"),
+            "message": row["message"],
+            "created_at": row["created_at"],
+            "created_at_text": local_str(row["created_at"], "%m-%d %H:%M:%S"),
+            "created_at_full": local_str(row["created_at"], "%Y-%m-%d %H:%M:%S"),
+        }
+        for row in rows
+    ]
     return {
-        "logs": [
-            {
-                "id": row["id"],
-                "level": row["level"],
-                "message": row["message"],
-                "created_at": row["created_at"],
-                "created_at_text": local_str(row["created_at"], "%m-%d %H:%M:%S"),
-            }
-            for row in rows
-        ]
+        "logs": items,
+        "count": len(items),
+        "total": total,
+        "offset": offset,
+        "limit": None if capped else limit,
+        "all": capped,
+        "has_more": offset + len(items) < total,
+        "truncated": truncated,
+        "categories": db.LOG_CATEGORIES,
+        "server_time": iso(now()),
     }
 
 

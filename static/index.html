@@ -248,6 +248,7 @@
     <button class="tab" data-tab="schedules">발신 스케줄<span class="count" id="tabScheduleCount"></span></button>
     <button class="tab" data-tab="tasks">대기열·로그</button>
     <button class="tab" data-tab="sms">수신 문자<span class="count" id="tabSmsCount"></span></button>
+    <button class="tab" data-tab="archive">🗑️ 삭제 보관함<span class="count" id="tabArchiveCount"></span></button>
     <button class="tab" data-tab="telegram">텔레그램</button>
   </nav>
 
@@ -273,8 +274,68 @@
     </div>
 
     <div class="card" style="margin-top:18px">
-      <div class="card-head"><div><h2>서버 활동 로그</h2><div class="sub">기기 등록 · 스케줄 · 문자 수신 이력</div></div></div>
-      <div class="card-body" id="dashLogs" style="max-height:320px;overflow:auto"></div>
+      <div class="card-head">
+        <div><h2>서버 활동 로그</h2><div class="sub" id="logSummary">기기 등록 · 스케줄 · 문자 수신 이력 · 불러오는 중…</div></div>
+        <div class="filters">
+          <button class="btn sm" onclick="loadLogs(true)">새로고침</button>
+        </div>
+      </div>
+      <div class="card-body" style="padding:14px 18px;border-bottom:1px solid var(--line)">
+        <div class="form-grid" style="gap:12px">
+          <div class="field">
+            <label>검색어 <span class="hint">메시지·분류·레벨에서 찾기</span></label>
+            <input type="text" id="logQuery" placeholder="예: 스케줄, 수신 문자, DEV-01" maxlength="200"
+                   oninput="markLogDirty()" onkeydown="if(event.key==='Enter'){event.preventDefault();applyLogFilters();}">
+          </div>
+          <div class="field">
+            <label>분류 · 레벨</label>
+            <div style="display:flex;gap:8px">
+              <select id="logCategory" onchange="applyLogFilters()" style="flex:1">
+                <option value="">전체 분류</option>
+                <option value="device">기기</option>
+                <option value="schedule">스케줄</option>
+                <option value="run">실행 기록</option>
+                <option value="queue">대기열</option>
+                <option value="sms">수신 문자</option>
+                <option value="telegram">텔레그램</option>
+                <option value="settings">설정</option>
+                <option value="system">시스템</option>
+              </select>
+              <select id="logLevel" onchange="applyLogFilters()" style="flex:1">
+                <option value="">전체 레벨</option>
+                <option value="info">정보</option>
+                <option value="warning">주의</option>
+                <option value="error">오류</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label>시작 시간 <span class="hint">비우면 처음부터</span></label>
+            <input type="datetime-local" id="logStart" onchange="applyLogFilters()">
+          </div>
+          <div class="field">
+            <label>종료 시간 <span class="hint">비우면 지금까지</span></label>
+            <input type="datetime-local" id="logEnd" onchange="applyLogFilters()">
+          </div>
+        </div>
+        <div class="filters" style="margin-top:12px">
+          <button class="chip active" id="logQuickAll" onclick="setLogRange('all')">전체 기간</button>
+          <button class="chip" id="logQuickHour" onclick="setLogRange('hour')">최근 1시간</button>
+          <button class="chip" id="logQuickToday" onclick="setLogRange('today')">오늘</button>
+          <button class="chip" id="logQuickDay" onclick="setLogRange('yesterday')">어제</button>
+          <button class="chip" id="logQuickWeek" onclick="setLogRange('week')">최근 7일</button>
+          <span class="spacer"></span>
+          <button class="btn sm primary" onclick="applyLogFilters()">검색</button>
+          <button class="btn sm" onclick="resetLogFilters()">초기화</button>
+        </div>
+      </div>
+      <div class="card-body" id="dashLogs" style="max-height:420px;overflow:auto;padding:8px 18px"></div>
+      <div class="card-body" style="padding:10px 18px;border-top:1px solid var(--line);display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span class="muted" id="logCountLabel" style="font-size:12px"></span>
+        <span class="spacer"></span>
+        <button class="btn sm" id="logMoreBtn" onclick="loadMoreLogs()">더 보기</button>
+        <button class="btn sm" id="logAllBtn" onclick="loadAllLogs()">전체 보기</button>
+      </div>
     </div>
   </section>
 
@@ -552,6 +613,47 @@
     </div>
   </section>
 
+  <!-- ================= 삭제 보관함 ================= -->
+  <section class="tabpane" id="pane-archive">
+    <div class="card">
+      <div class="card-head">
+        <div><h2>🗑️ 삭제 보관함</h2><div class="sub">웹에서 삭제한 스케줄·수신 문자·실행 기록·발신 작업을 서버에서 계속 보관합니다. 필요하면 복원할 수 있습니다.</div></div>
+        <button class="btn sm" onclick="loadArchive(true)">새로고침</button>
+      </div>
+      <div class="card-body" style="padding:12px 18px;border-bottom:1px solid var(--line)">
+        <div class="filters">
+          <button class="chip active" data-archkind="all" onclick="setArchiveKind(this,'all')">전체<span class="muted" id="archCountAll"></span></button>
+          <button class="chip" data-archkind="schedules" onclick="setArchiveKind(this,'schedules')">스케줄<span class="muted" id="archCountSchedules"></span></button>
+          <button class="chip" data-archkind="sms" onclick="setArchiveKind(this,'sms')">수신 문자<span class="muted" id="archCountSms"></span></button>
+          <button class="chip" data-archkind="runs" onclick="setArchiveKind(this,'runs')">실행 기록<span class="muted" id="archCountRuns"></span></button>
+          <button class="chip" data-archkind="tasks" onclick="setArchiveKind(this,'tasks')">발신 작업<span class="muted" id="archCountTasks"></span></button>
+        </div>
+        <div class="filters" style="margin-top:12px">
+          <input type="text" id="archQuery" placeholder="검색어 (이름 · 번호 · 문자 내용)" maxlength="200"
+                 style="flex:1;min-width:180px;max-width:340px;padding:8px 11px;border:1px solid var(--line-strong);border-radius:9px;font-family:inherit;font-size:13px"
+                 oninput="markArchiveDirty()" onkeydown="if(event.key==='Enter'){event.preventDefault();applyArchiveFilters();}">
+          <input type="datetime-local" id="archStart" title="기간 시작" onchange="applyArchiveFilters()"
+                 style="padding:8px 11px;border:1px solid var(--line-strong);border-radius:9px;font-family:inherit;font-size:13px">
+          <span class="muted">~</span>
+          <input type="datetime-local" id="archEnd" title="기간 끝" onchange="applyArchiveFilters()"
+                 style="padding:8px 11px;border:1px solid var(--line-strong);border-radius:9px;font-family:inherit;font-size:13px">
+          <button class="btn sm primary" onclick="applyArchiveFilters()">조회</button>
+          <button class="btn sm" onclick="resetArchiveFilters()">초기화</button>
+        </div>
+        <div class="hint-line" id="archiveSummary">불러오는 중…</div>
+      </div>
+      <div class="table-wrap"><table id="archiveTable">
+        <thead><tr><th style="width:88px">유형</th><th>항목</th><th>상세</th><th>시각</th><th>삭제 시각</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div class="card-body" style="padding:10px 18px;border-top:1px solid var(--line);display:flex;align-items:center;gap:8px">
+        <span class="muted" id="archiveCountLabel" style="font-size:12px"></span>
+        <span class="spacer"></span>
+        <button class="btn sm" id="archiveMoreBtn" onclick="loadMoreArchive()">더 보기</button>
+      </div>
+    </div>
+  </section>
+
   <!-- ================= 텔레그램 ================= -->
   <section class="tabpane" id="pane-telegram">
     <div class="grid2">
@@ -611,6 +713,34 @@
   </div>
 </div>
 
+<div class="modal" id="deviceModal">
+  <div class="box">
+    <h3>기기 정보 편집</h3>
+    <p id="deviceModalSub">이름·번호·메모를 고치면 앱이 다시 접속해도 그대로 유지됩니다.</p>
+    <div class="form-grid one">
+      <div class="field">
+        <label>기기명</label>
+        <input type="text" id="devEditName" placeholder="예: 사무실폰" maxlength="80">
+      </div>
+      <div class="field">
+        <label>수신 번호 <span class="hint">이 폰이 문자를 받는 번호</span></label>
+        <input type="tel" id="devEditPhone" placeholder="예: 010-1234-5678" maxlength="30">
+      </div>
+      <div class="field">
+        <label>메모</label>
+        <input type="text" id="devEditNote" placeholder="예: 유심 2번, 충전기 연결됨" maxlength="400">
+      </div>
+      <div class="field">
+        <label class="switch"><input type="checkbox" id="devEditEnabled"> 이 기기 사용(새 작업 배정)</label>
+      </div>
+    </div>
+    <div class="btn-row" style="margin-top:18px;justify-content:flex-end">
+      <button class="btn" onclick="closeDeviceEdit()">취소</button>
+      <button class="btn primary" id="devEditSaveBtn" onclick="saveDeviceEdit()">저장</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal lightbox" id="smsPhotoModal">
   <div class="box">
     <div class="lightbox-head">
@@ -645,7 +775,11 @@ const state = {
   timer: null,
   clockTimer: null,
   editingScheduleId: null,
-  devicePhoneEditing: null,
+  editingDeviceId: null,
+  // 서버 활동 로그(검색·기간·분류·전체 보기)
+  logs: { q: "", level: "", category: "", start: "", end: "", limit: 20, offset: 0, all: false, dirty: false, total: 0, count: 0, items: [], truncated: false },
+  // 삭제 보관함
+  archive: { kind: "all", q: "", start: "", end: "", limit: 100, offset: 0, dirty: false, total: 0, items: [], counts: {}, signature: "" },
   totalCallsAuto: true,
   // 발신 기기 여러 대 선택(스케줄 폼)
   schedDeviceIds: new Set(),
@@ -740,8 +874,6 @@ document.querySelectorAll(".tab").forEach((button) => {
 
 function switchTab(tab) {
   state.tab = tab;
-  // 다른 탭으로 이동하면 기기 수신 번호 입력 상태를 끝낸다(돌아왔을 때 최신 목록을 그린다).
-  if (tab !== "devices") state.devicePhoneEditing = null;
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   document.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + tab));
   location.hash = tab;
@@ -754,6 +886,7 @@ function loadTab() {
   else if (state.tab === "schedules") { loadSchedules(); loadDevices(); }
   else if (state.tab === "tasks") { loadTasks(); loadRuns(); }
   else if (state.tab === "sms") loadSms();
+  else if (state.tab === "archive") loadArchive();
   else if (state.tab === "telegram") loadTelegram();
 }
 
@@ -813,17 +946,132 @@ async function loadDashboard() {
           </li>`).join("")}</ul>`
       : `<div class="empty"><div class="big">🗓️</div>예정된 스케줄이 없습니다.</div>`;
 
-    const logs = await api("/api/logs?limit=12");
-    $("dashLogs").innerHTML = logs.logs.length
-      ? logs.logs.map((log) => `
-        <div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px">
-          <span class="mono muted nowrap">${esc(log.created_at_text)}</span>
-          <span style="color:${log.level === "warning" ? "var(--warn)" : "var(--text)"}">${esc(log.message)}</span>
-        </div>`).join("")
-      : `<div class="empty">로그가 없습니다.</div>`;
+    await loadLogs();
+    refreshArchiveBadge();
   } catch (e) {
     toast(e.message, "err");
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 서버 활동 로그 (검색 · 기간 · 분류 · 전체 보기)                    */
+/* ------------------------------------------------------------------ */
+const LOG_LEVEL_LABEL = { info: ["정보", "b-info"], warning: ["주의", "b-warn"], error: ["오류", "b-danger"] };
+
+function markLogDirty() { state.logs.dirty = true; }
+
+function toLocalInputValue(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function logQueryString() {
+  const f = state.logs;
+  const params = new URLSearchParams();
+  params.set("offset", String(f.offset));
+  if (f.q) params.set("q", f.q);
+  if (f.level) params.set("level", f.level);
+  if (f.category) params.set("category", f.category);
+  if (f.start) params.set("start", f.start);
+  if (f.end) params.set("end", f.end);
+  if (f.all) params.set("all", "true");
+  else params.set("limit", String(f.limit));
+  return params.toString();
+}
+
+async function loadLogs(force = false) {
+  const f = state.logs;
+  // 검색어를 입력하는 중에는 5초 자동 갱신이 값을 덮어쓰지 않도록 건너뛴다.
+  if (!force && f.dirty) return;
+  if (force) f.dirty = false;
+  try {
+    const data = await api("/api/logs?" + logQueryString());
+    f.items = data.logs || [];
+    f.total = data.total || 0;
+    f.count = data.count || f.items.length;
+    f.truncated = Boolean(data.truncated);
+    renderLogs();
+  } catch (e) {
+    $("dashLogs").innerHTML = `<div class="empty">로그를 불러오지 못했습니다: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderLogs() {
+  const f = state.logs;
+  const shown = f.offset + f.items.length;
+  $("logSummary").textContent = f.q || f.level || f.category || f.start || f.end
+    ? `검색 결과 ${f.total}건${f.all ? " · 전체 표시" : ""}`
+    : `기기 등록 · 스케줄 · 문자 수신 이력 · 전체 ${f.total}건`;
+  const parts = [`총 ${f.total}건 중 ${shown}건 표시`];
+  if (f.truncated || (f.total > shown && f.all)) parts.push("너무 많아 일부만 표시했습니다.");
+  else if (f.total > shown) parts.push("‘더 보기’로 이어서 볼 수 있습니다.");
+  $("logCountLabel").textContent = parts.join(" · ");
+  $("logMoreBtn").style.display = !f.all && f.total > shown ? "" : "none";
+  $("logAllBtn").style.display = !f.all && f.total > shown ? "" : "none";
+
+  $("dashLogs").innerHTML = f.items.length
+    ? f.items.map((log) => {
+        const level = LOG_LEVEL_LABEL[log.level] || [log.level, "b-gray"];
+        return `<div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px;align-items:flex-start">
+          <span class="mono muted nowrap" title="${esc(log.created_at_full || log.created_at || "")}">${esc(log.created_at_text)}</span>
+          <span class="nowrap">${badge(log.category_label || log.category || "기타", "b-gray")}</span>
+          ${log.level !== "info" ? `<span class="nowrap">${badge(level[0], level[1])}</span>` : ""}
+          <span style="color:${log.level === "warning" ? "var(--warn)" : (log.level === "error" ? "var(--danger)" : "var(--text)")};word-break:break-word">${esc(log.message)}</span>
+        </div>`;
+      }).join("")
+    : `<div class="empty"><div class="big">🔍</div>조건에 맞는 로그가 없습니다.</div>`;
+}
+
+function applyLogFilters() {
+  const f = state.logs;
+  f.q = ($("logQuery").value || "").trim();
+  f.category = $("logCategory").value || "";
+  f.level = $("logLevel").value || "";
+  f.start = $("logStart").value || "";
+  f.end = $("logEnd").value || "";
+  f.offset = 0;
+  f.all = false;
+  f.dirty = false;
+  loadLogs(true);
+}
+
+function setLogRange(kind) {
+  const nowDate = new Date();
+  let start = null;
+  let end = null;
+  if (kind === "hour") { start = new Date(nowDate.getTime() - 3600 * 1000); end = nowDate; }
+  else if (kind === "today") { start = new Date(nowDate); start.setHours(0, 0, 0, 0); end = nowDate; }
+  else if (kind === "yesterday") {
+    start = new Date(nowDate); start.setDate(start.getDate() - 1); start.setHours(0, 0, 0, 0);
+    end = new Date(start); end.setHours(23, 59, 0, 0);
+  }
+  else if (kind === "week") { start = new Date(nowDate.getTime() - 7 * 86400 * 1000); end = nowDate; }
+  $("logStart").value = start ? toLocalInputValue(start) : "";
+  $("logEnd").value = end ? toLocalInputValue(end) : "";
+  const chips = { all: "logQuickAll", hour: "logQuickHour", today: "logQuickToday", yesterday: "logQuickDay", week: "logQuickWeek" };
+  Object.entries(chips).forEach(([key, id]) => { const el = $(id); if (el) el.classList.toggle("active", key === kind); });
+  applyLogFilters();
+}
+
+function resetLogFilters() {
+  ["logQuery", "logCategory", "logLevel", "logStart", "logEnd"].forEach((id) => { $(id).value = ""; });
+  state.logs.limit = 20;
+  state.logs.offset = 0;
+  state.logs.all = false;
+  setLogRange("all");
+}
+
+function loadMoreLogs() {
+  const f = state.logs;
+  f.limit += 100;
+  f.all = false;
+  loadLogs(true);
+}
+
+function loadAllLogs() {
+  state.logs.all = true;
+  state.logs.offset = 0;
+  loadLogs(true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -839,19 +1087,16 @@ async function loadDevices() {
 
     renderScheduleDevicePicker();
 
-    // 수신 번호를 입력하는 중에는 5초 자동 갱신이 표를 다시 그려 입력값을 지우지 않게 한다.
-    if (!state.devicePhoneEditing) {
-      $("devicesTable").querySelector("tbody").innerHTML = data.devices.length ? data.devices.map((d) => `
+    $("devicesTable").querySelector("tbody").innerHTML = data.devices.length ? data.devices.map((d) => `
         <tr style="${d.enabled ? "" : "opacity:.62"}">
           <td>${d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray")}${d.enabled ? "" : " " + badge("중지됨", "b-warn")}</td>
-          <td><b>${esc(d.name)}</b><div class="muted mono">${esc(d.id)}</div>${d.note ? `<div class="muted" style="font-size:11.5px">${esc(d.note)}</div>` : ""}</td>
-          <td class="nowrap" data-phone="${esc(d.phone_number || "")}"><span class="mono">${d.phone_number ? esc(d.phone_number) : '<span class="muted">미설정</span>'}</span> <button class="btn sm" title="이 폰이 문자를 받는 번호를 입력합니다" onclick="editDevicePhone(this, '${esc(d.id)}')">${d.phone_number ? "수정" : "입력"}</button></td>
+          <td><b>${esc(d.name)}</b>${d.name_customized ? ' <span class="muted" style="font-size:11px">(직접 지정)</span>' : ""}<div class="muted mono">${esc(d.id)}</div>${d.note ? `<div class="muted" style="font-size:11.5px">📝 ${esc(d.note)}</div>` : ""}</td>
+          <td class="nowrap"><span class="mono">${d.phone_number ? esc(d.phone_number) : '<span class="muted">미설정</span>'}</span></td>
           <td class="muted">${esc(d.model || "-")}<div style="font-size:11.5px">${d.android_version ? "Android " + esc(d.android_version) : ""}</div></td>
           <td>${d.battery === null || d.battery === undefined ? '<span class="muted">-</span>' : `${d.battery}%`}</td>
           <td class="muted nowrap">${esc(d.last_seen_text)}</td>
-          <td class="nowrap"><button class="btn sm" onclick="toggleDevice('${esc(d.id)}', ${d.enabled ? "false" : "true"})">${d.enabled ? "사용 중지" : "사용"}</button> <button class="btn sm danger" onclick="deleteDevice('${esc(d.id)}')">삭제</button></td>
+          <td class="nowrap"><div class="cell-actions"><button class="btn sm" onclick="openDeviceEdit('${esc(d.id)}')">편집</button> <button class="btn sm" onclick="toggleDevice('${esc(d.id)}', ${d.enabled ? "false" : "true"})">${d.enabled ? "사용 중지" : "사용"}</button> <button class="btn sm danger" onclick="deleteDevice('${esc(d.id)}')">삭제</button></div></td>
         </tr>`).join("") : emptyRow(7, "등록된 기기가 없습니다. 앱에서 서비스 시작을 누르면 자동 등록됩니다.", "📵");
-    }
 
     if (state.tab === "devices") loadRemoteSettings();
   } catch (e) { toast(e.message, "err"); }
@@ -930,40 +1175,51 @@ async function addDevice() {
   } catch (e) { toast(e.message, "err"); }
 }
 
-/* 등록된 기기의 수신 번호를 표 안에서 바로 입력·수정한다. */
-function editDevicePhone(btn, id) {
-  const cell = btn.closest("td");
-  if (!cell || cell.dataset.editing === "1") return;
-  const current = cell.dataset.phone || "";
-  cell.dataset.editing = "1";
-  state.devicePhoneEditing = String(id);
-  cell.innerHTML = `<span class="mono"><input type="tel" class="phone-input" value="${esc(current)}" placeholder="010-0000-0000" maxlength="30" style="width:132px"></span> <button class="btn sm primary" onclick="saveDevicePhone(this, '${esc(id)}')">저장</button> <button class="btn sm" onclick="cancelDevicePhone()">취소</button>`;
-  const input = cell.querySelector("input");
-  if (input) {
-    input.focus();
-    input.select();
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") saveDevicePhone(input, id);
-      if (event.key === "Escape") cancelDevicePhone();
-    });
-  }
+/* 등록된 기기 정보(이름·번호·메모·사용 여부)를 모달에서 편집한다. */
+function openDeviceEdit(id) {
+  const device = (state.devices || []).find((d) => String(d.id) === String(id));
+  if (!device) { toast("기기 정보를 찾을 수 없습니다.", "err"); return; }
+  state.editingDeviceId = device.id;
+  $("devEditName").value = device.name || "";
+  $("devEditPhone").value = device.phone_number || "";
+  $("devEditNote").value = device.note || "";
+  $("devEditEnabled").checked = Boolean(device.enabled);
+  $("deviceModalSub").textContent = `기기 ID ${device.id} · 여기서 고친 이름·번호는 앱이 다시 접속해도 유지됩니다.`;
+  $("deviceModal").classList.add("show");
+  $("devEditName").focus();
 }
 
-function cancelDevicePhone() {
-  state.devicePhoneEditing = null;
-  loadDevices();
+function closeDeviceEdit() {
+  state.editingDeviceId = null;
+  $("deviceModal").classList.remove("show");
 }
 
-async function saveDevicePhone(el, id) {
-  const cell = el.closest("td");
-  const input = cell ? cell.querySelector("input") : null;
-  const value = (input ? input.value : "").trim();
+async function saveDeviceEdit() {
+  const id = state.editingDeviceId;
+  if (!id) return;
+  const name = $("devEditName").value.trim();
+  const phone = $("devEditPhone").value.trim();
+  if (!name) { toast("기기명을 입력하세요.", "err"); return; }
+  const button = $("devEditSaveBtn");
+  button.disabled = true;
   try {
-    await api(`/api/devices/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ phone_number: value }) });
-    toast(value ? `기기 ${id} 의 수신 번호를 ${value} 로 저장했습니다.` : `기기 ${id} 의 수신 번호를 비웠습니다.`, "ok");
-  } catch (e) { toast(e.message, "err"); }
-  state.devicePhoneEditing = null;
-  loadDevices();
+    await api(`/api/devices/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        name,
+        phone_number: phone,
+        note: $("devEditNote").value.trim(),
+        enabled: $("devEditEnabled").checked,
+      }),
+    });
+    toast(`기기 ${name} 정보를 저장했습니다.`, "ok");
+    closeDeviceEdit();
+    loadDevices();
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function deleteDevice(id) {
@@ -1374,7 +1630,7 @@ function updateScheduleToolbar() {
   const hint = $("scheduleDeleteHint");
   if (hint) {
     hint.textContent = selected
-      ? `${selected}개 선택됨 · 삭제하면 스케줄과 실행 기록이 함께 사라집니다.`
+      ? `${selected}개 선택됨 · 삭제하면 웹 목록에서 숨겨지고 [삭제 보관함]에서 다시 찾아볼 수 있습니다.`
       : "스케줄을 선택해 삭제하거나, 이미 실행이 끝나 다시 예약되지 않는 스케줄만 모아서 지울 수 있습니다.";
   }
 }
@@ -1383,7 +1639,7 @@ function scheduleDeleteMessage(result) {
   const parts = [`스케줄 ${result.deleted}개를 삭제했습니다.`];
   if (result.deleted_runs) parts.push(`실행 기록 ${result.deleted_runs}개`);
   if (result.deleted_tasks) parts.push(`발신 작업 ${result.deleted_tasks}건`);
-  return parts.join(" ");
+  return parts.join(" ") + " 삭제 보관함에서 복원할 수 있습니다.";
 }
 
 async function copySchedule(id) {
@@ -1432,9 +1688,9 @@ async function deleteSchedule(id) {
   const schedule = (state.schedules || []).find((item) => item.id === id);
   const label = schedule ? `'${schedule.name}' (#${id})` : `#${id}`;
   const lines = [`스케줄 ${label}을(를) 삭제할까요?`];
-  if (schedule && schedule.next_run_at) lines.push("예약된 다음 발신과 대기 중인 작업도 함께 취소·삭제됩니다.");
-  if (schedule && isExecutedSchedule(schedule)) lines.push("이미 실행된 기록(실행 묶음·발신 작업)도 함께 사라집니다.");
-  lines.push("삭제한 뒤에는 되돌릴 수 없습니다.");
+  if (schedule && schedule.next_run_at) lines.push("예약된 다음 발신과 대기 중인 작업도 함께 취소됩니다.");
+  if (schedule && isExecutedSchedule(schedule)) lines.push("이미 실행된 기록(실행 묶음·발신 작업)도 함께 보관함으로 옮겨집니다.");
+  lines.push("웹 목록에서는 숨겨지며, 서버 [삭제 보관함]에서 나중에 다시 찾아볼 수 있습니다.");
   if (!confirm(lines.join("\n"))) return;
   try {
     const result = await api(`/api/schedules/${id}`, { method: "DELETE" });
@@ -1451,7 +1707,7 @@ async function deleteSelectedSchedules() {
   if (!ids.length) { toast("삭제할 스케줄을 선택하세요.", "err"); return; }
   const names = (state.schedules || []).filter((s) => ids.includes(s.id)).map((s) => `· ${s.name} (#${s.id})`);
   const more = names.length > 10 ? `\n외 ${names.length - 10}개` : "";
-  if (!confirm(`선택한 스케줄 ${ids.length}개를 삭제할까요?\n${names.slice(0, 10).join("\n")}${more}\n\n실행 기록·발신 작업 기록도 함께 삭제되며 되돌릴 수 없습니다.`)) return;
+  if (!confirm(`선택한 스케줄 ${ids.length}개를 삭제할까요?\n${names.slice(0, 10).join("\n")}${more}\n\n실행 기록·발신 작업도 함께 보관함으로 옮겨집니다. 웹 목록에서는 숨겨지며 삭제 보관함에서 복원할 수 있습니다.`)) return;
   try {
     const result = await api("/api/schedules/delete", { method: "POST", body: JSON.stringify({ ids }) });
     state.selectedSchedules.clear();
@@ -1467,7 +1723,7 @@ async function deleteExecutedSchedules() {
   if (!executed.length) { toast("실행했던 스케줄이 없습니다."); return; }
   const names = executed.map((s) => `· ${s.name} (#${s.id} · ${s.run_count || 0}회 실행)`);
   const more = names.length > 10 ? `\n외 ${names.length - 10}개` : "";
-  if (!confirm(`이미 실행이 끝나 다시 예약되지 않는 스케줄 ${executed.length}개를 삭제할까요?\n${names.slice(0, 10).join("\n")}${more}\n\n계속 예약되는 활성·일시정지 스케줄은 그대로 두며, 삭제한 기록은 되돌릴 수 없습니다.`)) return;
+  if (!confirm(`이미 실행이 끝나 다시 예약되지 않는 스케줄 ${executed.length}개를 삭제할까요?\n${names.slice(0, 10).join("\n")}${more}\n\n계속 예약되는 활성·일시정지 스케줄은 그대로 두며, 삭제한 항목은 보관함에서 복원할 수 있습니다.`)) return;
   try {
     const result = await api("/api/schedules/delete", { method: "POST", body: JSON.stringify({ executed_only: true }) });
     if (result.deleted_ids && result.deleted_ids.includes(state.editingScheduleId)) resetScheduleForm();
@@ -1529,17 +1785,18 @@ function updateQueueToolbar() {
   const hint = $("queueDeleteHint");
   if (hint) {
     hint.textContent = count
-      ? `${count}건 선택됨 · 삭제하면 목록에서 완전히 지워집니다.`
-      : "원하는 작업을 선택해 목록에서 삭제할 수 있습니다.";
+      ? `${count}건 선택됨 · 삭제하면 웹 목록에서 숨겨지고 [삭제 보관함]으로 옮겨집니다.`
+      : "원하는 작업을 선택해 목록에서 숨길 수 있습니다. 삭제한 작업은 보관함에서 다시 볼 수 있습니다.";
   }
 }
 
 function deleteResultMessage(result) {
   const parts = [];
-  if (result.deleted_count) parts.push(`${result.deleted_count}건을 대기열에서 삭제했습니다.`);
+  if (result.deleted_count) parts.push(`${result.deleted_count}건을 보관함으로 옮겼습니다.`);
   if (result.canceled_count) parts.push(`발신 중이던 ${result.canceled_count}건은 취소로 바꿨습니다.`);
   if (result.protected_ids && result.protected_ids.length) parts.push(`완료·취소된 ${result.protected_ids.length}건은 기록으로 남겼습니다.`);
-  return parts.join(" ") || "삭제할 작업이 없습니다.";
+  const message = parts.join(" ") || "삭제할 작업이 없습니다.";
+  return result.deleted_count ? message + " 삭제 보관함에서 복원할 수 있습니다." : message;
 }
 
 function refreshQueue() {
@@ -1549,7 +1806,7 @@ function refreshQueue() {
 }
 
 async function deleteTask(id) {
-  if (!confirm(`작업 #${id} 를 대기열에서 삭제할까요?\n폰이 아직 가져가지 않았다면 발신되지 않습니다.`)) return;
+  if (!confirm(`작업 #${id} 를 대기열에서 삭제할까요?\n폰이 아직 가져가지 않았다면 발신되지 않으며, 웹 목록에서 숨겨져 [삭제 보관함]에서 다시 찾아볼 수 있습니다.`)) return;
   try {
     const result = await api(`/api/tasks/${id}`, { method: "DELETE" });
     state.selectedTasks.delete(Number(id));
@@ -1561,7 +1818,7 @@ async function deleteTask(id) {
 async function deleteSelectedTasks() {
   const ids = Array.from(state.selectedTasks);
   if (!ids.length) { toast("삭제할 작업을 선택하세요.", "err"); return; }
-  if (!confirm(`선택한 작업 ${ids.length}건을 대기열에서 삭제할까요?\n발신 중인 작업은 취소 표시됩니다.`)) return;
+  if (!confirm(`선택한 작업 ${ids.length}건을 대기열에서 삭제할까요?\n발신 중인 작업은 취소 표시되며, 나머지는 웹 목록에서 숨겨져 삭제 보관함으로 옮겨집니다.`)) return;
   try {
     const result = await api("/api/tasks/bulk-delete", {
       method: "POST",
@@ -1581,7 +1838,7 @@ async function deleteAllPendingTasks() {
     const data = await api("/api/tasks?limit=1000");
     const items = data.tasks || [];
     if (!items.length) { toast("대기열 목록에 남은 작업이 없습니다."); return; }
-    if (!confirm(`목록에 있는 작업 ${items.length}건을 모두 삭제할까요?\n발신 중인 작업은 취소 표시되며, 나머지 항목은 목록에서 완전히 지워집니다.`)) return;
+    if (!confirm(`목록에 있는 작업 ${items.length}건을 모두 삭제할까요?\n발신 중인 작업은 취소 표시되며, 나머지는 삭제 보관함으로 옮겨집니다.`)) return;
     const result = await api("/api/tasks/bulk-delete", {
       method: "POST",
       body: JSON.stringify({ all_tasks: true }),
@@ -1644,7 +1901,7 @@ async function loadRuns() {
 }
 
 async function deleteRun(id) {
-  if (!confirm(`실행 묶음 #${id}과 그 안의 발신 작업 기록을 삭제할까요?\n스케줄 자체는 그대로 남고, 되돌릴 수 없습니다.`)) return;
+  if (!confirm(`실행 묶음 #${id}과 그 안의 발신 작업 기록을 삭제할까요?\n스케줄 자체는 그대로 남고, 삭제한 기록은 [삭제 보관함]에서 다시 찾아볼 수 있습니다.`)) return;
   try {
     const result = await api(`/api/runs/${id}`, { method: "DELETE" });
     toast(`실행 기록 1개와 발신 작업 ${result.deleted_tasks}건을 삭제했습니다.`, "ok");
@@ -1654,7 +1911,7 @@ async function deleteRun(id) {
 }
 
 async function deleteFinishedRuns() {
-  if (!confirm("완료·실패·취소로 끝난 실행 기록을 모두 삭제할까요?\n대기·진행 중인 묶음은 그대로 두며, 삭제한 기록은 되돌릴 수 없습니다.")) return;
+  if (!confirm("완료·실패·취소로 끝난 실행 기록을 모두 삭제할까요?\n대기·진행 중인 묶음은 그대로 두며, 삭제한 기록은 삭제 보관함에서 다시 찾아볼 수 있습니다.")) return;
   try {
     const result = await api("/api/runs/delete", { method: "POST", body: JSON.stringify({ all_finished: true }) });
     toast(`끝난 실행 기록 ${result.deleted}개와 발신 작업 ${result.deleted_tasks}건을 삭제했습니다.`, "ok");
@@ -1721,8 +1978,8 @@ function attachmentPreview(m) {
   return html;
 }
 
-async function hydrateSmsThumbs() {
-  const images = Array.from(document.querySelectorAll("#smsTable img.sms-thumb[data-att-url]"))
+async function hydrateSmsThumbs(rootSelector = "#smsTable") {
+  const images = Array.from(document.querySelectorAll(`${rootSelector} img.sms-thumb[data-att-url]`))
     .filter((img) => img.dataset.loaded !== "1");
   // 한 번에 너무 많은 요청을 보내지 않도록 6개씩 나눠 병렬로 받아온다.
   for (let i = 0; i < images.length; i += 6) {
@@ -1810,8 +2067,8 @@ function updateSmsToolbar() {
   const hint = $("smsDeleteHint");
   if (hint) {
     hint.textContent = count
-      ? `${count}건 선택됨 · 삭제하면 목록과 MMS 사진이 서버에서 지워집니다.`
-      : "문자를 선택해 삭제할 수 있습니다. 사진은 눌러서 크게 볼 수 있습니다.";
+      ? `${count}건 선택됨 · 삭제하면 목록에서 숨겨지고 사진은 [삭제 보관함]에서 다시 볼 수 있습니다.`
+      : "문자를 선택해 삭제할 수 있습니다. 삭제해도 서버 보관함에 남아 나중에 다시 볼 수 있습니다.";
   }
   const all = $("smsDeleteAllBtn");
   if (all) all.disabled = !state.smsTotal;
@@ -1821,9 +2078,9 @@ function smsDeleteMessage(result) {
   const parts = [];
   if (result.deleted_count) parts.push(`수신 문자 ${result.deleted_count}건을 삭제했습니다.`);
   else parts.push("삭제할 수신 문자가 없습니다.");
-  if (result.files_removed) parts.push(`사진·첨부 ${result.files_removed}개도 함께 정리했습니다.`);
-  if (result.files_kept) parts.push(`첨부 ${result.files_kept}개는 파일을 찾지 못해 그대로 두었습니다.`);
+  if (result.files_kept) parts.push(`사진·첨부 ${result.files_kept}개는 삭제 보관함에서 그대로 볼 수 있습니다.`);
   if (result.missing_ids && result.missing_ids.length) parts.push(`이미 지워진 ${result.missing_ids.length}건은 건너뛰었습니다.`);
+  if (result.deleted_count) parts.push("삭제 보관함에서 복원할 수 있습니다.");
   return parts.join(" ");
 }
 
@@ -1889,7 +2146,7 @@ async function resendSms(id) {
 async function deleteSms(id) {
   const target = (state.visibleSms || []).find((m) => m.id === Number(id));
   const label = target ? `${target.sender || "발신번호 없음"} · ${target.received_at_text}` : `#${id}`;
-  if (!confirm(`수신 문자 #${id} (${label}) 를 삭제할까요?\nMMS 사진·첨부도 서버에서 함께 지워집니다.`)) return;
+  if (!confirm(`수신 문자 #${id} (${label}) 를 삭제할까요?\n웹 목록에서 숨겨지고, MMS 사진·첨부는 [삭제 보관함]에서 그대로 다시 볼 수 있습니다.`)) return;
   try {
     const result = await api(`/api/sms/${id}`, { method: "DELETE" });
     state.selectedSms.delete(Number(id));
@@ -1903,7 +2160,7 @@ async function deleteSms(id) {
 async function deleteSelectedSms() {
   const ids = Array.from(state.selectedSms);
   if (!ids.length) { toast("삭제할 문자를 선택하세요.", "err"); return; }
-  if (!confirm(`선택한 수신 문자 ${ids.length}건을 삭제할까요?\nMMS 사진·첨부도 서버에서 함께 지워집니다.`)) return;
+  if (!confirm(`선택한 수신 문자 ${ids.length}건을 삭제할까요?\n웹 목록에서 숨겨지고, MMS 사진·첨부는 삭제 보관함에서 그대로 다시 볼 수 있습니다.`)) return;
   try {
     const result = await api("/api/sms/delete", {
       method: "POST",
@@ -1922,7 +2179,7 @@ async function deleteSelectedSms() {
 
 async function deleteAllSms() {
   if (!state.smsTotal) { toast("삭제할 수신 문자가 없습니다."); return; }
-  if (!confirm(`수신 문자 ${state.smsTotal}건을 모두 삭제할까요?\n이 작업은 되돌릴 수 없으며 MMS 사진·첨부도 서버에서 함께 지워집니다.\n(폰에 있는 원본 문자는 지워지지 않습니다)`)) return;
+  if (!confirm(`수신 문자 ${state.smsTotal}건을 모두 삭제할까요?\n웹 목록에서 숨겨지고, MMS 사진·첨부는 삭제 보관함에 그대로 남아 다시 볼 수 있습니다.\n(폰에 있는 원본 문자는 지워지지 않습니다)`)) return;
   try {
     const result = await api("/api/sms/delete", {
       method: "POST",
@@ -1934,6 +2191,172 @@ async function deleteAllSms() {
     loadSms();
     loadDashboard();
   } catch (e) { toast(e.message, "err"); }
+}
+
+/* ------------------------------------------------------------------ */
+/* 삭제 보관함                                                          */
+/* ------------------------------------------------------------------ */
+const ARCHIVE_KIND_TAG = {
+  schedule: ['<span class="type-tag t-call" style="background:#eef3ff;color:#2456c9">🗓️ 스케줄</span>'],
+  run: ['<span class="type-tag" style="background:#f4f0ff;color:#6b46c1">📦 실행</span>'],
+  task: ['<span class="type-tag" style="background:#fff4e0;color:#8a5a00">📞 발신</span>'],
+  sms: ['<span class="type-tag t-sms">💬 문자</span>'],
+};
+
+function markArchiveDirty() { state.archive.dirty = true; }
+
+function archiveQueryString() {
+  const a = state.archive;
+  const params = new URLSearchParams({ kind: a.kind, limit: String(a.limit), offset: String(a.offset) });
+  if (a.q) params.set("q", a.q);
+  if (a.start) params.set("start", a.start);
+  if (a.end) params.set("end", a.end);
+  return params.toString();
+}
+
+function renderArchiveCounts(counts) {
+  const c = counts || {};  $("archCountAll").textContent = c.total ? ` ${c.total}` : "";
+  $("archCountSchedules").textContent = c.schedules ? ` ${c.schedules}` : "";
+  $("archCountSms").textContent = c.sms ? ` ${c.sms}` : "";
+  $("archCountRuns").textContent = c.runs ? ` ${c.runs}` : "";
+  $("archCountTasks").textContent = c.tasks ? ` ${c.tasks}` : "";
+  $("tabArchiveCount").textContent = c.total ? ` ${c.total}` : "";
+}
+
+function archiveDetailCell(item) {
+  if (item.kind === "sms") {
+    const body = item.body ? `<div class="sms-body">${esc(item.body)}</div>` : "";
+    return body + attachmentPreview(item);
+  }
+  return esc(item.detail || "-");
+}
+
+function renderArchive(items) {
+  const a = state.archive;
+  const shown = items.length;
+  $("archiveSummary").textContent = a.total
+    ? `보관된 항목 ${a.total}건${a.q || a.start || a.end ? " (검색 조건 적용)" : ""}${shown < a.total ? ` · ${shown}건 표시 중` : ""}`
+    : "보관 중인 항목이 없습니다. 웹에서 삭제한 스케줄·문자·실행 기록이 여기에 남습니다.";
+  $("archiveCountLabel").textContent = a.total ? `총 ${a.total}건 중 ${shown}건 표시` : "";
+  $("archiveMoreBtn").style.display = shown < a.total ? "" : "none";
+
+  $("archiveTable").querySelector("tbody").innerHTML = items.length
+    ? items.map((item) => `
+        <tr>
+          <td class="nowrap">${(ARCHIVE_KIND_TAG[item.kind] || [esc(item.kind_label)])[0]}</td>
+          <td><b>${esc(item.title || "-")}</b><div class="muted" style="font-size:11.5px">#${item.id}${item.kind === "sms" && item.device_name ? " · " + esc(item.device_name) : ""}${item.type ? " · " + (item.type === "sms" ? "문자" : "전화") : ""}</div></td>
+          <td style="max-width:420px">${archiveDetailCell(item)}</td>
+          <td class="muted nowrap">${esc(item.item_time_text || "-")}</td>
+          <td class="muted nowrap">${esc(item.deleted_at_text || "-")}</td>
+          <td class="nowrap"><button class="btn sm" onclick="restoreArchive('${item.kind}', ${item.id})">복원</button></td>
+        </tr>`).join("")
+    : emptyRow(6, "보관함이 비어 있습니다.", "🗑️");
+  hydrateSmsThumbs("#archiveTable");
+}
+
+async function loadArchive(force = false) {
+  const a = state.archive;
+  if (!force && a.dirty) return;
+  if (force) a.dirty = false;
+  try {
+    const data = await api("/api/archive?" + archiveQueryString());
+    a.total = data.total || 0;
+    a.items = data.items || [];
+    renderArchiveCounts(data.counts);
+    const signature = JSON.stringify(a.items.map((item) => [item.kind, item.id, item.deleted_at, item.status]));
+    // 5초 자동 갱신이 같으면 다시 그리지 않는다(사진 클릭·스크롤이 끊기지 않도록).
+    if (signature !== a.signature || force) {
+      a.signature = signature;
+      renderArchive(a.items);
+    } else {
+      $("archiveSummary").textContent = a.total
+        ? `보관된 항목 ${a.total}건${a.q || a.start || a.end ? " (검색 조건 적용)" : ""}`
+        : "보관 중인 항목이 없습니다. 웹에서 삭제한 스케줄·문자·실행 기록이 여기에 남습니다.";
+    }
+  } catch (e) {
+    $("archiveSummary").textContent = "보관함을 불러오지 못했습니다: " + e.message;
+  }
+}
+
+function setArchiveKind(button, kind) {
+  document.querySelectorAll("#pane-archive .chip").forEach((b) => b.classList.toggle("active", b === button));
+  state.archive.kind = kind;
+  state.archive.offset = 0;
+  loadArchive(true);
+}
+
+function applyArchiveFilters() {
+  const a = state.archive;
+  a.q = ($("archQuery").value || "").trim();
+  a.start = $("archStart").value || "";
+  a.end = $("archEnd").value || "";
+  a.offset = 0;
+  a.limit = 100;
+  a.dirty = false;
+  a.signature = "";
+  loadArchive(true);
+}
+
+function resetArchiveFilters() {
+  ["archQuery", "archStart", "archEnd"].forEach((id) => { $(id).value = ""; });
+  state.archive.q = "";
+  state.archive.start = "";
+  state.archive.end = "";
+  state.archive.offset = 0;
+  state.archive.limit = 100;
+  state.archive.signature = "";
+  loadArchive(true);
+}
+
+function loadMoreArchive() {
+  const a = state.archive;
+  a.offset = a.items.length;
+  a.limit = 100;
+  a.dirty = false;
+  api("/api/archive?" + archiveQueryString()).then((data) => {
+    const seen = new Set(a.items.map((item) => item.kind + "#" + item.id));
+    (data.items || []).forEach((item) => {
+      if (!seen.has(item.kind + "#" + item.id)) a.items.push(item);
+    });
+    a.total = data.total || a.total;
+    a.signature = "";
+    renderArchive(a.items);
+  }).catch((e) => toast(e.message, "err"));
+}
+
+const ARCHIVE_RESTORE_LABELS = { schedule: "스케줄", run: "실행 기록", task: "발신 작업", sms: "수신 문자" };
+
+async function refreshArchiveBadge(force = false) {
+  const nowMs = Date.now();
+  if (!force && nowMs - (state.archiveBadgeAt || 0) < 30000) return;
+  state.archiveBadgeAt = nowMs;
+  try {
+    const data = await api("/api/archive?limit=1");
+    renderArchiveCounts(data.counts);
+  } catch (e) { /* 보관함 개수는 실패해도 화면을 막지 않는다 */ }
+}
+
+async function restoreArchive(kind, id) {
+  const label = ARCHIVE_RESTORE_LABELS[kind] || kind;
+  const note = kind === "schedule"
+    ? "\n스케줄은 일시정지 상태로 돌아옵니다(실행 시각을 확인한 뒤 [재개]를 누르면 예약됩니다)."
+    : "";
+  if (!confirm(`${label} #${id} 을(를) 복원할까요?${note}`)) return;
+  try {
+    const result = await api("/api/archive/restore", {
+      method: "POST",
+      body: JSON.stringify({ kind, id: Number(id) }),
+    });
+    const extra = result.restored_tasks ? ` (함께 보관된 발신 작업 ${result.restored_tasks}건도 복원)` : "";
+    toast(`${label} #${id} 을(를) 복원했습니다.${extra}`, "ok");
+    state.archive.signature = "";
+    await loadArchive(true);
+    if (kind === "sms") loadSms();
+    if (kind === "schedule" || kind === "run" || kind === "task") { loadSchedules(); loadRuns(); loadTasks(); }
+    loadDashboard();
+  } catch (e) {
+    toast(e.message, "err");
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2006,8 +2429,12 @@ function startAutoRefresh() {
   document.querySelectorAll(".modal.lightbox").forEach((el) => {
     el.addEventListener("click", (ev) => { if (ev.target === el) closeSmsPhoto(); });
   });
+  const deviceModal = $("deviceModal");
+  if (deviceModal) {
+    deviceModal.addEventListener("click", (ev) => { if (ev.target === deviceModal) closeDeviceEdit(); });
+  }
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") closeSmsPhoto();
+    if (ev.key === "Escape") { closeSmsPhoto(); closeDeviceEdit(); }
   });
   if (hash && document.getElementById("pane-" + hash)) {
     document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === hash));
