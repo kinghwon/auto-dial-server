@@ -87,7 +87,7 @@ def test_db_schema_created(isolate_db):
 def test_device_registration_heartbeat_and_online(client):
     response = client.post(
         "/api/devices",
-        json={"device_id": "DEV-01", "name": "거실폰", "model": "SM-S911N", "android_version": "14"},
+        json={"device_id": "010-9000-0011", "name": "거실폰", "model": "SM-S911N", "android_version": "14"},
     )
     assert response.status_code == 200
     assert response.json()["device"]["online"] is True
@@ -96,27 +96,27 @@ def test_device_registration_heartbeat_and_online(client):
     assert len(devices) == 1
     assert devices[0]["name"] == "거실폰"
 
-    heartbeat = client.post("/api/devices/DEV-01/heartbeat", json={"device_id": "DEV-01", "battery": 87, "network": "WiFi"})
+    heartbeat = client.post("/api/devices/010-9000-0011/heartbeat", json={"device_id": "010-9000-0011", "battery": 87, "network": "WiFi"})
     assert heartbeat.status_code == 200
     assert client.get("/api/devices").json()["devices"][0]["battery"] == 87
 
     # 마지막 하트비트가 오래되면 오프라인
     conn = _conn()
     old = (datetime.now(TZ) - timedelta(seconds=config.ONLINE_TIMEOUT_SEC + 60)).isoformat(timespec="seconds")
-    conn.execute("UPDATE devices SET last_seen = ? WHERE id = 'DEV-01'", (old,))
+    conn.execute("UPDATE devices SET last_seen = ? WHERE id = '010-9000-0011'", (old,))
     conn.close()
     assert client.get("/api/devices").json()["devices"][0]["online"] is False
 
-    assert client.delete("/api/devices/DEV-01").status_code == 200
+    assert client.delete("/api/devices/010-9000-0011").status_code == 200
     assert client.get("/api/devices").json()["devices"] == []
 
 
 def test_unknown_device_auto_registers_on_poll(client):
-    response = client.get("/api/tasks/poll", params={"device_id": "NEW-99"})
+    response = client.get("/api/tasks/poll", params={"device_id": "010-9000-0101"})
     assert response.status_code == 200
     assert response.json()["task"] is None
     devices = client.get("/api/devices").json()["devices"]
-    assert [d["id"] for d in devices] == ["NEW-99"]
+    assert [d["id"] for d in devices] == ["010-9000-0101"]
 
 
 # --------------------------------------------------------------------------
@@ -271,37 +271,37 @@ def test_pause_resume(client):
 # 5. 작업 폴링 → 결과 보고
 # --------------------------------------------------------------------------
 def test_task_poll_and_result_flow(client):
-    client.post("/api/devices", json={"device_id": "DEV-A", "name": "A폰"})
+    client.post("/api/devices", json={"device_id": "010-9000-0001", "name": "A폰"})
     schedule = make_schedule(client, numbers=["010-5555-0001", "010-5555-0002"], repeat_count=1)
     run_id = client.post(f"/api/schedules/{schedule['id']}/run-now").json()["run_id"]
 
-    first = client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"]
+    first = client.get("/api/tasks/poll", params={"device_id": "010-9000-0001"}).json()["task"]
     assert first["phone_number"] == "010-5555-0001"
     assert first["type"] == "call"
     assert first["max_call_duration_sec"] == 15
     assert first["status"] == "assigned"
 
-    second = client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"]
+    second = client.get("/api/tasks/poll", params={"device_id": "010-9000-0001"}).json()["task"]
     assert second["phone_number"] == "010-5555-0002"
 
     # 다른 기기에는 이미 배정된 작업이 보이지 않는다
-    assert client.get("/api/tasks/poll", params={"device_id": "DEV-B"}).json()["task"] is None
+    assert client.get("/api/tasks/poll", params={"device_id": "010-9000-0002"}).json()["task"] is None
 
     done = client.post(
         f"/api/tasks/{first['id']}/result",
-        json={"device_id": "DEV-A", "status": "done", "result": "통화 종료 (15초)", "duration_sec": 15.2},
+        json={"device_id": "010-9000-0001", "status": "done", "result": "통화 종료 (15초)", "duration_sec": 15.2},
     )
     assert done.status_code == 200
     assert done.json()["task"]["status"] == "done"
 
     # 중복 보고는 무시되고 중복 표시
-    duplicate = client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-A", "status": "failed"})
+    duplicate = client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "010-9000-0001", "status": "failed"})
     assert duplicate.status_code == 200
     assert duplicate.json()["duplicate"] is True
 
     client.post(
         f"/api/tasks/{second['id']}/result",
-        json={"device_id": "DEV-A", "status": "failed", "error": "통화 연결 실패"},
+        json={"device_id": "010-9000-0001", "status": "failed", "error": "통화 연결 실패"},
     )
 
     runs = client.get("/api/runs").json()["runs"]
@@ -312,30 +312,30 @@ def test_task_poll_and_result_flow(client):
 
 
 def test_task_result_rejects_other_device(client):
-    client.post("/api/devices", json={"device_id": "DEV-A"})
+    client.post("/api/devices", json={"device_id": "010-9000-0001"})
     schedule = make_schedule(client, numbers=["010-6666-0001"], repeat_count=1)
     client.post(f"/api/schedules/{schedule['id']}/run-now")
-    task = client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"]
-    response = client.post(f"/api/tasks/{task['id']}/result", json={"device_id": "DEV-B", "status": "done"})
+    task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0001"}).json()["task"]
+    response = client.post(f"/api/tasks/{task['id']}/result", json={"device_id": "010-9000-0002", "status": "done"})
     assert response.status_code == 409
 
 
 def test_device_specific_assignment(client):
-    client.post("/api/devices", json={"device_id": "DEV-A"})
-    client.post("/api/devices", json={"device_id": "DEV-B"})
-    schedule = make_schedule(client, numbers=["010-7777-0001"], repeat_count=1, device_id="DEV-B")
+    client.post("/api/devices", json={"device_id": "010-9000-0001"})
+    client.post("/api/devices", json={"device_id": "010-9000-0002"})
+    schedule = make_schedule(client, numbers=["010-7777-0001"], repeat_count=1, device_id="010-9000-0002")
     client.post(f"/api/schedules/{schedule['id']}/run-now")
 
-    assert client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"] is None
-    task = client.get("/api/tasks/poll", params={"device_id": "DEV-B"}).json()["task"]
-    assert task["device_id"] == "DEV-B"
+    assert client.get("/api/tasks/poll", params={"device_id": "010-9000-0001"}).json()["task"] is None
+    task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0002"}).json()["task"]
+    assert task["device_id"] == "010-9000-0002"
 
 
 def test_stale_task_is_recovered(client):
-    client.post("/api/devices", json={"device_id": "DEV-A"})
+    client.post("/api/devices", json={"device_id": "010-9000-0001"})
     schedule = make_schedule(client, numbers=["010-8888-0001"], repeat_count=1)
     client.post(f"/api/schedules/{schedule['id']}/run-now")
-    task = client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"]
+    task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0001"}).json()["task"]
 
     conn = _conn()
     old = (datetime.now(TZ) - timedelta(seconds=config.TASK_TIMEOUT_SEC + 10)).isoformat(timespec="seconds")
@@ -351,7 +351,7 @@ def test_stale_task_is_recovered(client):
 # 6. 수신 문자 → 텔레그램
 # --------------------------------------------------------------------------
 def test_incoming_sms_is_stored_and_forwarded(client, monkeypatch):
-    client.post("/api/devices", json={"device_id": "DEV-01", "name": "사무실폰"})
+    client.post("/api/devices", json={"device_id": "010-9000-0011", "name": "사무실폰"})
     client.post(
         "/api/settings/telegram",
         json={"bot_token": "123456789:TESTTOKEN", "chat_id": "-1001234567890"},
@@ -370,7 +370,7 @@ def test_incoming_sms_is_stored_and_forwarded(client, monkeypatch):
     response = client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-01",
+            "device_id": "010-9000-0011",
             "sender": "010-9999-8888",
             "body": "주문하신 상품이 배송 출발했습니다.",
             "received_at": "2026-11-22T16:05:00+09:00",
@@ -382,7 +382,7 @@ def test_incoming_sms_is_stored_and_forwarded(client, monkeypatch):
     assert len(sent) == 1
     message = sent[0]
     assert "수신 문자" in message
-    assert "사무실폰 (DEV-01)" in message
+    assert "사무실폰 (010-9000-0011)" in message
     assert "010-9999-8888" in message
     assert "2026-11-22 16:05:00" in message
     assert "주문하신 상품이 배송 출발했습니다." in message
@@ -393,7 +393,7 @@ def test_incoming_sms_is_stored_and_forwarded(client, monkeypatch):
 
 
 def test_incoming_sms_with_epoch_millis(client, monkeypatch):
-    client.post("/api/devices", json={"device_id": "DEV-02", "name": "차량폰"})
+    client.post("/api/devices", json={"device_id": "010-9000-0012", "name": "차량폰"})
     client.post(
         "/api/settings/telegram",
         json={"bot_token": "123456789:TESTTOKEN", "chat_id": "-100999"},
@@ -402,7 +402,7 @@ def test_incoming_sms_with_epoch_millis(client, monkeypatch):
 
     response = client.post(
         "/api/sms/incoming",
-        json={"device_id": "DEV-02", "sender": "02-123-4567", "body": "테스트", "received_ts": 1795311900000},
+        json={"device_id": "010-9000-0012", "sender": "02-123-4567", "body": "테스트", "received_ts": 1795311900000},
     )
     assert response.status_code == 200
     stored = client.get("/api/sms").json()["messages"][0]
@@ -413,13 +413,13 @@ def test_incoming_sms_with_epoch_millis(client, monkeypatch):
 
 def test_telegram_format_contains_all_fields():
     text = telegram_client.format_incoming_sms(
-        device_id="DEV-03",
+        device_id="010-9000-0013",
         device_name="",
         sender="010-0000-0000",
         body="안녕",
         received_at="2026-11-22T08:00:00+09:00",
     )
-    assert "DEV-03" in text and "010-0000-0000" in text and "2026-11-22 08:00:00" in text and "안녕" in text
+    assert "010-9000-0013" in text and "010-0000-0000" in text and "2026-11-22 08:00:00" in text and "안녕" in text
 
 
 def test_telegram_settings_save_and_test(client, monkeypatch):
@@ -445,7 +445,7 @@ def test_telegram_settings_save_and_test(client, monkeypatch):
 def test_sms_skipped_when_telegram_not_configured(client, monkeypatch):
     called = []
     monkeypatch.setattr(telegram_client, "send_message", lambda *a, **k: called.append(1) or (True, None))
-    response = client.post("/api/sms/incoming", json={"device_id": "DEV-X", "sender": "1", "body": "b"})
+    response = client.post("/api/sms/incoming", json={"device_id": "010-9000-0181", "sender": "1", "body": "b"})
     assert response.status_code == 200
     assert called == []
     assert client.get("/api/sms").json()["messages"][0]["telegram_status"] == "skipped"
@@ -484,7 +484,7 @@ def _capture_telegram(monkeypatch):
 
 
 def _prepare_telegram(client):
-    client.post("/api/devices", json={"device_id": "DEV-MMS", "name": "갤23+"})
+    client.post("/api/devices", json={"device_id": "010-9000-0031", "name": "갤23+"})
     client.post(
         "/api/settings/telegram",
         json={"bot_token": "123456789:TESTTOKEN", "chat_id": "-100777"},
@@ -498,7 +498,7 @@ def test_incoming_mms_photo_is_forwarded_as_photo(client, monkeypatch):
     response = client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-MMS",
+            "device_id": "010-9000-0031",
             "sender": "010-1234-5678",
             "body": "[MMS]\n제목: 매장 안내\n사진 보냅니다",
             "received_at": "2026-11-22T20:30:00+09:00",
@@ -521,7 +521,7 @@ def test_incoming_mms_photo_is_forwarded_as_photo(client, monkeypatch):
     assert sent_photo["bytes"] == PHOTO_BYTES
     assert sent_photo["filename"] == "photo.jpg"
     assert "수신 문자" in sent_photo["caption"]
-    assert "갤23+ (DEV-MMS)" in sent_photo["caption"]
+    assert "갤23+ (010-9000-0031)" in sent_photo["caption"]
     assert "제목: 매장 안내" in sent_photo["caption"]
 
     # 첨부는 서버 파일로 남고, 대시보드에서 다시 내려받을 수 있다.
@@ -545,7 +545,7 @@ def test_incoming_mms_long_body_sends_text_then_photo(client, monkeypatch):
     response = client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-MMS",
+            "device_id": "010-9000-0031",
             "sender": "1588-0000",
             "body": long_body,
             "attachments": [
@@ -568,7 +568,7 @@ def test_incoming_mms_multiple_photos_sent_in_order(client, monkeypatch):
     client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-MMS",
+            "device_id": "010-9000-0031",
             "sender": "010-2222-3333",
             "body": "사진 두 장",
             "attachments": [
@@ -590,7 +590,7 @@ def test_incoming_mms_non_image_attachment_uses_document(client, monkeypatch):
     client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-MMS",
+            "device_id": "010-9000-0031",
             "sender": "010-4444-5555",
             "body": "계약서 첨부",
             "attachments": [
@@ -609,7 +609,7 @@ def test_sms_without_attachments_keeps_text_only_path(client, monkeypatch):
     _prepare_telegram(client)
     calls = _capture_telegram(monkeypatch)
 
-    client.post("/api/sms/incoming", json={"device_id": "DEV-MMS", "sender": "010-1", "body": "사진 없는 문자"})
+    client.post("/api/sms/incoming", json={"device_id": "010-9000-0031", "sender": "010-1", "body": "사진 없는 문자"})
     assert len(calls["text"]) == 1
     assert calls["photo"] == []
     assert calls["document"] == []
@@ -622,7 +622,7 @@ def test_incoming_mms_broken_attachment_still_forwards_text(client, monkeypatch)
     response = client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-MMS",
+            "device_id": "010-9000-0031",
             "sender": "010-6",
             "body": "깨진 첨부",
             "attachments": [{"filename": "x.jpg", "content_type": "image/jpeg", "data_base64": "!!!!"}],
@@ -638,7 +638,7 @@ def test_incoming_sms_rejects_too_many_attachments(client):
     response = client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-MMS",
+            "device_id": "010-9000-0031",
             "sender": "010-7",
             "body": "첨부 11건",
             "attachments": [
@@ -657,7 +657,7 @@ def test_resend_sms_uses_saved_photo(client, monkeypatch):
     created = client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-MMS",
+            "device_id": "010-9000-0031",
             "sender": "010-8",
             "body": "사진 다시 보내기",
             "attachments": [
@@ -703,7 +703,7 @@ def test_api_key_protection(client, monkeypatch):
 
 
 def test_stats_endpoint(client):
-    client.post("/api/devices", json={"device_id": "DEV-01", "name": "폰1"})
+    client.post("/api/devices", json={"device_id": "010-9000-0011", "name": "폰1"})
     make_schedule(client, start_at="2026-11-22T09:00")
     stats = client.get("/api/stats").json()
     assert stats["devices"] == {"total": 1, "online": 1}
@@ -749,10 +749,10 @@ def test_schedule_delete_soft_deletes_schedule_runs_and_tasks(client):
 
 
 def test_schedule_delete_with_running_task_leaves_no_orphans(client):
-    client.post("/api/devices", json={"device_id": "DEV-DEL"})
-    schedule = make_schedule(client, numbers=["010-2222-0001"], repeat_count=1, device_id="DEV-DEL")
+    client.post("/api/devices", json={"device_id": "010-9000-0094"})
+    schedule = make_schedule(client, numbers=["010-2222-0001"], repeat_count=1, device_id="010-9000-0094")
     client.post(f"/api/schedules/{schedule['id']}/run-now")
-    polled = client.get("/api/tasks/poll", params={"device_id": "DEV-DEL"}).json()["task"]
+    polled = client.get("/api/tasks/poll", params={"device_id": "010-9000-0094"}).json()["task"]
     assert polled is not None
     client.post(f"/api/tasks/{polled['id']}/start")
 
@@ -777,7 +777,7 @@ def test_schedule_copy_is_paused_and_keeps_settings(client):
         order_mode="random",
         start_at="2026-11-24T09:00",
         recurrence="daily",
-        device_id="DEV-A",
+        device_id="010-9000-0001",
         max_call_duration_sec=45,
     )
     response = client.post(f"/api/schedules/{source['id']}/copy", json={})
@@ -791,7 +791,7 @@ def test_schedule_copy_is_paused_and_keeps_settings(client):
     assert copy["total_calls"] == 6
     assert copy["order_mode"] == "random"
     assert copy["recurrence"] == "daily"
-    assert copy["device_id"] == "DEV-A"
+    assert copy["device_id"] == "010-9000-0001"
     assert copy["max_call_duration_sec"] == 45
     assert copy["start_at"] == source["start_at"]
     assert copy["run_count"] == 0
@@ -979,9 +979,9 @@ def test_dashboard_has_schedule_copy_and_delete_controls(client):
 
 
 def test_logs_recorded(client):
-    client.post("/api/devices", json={"device_id": "DEV-LOG"})
+    client.post("/api/devices", json={"device_id": "010-9000-0211"})
     logs = client.get("/api/logs").json()["logs"]
-    assert any("DEV-LOG" in entry["message"] for entry in logs)
+    assert any("010-9000-0211" in entry["message"] for entry in logs)
 
 
 def test_expand_tasks_helper():
@@ -1014,7 +1014,7 @@ def test_settings_returns_remote_defaults(client):
 
 
 def test_remote_settings_save_applies_to_heartbeat_and_poll(client):
-    client.post("/api/devices", json={"device_id": "DEV-RC", "name": "원격폰"})
+    client.post("/api/devices", json={"device_id": "010-9000-0111", "name": "원격폰"})
 
     saved = client.post(
         "/api/settings/remote",
@@ -1029,13 +1029,13 @@ def test_remote_settings_save_applies_to_heartbeat_and_poll(client):
     assert client.get("/api/settings").json()["remote"]["sms_forward_enabled"] is False
 
     # 하트비트 응답: 최상위 poll_interval_sec + config 블록
-    heartbeat = client.post("/api/devices/DEV-RC/heartbeat").json()
+    heartbeat = client.post("/api/devices/010-9000-0111/heartbeat").json()
     assert heartbeat["poll_interval_sec"] == 20
     assert heartbeat["config"] == {**DEFAULT_REMOTE, "poll_interval_sec": 20, "call_gap_sec": 12,
                                    "sms_forward_enabled": False, "mms_forward_enabled": False}
 
     # 폴링 응답도 같은 설정을 돌려준다.
-    poll = client.get("/api/tasks/poll", params={"device_id": "DEV-RC"}).json()
+    poll = client.get("/api/tasks/poll", params={"device_id": "010-9000-0111"}).json()
     assert poll["poll_interval_sec"] == 20
     assert poll["config"] == heartbeat["config"]
 
@@ -1115,7 +1115,7 @@ def test_call_audio_defaults(client):
 
 def test_call_audio_settings_save_and_reach_device(client):
     """통화 중 동작 3가지를 저장하면 하트비트·폴링 config 로 폰에 내려간다."""
-    client.post("/api/devices", json={"device_id": "DEV-AUDIO", "name": "통화폰"})
+    client.post("/api/devices", json={"device_id": "010-9000-0171", "name": "통화폰"})
 
     saved = client.post(
         "/api/settings/remote",
@@ -1125,9 +1125,9 @@ def test_call_audio_settings_save_and_reach_device(client):
     expected = {**DEFAULT_REMOTE, "call_recording_enabled": True, "call_mute_volume": False, "call_mute_mic": False}
     assert saved.json()["remote"] == expected
 
-    heartbeat = client.post("/api/devices/DEV-AUDIO/heartbeat").json()
+    heartbeat = client.post("/api/devices/010-9000-0171/heartbeat").json()
     assert heartbeat["config"] == expected
-    poll = client.get("/api/tasks/poll", params={"device_id": "DEV-AUDIO"}).json()
+    poll = client.get("/api/tasks/poll", params={"device_id": "010-9000-0171"}).json()
     assert poll["config"] == expected
 
     conn = _conn()
@@ -1163,21 +1163,21 @@ def test_remote_settings_change_is_logged(client):
 
 
 def test_disabled_device_is_not_assigned_tasks(client):
-    client.post("/api/devices", json={"device_id": "DEV-OFF", "name": "중지폰"})
+    client.post("/api/devices", json={"device_id": "010-9000-0081", "name": "중지폰"})
     schedule = make_schedule(client, numbers=["010-9999-0001", "010-9999-0002"], repeat_count=1)
     client.post(f"/api/schedules/{schedule['id']}/run-now")
 
-    disabled = client.patch("/api/devices/DEV-OFF", json={"enabled": False})
+    disabled = client.patch("/api/devices/010-9000-0081", json={"enabled": False})
     assert disabled.status_code == 200
     assert disabled.json()["device"]["enabled"] is False
 
     # 중지된 기기는 하트비트는 계속하지만 작업은 받지 않는다.
-    heartbeat = client.post("/api/devices/DEV-OFF/heartbeat").json()
+    heartbeat = client.post("/api/devices/010-9000-0081/heartbeat").json()
     assert heartbeat["ok"] is True
     assert heartbeat["config"]["device_enabled"] is False
     assert heartbeat["pending_tasks"] == 2
 
-    poll = client.get("/api/tasks/poll", params={"device_id": "DEV-OFF"}).json()
+    poll = client.get("/api/tasks/poll", params={"device_id": "010-9000-0081"}).json()
     assert poll["task"] is None
     assert poll["config"]["device_enabled"] is False
     assert poll["pending_tasks"] == 2
@@ -1186,20 +1186,20 @@ def test_disabled_device_is_not_assigned_tasks(client):
     assert [task["status"] for task in tasks] == ["pending", "pending"]
 
     # 다시 사용 설정하면 정상적으로 작업을 받는다.
-    assert client.patch("/api/devices/DEV-OFF", json={"enabled": True}).json()["device"]["enabled"] is True
-    task = client.get("/api/tasks/poll", params={"device_id": "DEV-OFF"}).json()
+    assert client.patch("/api/devices/010-9000-0081", json={"enabled": True}).json()["device"]["enabled"] is True
+    task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0081"}).json()
     assert task["task"]["phone_number"] == "010-9999-0001"
     assert task["config"]["device_enabled"] is True
 
 
 def test_disabled_device_does_not_block_other_devices(client):
-    client.post("/api/devices", json={"device_id": "DEV-OFF"})
-    client.post("/api/devices", json={"device_id": "DEV-ON"})
-    client.patch("/api/devices/DEV-OFF", json={"enabled": False})
+    client.post("/api/devices", json={"device_id": "010-9000-0081"})
+    client.post("/api/devices", json={"device_id": "010-9000-0082"})
+    client.patch("/api/devices/010-9000-0081", json={"enabled": False})
     schedule = make_schedule(client, numbers=["010-9999-0100"], repeat_count=1)
     client.post(f"/api/schedules/{schedule['id']}/run-now")
 
-    task = client.get("/api/tasks/poll", params={"device_id": "DEV-ON"}).json()["task"]
+    task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0082"}).json()["task"]
     assert task is not None
     assert task["phone_number"] == "010-9999-0100"
 
@@ -1266,12 +1266,12 @@ def test_delete_unknown_task_returns_404(client):
 
 
 def test_delete_finished_task_is_rejected(client):
-    client.post("/api/devices", json={"device_id": "DEV-DONE"})
+    client.post("/api/devices", json={"device_id": "010-9000-0093"})
     schedule, _ = pending_run(client, numbers=["010-7777-0201"])
-    task = client.get("/api/tasks/poll", params={"device_id": "DEV-DONE"}).json()["task"]
+    task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0093"}).json()["task"]
     client.post(
         f"/api/tasks/{task['id']}/result",
-        json={"device_id": "DEV-DONE", "status": "done", "result": "통화 종료"},
+        json={"device_id": "010-9000-0093", "status": "done", "result": "통화 종료"},
     )
 
     response = client.delete(f"/api/tasks/{task['id']}")
@@ -1280,9 +1280,9 @@ def test_delete_finished_task_is_rejected(client):
 
 
 def test_delete_running_task_marks_it_canceled(client):
-    client.post("/api/devices", json={"device_id": "DEV-RUN"})
+    client.post("/api/devices", json={"device_id": "010-9000-0091"})
     schedule, run_id = pending_run(client, numbers=["010-7777-0301"])
-    task = client.get("/api/tasks/poll", params={"device_id": "DEV-RUN"}).json()["task"]
+    task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0091"}).json()["task"]
     client.post(f"/api/tasks/{task['id']}/start")
 
     response = client.delete(f"/api/tasks/{task['id']}")
@@ -1300,7 +1300,7 @@ def test_delete_running_task_marks_it_canceled(client):
     assert run["total_tasks"] == 0
 
     # 폰이 걸고 있던 통화를 마치고 뒤늦게 보고해도 무시된다(중복 처리).
-    late = client.post(f"/api/tasks/{task['id']}/result", json={"device_id": "DEV-RUN", "status": "done"})
+    late = client.post(f"/api/tasks/{task['id']}/result", json={"device_id": "010-9000-0091", "status": "done"})
     assert late.status_code == 200
     assert late.json()["duplicate"] is True
 
@@ -1333,15 +1333,15 @@ def test_bulk_delete_duplicate_ids_are_counted_once(client):
 
 
 def test_bulk_delete_all_pending_queue(client):
-    client.post("/api/devices", json={"device_id": "DEV-KEEP"})
+    client.post("/api/devices", json={"device_id": "010-9000-0041"})
     first, run_a = pending_run(client, numbers=["010-8888-0001", "010-8888-0002"])
     second, run_b = pending_run(client, numbers=["010-8888-0003"])
 
     # 한 건을 먼저 완료 처리해 둔다(전체 삭제는 이 기록을 건드리지 않아야 한다).
-    done_task = client.get("/api/tasks/poll", params={"device_id": "DEV-KEEP"}).json()["task"]
+    done_task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0041"}).json()["task"]
     client.post(
         f"/api/tasks/{done_task['id']}/result",
-        json={"device_id": "DEV-KEEP", "status": "done", "duration_sec": 5},
+        json={"device_id": "010-9000-0041", "status": "done", "duration_sec": 5},
     )
 
     response = client.post("/api/tasks/bulk-delete", json={"all_pending": True})
@@ -1378,10 +1378,10 @@ def test_bulk_delete_all_pending_within_one_run(client):
 
 
 def test_bulk_delete_reports_protected_and_missing(client):
-    client.post("/api/devices", json={"device_id": "DEV-MIX"})
+    client.post("/api/devices", json={"device_id": "010-9000-0092"})
     schedule, _ = pending_run(client, numbers=["010-8888-1001", "010-8888-1002"])
-    first = client.get("/api/tasks/poll", params={"device_id": "DEV-MIX"}).json()["task"]
-    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-MIX", "status": "failed"})
+    first = client.get("/api/tasks/poll", params={"device_id": "010-9000-0092"}).json()["task"]
+    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "010-9000-0092", "status": "failed"})
     pending = [t for t in queue_tasks(client, schedule_id=schedule["id"]) if t["status"] == "pending"]
     assert len(pending) == 1
 
@@ -1397,10 +1397,10 @@ def test_bulk_delete_reports_protected_and_missing(client):
 
 
 def test_bulk_delete_all_tasks_clears_entire_list(client):
-    client.post("/api/devices", json={"device_id": "DEV-ALL"})
+    client.post("/api/devices", json={"device_id": "010-9000-0095"})
     schedule, _ = pending_run(client, numbers=["010-8888-2001", "010-8888-2002"])
-    first = client.get("/api/tasks/poll", params={"device_id": "DEV-ALL"}).json()["task"]
-    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-ALL", "status": "done"})
+    first = client.get("/api/tasks/poll", params={"device_id": "010-9000-0095"}).json()["task"]
+    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "010-9000-0095", "status": "done"})
 
     response = client.post("/api/tasks/bulk-delete", json={"all_tasks": True})
     assert response.status_code == 200, response.text
@@ -1589,7 +1589,7 @@ def test_update_schedule_changes_all_fields(client):
             "total_calls": 10,
             "order_mode": "random",
             "max_call_duration_sec": 45,
-            "device_id": "DEV-9",
+            "device_id": "010-9000-0019",
             "start_at": "2026-11-25T14:30",
             "recurrence": "weekly",
         },
@@ -1604,7 +1604,7 @@ def test_update_schedule_changes_all_fields(client):
     assert body["tasks_per_run"] == 10
     assert body["order_mode"] == "random"
     assert body["max_call_duration_sec"] == 45
-    assert body["device_id"] == "DEV-9"
+    assert body["device_id"] == "010-9000-0019"
     assert body["recurrence"] == "weekly"
     assert parse_dt(body["start_at"]) == datetime(2026, 11, 25, 14, 30, tzinfo=TZ)
     assert parse_dt(body["next_run_at"]) == datetime(2026, 11, 25, 14, 30, tzinfo=TZ)
@@ -1614,7 +1614,7 @@ def test_update_schedule_changes_all_fields(client):
     tasks = _tasks_of(client, schedule["id"])
     assert len(tasks) == 10
     assert {task["phone_number"] for task in tasks} <= set(new_numbers)
-    assert all(task["device_id"] == "DEV-9" for task in tasks)
+    assert all(task["device_id"] == "010-9000-0019" for task in tasks)
     assert all(task["max_call_duration_sec"] == 45 for task in tasks)
     assert all(
         previous != current
@@ -1831,7 +1831,7 @@ def test_dashboard_has_total_calls_edit_mode_and_order_options(client):
 # --------------------------------------------------------------------------
 # 21. 수신 문자 조회(MMS 미리보기) · 삭제
 # --------------------------------------------------------------------------
-def _post_sms(client, *, device_id="DEV-INBOX", sender="010-2222-3333", body="문자 본문", attachments=None):
+def _post_sms(client, *, device_id="010-9000-0151", sender="010-2222-3333", body="문자 본문", attachments=None):
     response = client.post(
         "/api/sms/incoming",
         json={
@@ -1847,7 +1847,7 @@ def _post_sms(client, *, device_id="DEV-INBOX", sender="010-2222-3333", body="�
 
 
 def _post_photo_sms(client, *, body="사진 보냅니다"):
-    client.post("/api/devices", json={"device_id": "DEV-INBOX", "name": "사무실폰"})
+    client.post("/api/devices", json={"device_id": "010-9000-0151", "name": "사무실폰"})
     return _post_sms(
         client,
         body=body,
@@ -1911,15 +1911,15 @@ def test_list_sms_text_only_has_empty_attachments(client):
 
 
 def test_list_sms_filter_by_device_counts_total(client):
-    _post_sms(client, device_id="DEV-A", body="A 기기 문자")
-    _post_sms(client, device_id="DEV-B", body="B 기기 문자")
-    _post_sms(client, device_id="DEV-B", body="B 기기 문자 2")
+    _post_sms(client, device_id="010-9000-0001", body="A 기기 문자")
+    _post_sms(client, device_id="010-9000-0002", body="B 기기 문자")
+    _post_sms(client, device_id="010-9000-0002", body="B 기기 문자 2")
 
     everything = client.get("/api/sms").json()
     assert everything["total"] == 3
-    filtered = client.get("/api/sms", params={"device_id": "DEV-B"}).json()
+    filtered = client.get("/api/sms", params={"device_id": "010-9000-0002"}).json()
     assert filtered["total"] == 2
-    assert {m["device_id"] for m in filtered["messages"]} == {"DEV-B"}
+    assert {m["device_id"] for m in filtered["messages"]} == {"010-9000-0002"}
 
     limited = client.get("/api/sms", params={"limit": 1}).json()
     assert limited["count"] == 1
@@ -2115,37 +2115,49 @@ def test_db_schema_has_phone_and_receiver_columns(isolate_db):
     assert "receiver_number" in sms_columns
 
 
-def test_device_phone_number_register_patch_and_clear(client):
+def test_device_key_is_normalized_phone_number(client):
+    """기기 키는 정규화된 수신번호다. 등록할 때 device_id 와 phone_number 가 같은 값이 된다."""
     created = client.post(
         "/api/devices",
-        json={"device_id": "DEV-PHONE", "name": "사무실폰", "phone_number": "010-1234-5678"},
+        json={"device_id": "010-9000-0131", "name": "사무실폰", "phone_number": "01012345678"},
     ).json()["device"]
+    assert created["id"] == "010-1234-5678"
     assert created["phone_number"] == "010-1234-5678"
 
-    listed = client.get("/api/devices").json()["devices"][0]
-    assert listed["phone_number"] == "010-1234-5678"
+    # 앱이 번호 없이 다시 등록(30초마다 오는 등록 요청)해도 키·번호가 유지된다.
+    again = client.post("/api/devices", json={"device_id": "010-1234-5678", "name": "사무실폰"}).json()["device"]
+    assert again["id"] == again["phone_number"] == "010-1234-5678"
 
-    # 앱이 번호 없이 다시 등록(하트비트 대신 재등록)해도 대시보드에서 넣은 번호가 지워지지 않는다
-    again = client.post("/api/devices", json={"device_id": "DEV-PHONE", "name": "사무실폰"}).json()["device"]
-    assert again["phone_number"] == "010-1234-5678"
+    # 번호를 못 읽은 기기는 등록되지 않는다(번호 없는 기기 키를 만들지 않는다).
+    missing = client.post("/api/devices", json={"device_id": "NO-PHONE", "name": "이름만"})
+    assert missing.status_code == 422
+    assert "수신번호" in missing.json()["detail"]
+    assert [d["id"] for d in client.get("/api/devices").json()["devices"]] == ["010-1234-5678"]
 
-    patched = client.patch("/api/devices/DEV-PHONE", json={"phone_number": "02-123-4567"}).json()["device"]
-    assert patched["phone_number"] == "02-123-4567"
 
-    cleared = client.patch("/api/devices/DEV-PHONE", json={"phone_number": ""}).json()["device"]
-    assert cleared["phone_number"] == ""
+def test_device_phone_number_cannot_be_changed(client):
+    client.post("/api/devices", json={"device_id": "010-9000-0131", "name": "사무실폰"})
 
-    # 형식이 틀린 번호는 저장하지 않는다
-    assert client.patch("/api/devices/DEV-PHONE", json={"phone_number": "전화번호아님!!"}).status_code == 422
-    assert client.get("/api/devices").json()["devices"][0]["phone_number"] == ""
+    # 다른 번호로 바꾸기 → 422 (키가 바뀌면 스케줄·작업·문자가 어긋난다)
+    for payload in ({"phone_number": "02-123-4567"}, {"phone_number": ""}, {"new_device_id": "010-9999-0000"}):
+        response = client.patch("/api/devices/010-9000-0131", json=payload)
+        assert response.status_code == 422, payload
+        assert "수정할 수 없습니다" in response.json()["detail"]
+
+    # 같은 값(지금 키)을 보내는 것은 그대로 저장된다(예전 대시보드 호환).
+    body = client.patch(
+        "/api/devices/010-9000-0131", json={"name": "거실폰", "phone_number": "010-9000-0131"}
+    ).json()["device"]
+    assert body["id"] == body["phone_number"] == "010-9000-0131"
+    assert body["name"] == "거실폰"
 
 
 def test_incoming_sms_stores_explicit_receiver_number(client):
-    client.post("/api/devices", json={"device_id": "DEV-R1", "name": "A폰", "phone_number": "010-1000-0001"})
+    client.post("/api/devices", json={"device_id": "010-9000-0121", "name": "A폰", "phone_number": "010-1000-0001"})
     response = client.post(
         "/api/sms/incoming",
         json={
-            "device_id": "DEV-R1",
+            "device_id": "010-9000-0121",
             "sender": "010-2000-0002",
             "body": "명시한 수신 번호",
             "receiver_number": "010-9999-0000",
@@ -2164,50 +2176,52 @@ def test_incoming_sms_stores_explicit_receiver_number(client):
     assert row["receiver_number"] == "010-9999-0000"
 
 
-def test_incoming_sms_falls_back_to_device_phone_number(client):
-    client.post("/api/devices", json={"device_id": "DEV-R2", "name": "B폰", "phone_number": "010-3000-0003"})
+def test_incoming_sms_falls_back_to_device_key(client):
+    client.post("/api/devices", json={"device_id": "010-9000-0122", "name": "B폰"})
     response = client.post(
         "/api/sms/incoming",
-        json={"device_id": "DEV-R2", "sender": "010-4000-0004", "body": "번호 없이 도착"},
+        json={"device_id": "010-9000-0122", "sender": "010-4000-0004", "body": "번호 없이 도착"},
     )
-    assert response.json()["sms"]["receiver_number"] == "010-3000-0003"
-    assert client.get("/api/sms").json()["messages"][0]["receiver_number"] == "010-3000-0003"
+    assert response.json()["sms"]["receiver_number"] == "010-9000-0122"
+    assert client.get("/api/sms").json()["messages"][0]["receiver_number"] == "010-9000-0122"
 
     conn = _conn()
     row = conn.execute("SELECT receiver_number FROM sms_inbox").fetchone()
     conn.close()
-    assert row["receiver_number"] == "010-3000-0003"
+    assert row["receiver_number"] == "010-9000-0122"
 
 
-def test_incoming_sms_accepts_recipient_alias_and_fills_device_number(client):
-    client.post("/api/devices", json={"device_id": "DEV-R3", "name": "C폰"})
+def test_incoming_sms_accepts_recipient_alias(client):
+    client.post("/api/devices", json={"device_id": "010-9000-0123", "name": "C폰"})
     response = client.post(
         "/api/sms/incoming",
-        json={"device_id": "DEV-R3", "sender": "010-5000-0005", "body": "recipient 이름", "recipient": "010-7000-0007"},
+        json={"device_id": "010-9000-0123", "sender": "010-5000-0005", "body": "recipient 이름", "recipient": "010-7000-0007"},
     )
     assert response.json()["sms"]["receiver_number"] == "010-7000-0007"
 
-    # 앱이 알려 준 수신 번호는 기기 정보에도 채워 둔다 (다음 문자부터 fallback 으로도 보인다)
+    # 기기 키는 바뀌지 않는다(듀얼 유심의 다른 번호로 문자가 와도 키는 대표 번호).
     device = client.get("/api/devices").json()["devices"][0]
-    assert device["phone_number"] == "010-7000-0007"
+    assert device["id"] == device["phone_number"] == "010-9000-0123"
     assert client.get("/api/sms").json()["messages"][0]["receiver_number"] == "010-7000-0007"
 
 
-def test_sms_receiver_number_falls_back_when_device_number_added_later(client):
-    client.post("/api/sms/incoming", json={"device_id": "DEV-R4", "sender": "1", "body": "먼저 온 문자"})
+def test_sms_receiver_number_uses_device_key_for_auto_registered_device(client):
+    # 등록 안 된 번호로 문자가 오면 그 번호를 키로 기기가 자동 등록되고, 수신 번호도 그 값이다.
+    client.post("/api/sms/incoming", json={"device_id": "010-9000-0124", "sender": "1", "body": "먼저 온 문자"})
     first = client.get("/api/sms").json()["messages"][0]
-    assert first["receiver_number"] == ""
-
-    # 나중에 대시보드에서 기기 번호를 넣으면 이미 받은 문자에도 수신 번호가 보인다
-    client.patch("/api/devices/DEV-R4", json={"phone_number": "010-6000-0006"})
-    after = client.get("/api/sms").json()["messages"][0]
-    assert after["receiver_number"] == "010-6000-0006"
+    assert first["receiver_number"] == "010-9000-0124"
+    device = client.get("/api/devices").json()["devices"][0]
+    assert device["id"] == device["phone_number"] == "010-9000-0124"
 
 
-def test_sms_receiver_number_is_empty_string_for_unknown_number(client):
-    client.post("/api/sms/incoming", json={"device_id": "DEV-NONUM", "sender": "1", "body": "번호 미설정"})
-    item = client.get("/api/sms").json()["messages"][0]
-    assert item["receiver_number"] == ""
+def test_incoming_sms_rejects_non_phone_device_key(client):
+    # 번호가 아닌 기기 키(옛 ID)는 받아 주지 않는다.
+    response = client.post("/api/sms/incoming", json={"device_id": "010-9000-0191", "sender": "1", "body": "x"})
+    assert response.status_code == 200
+    # 번호는 키로 등록된다
+    assert client.get("/api/devices").json()["devices"][0]["id"] == "010-9000-0191"
+    response = client.post("/api/sms/incoming", json={"device_id": "LEGACY-1", "sender": "1", "body": "x"})
+    assert response.status_code == 400
 
 
 def test_db_migration_adds_phone_and_receiver_columns_to_existing_db(tmp_path, monkeypatch):
@@ -2271,16 +2285,28 @@ def test_db_migration_adds_phone_and_receiver_columns_to_existing_db(tmp_path, m
     assert sms_row["receiver_number"] == ""
     conn.close()
 
-    # 마이그레이션 후에도 기존 문자는 그대로 보이고, 기기 번호를 넣으면 수신 번호가 채워진다
+    # 마이그레이션 후에도 기존 문자는 그대로 보인다(기기 번호가 없던 기기는 그대로 남는다).
     monkeypatch.setattr(config, "DB_PATH", old_db)
     with TestClient(app) as migrated_client:
         messages = migrated_client.get("/api/sms").json()["messages"]
         assert messages[0]["body"] == "기존 문자"
         assert messages[0]["receiver_number"] == ""
-        migrated_client.patch("/api/devices/5656", json={"phone_number": "010-5656-3939"})
+        assert [d["id"] for d in migrated_client.get("/api/devices").json()["devices"]] == ["5656"]
+
+        # 폰 앱이 유심 번호를 읽어 등록하면, 번호가 비어 있던 옛 기기 줄을 그대로 수신번호 키로 옮긴다.
+        registered = migrated_client.post(
+            "/api/devices", json={"device_id": "5656", "name": "5656", "phone_number": "010-5656-3939"}
+        )
+        assert registered.status_code == 200, registered.text
+        assert registered.json()["device"]["id"] == "010-5656-3939"
+        assert registered.json()["device"]["phone_number"] == "010-5656-3939"
         messages = migrated_client.get("/api/sms").json()["messages"]
+        assert messages[0]["body"] == "기존 문자"
+        assert messages[0]["device_id"] == "010-5656-3939"
         assert messages[0]["receiver_number"] == "010-5656-3939"
-        assert messages[0]["device_id"] == "5656"
+        # 옛 앱이 예전 기기 ID 로 계속 폴링해도 같은 기기로 이어진다.
+        assert migrated_client.get("/api/tasks/poll", params={"device_id": "5656"}).status_code == 200
+        assert [d["id"] for d in migrated_client.get("/api/devices").json()["devices"]] == ["010-5656-3939"]
 
     # 두 번 실행해도 안전(멱등)
     db.init_db(old_db)
@@ -2320,11 +2346,13 @@ def test_dashboard_sms_tab_has_receiver_number_column(client):
 # 22. 스케줄 다중 기기 선택(기기당 같은 횟수) · 기기명/번호 표시
 # --------------------------------------------------------------------------
 def _register_device(client: TestClient, device_id: str, name: str, phone_number: str = "") -> str:
+    """기기를 등록한다. 기기 키는 수신번호이므로 device_id 자체를 번호로 쓴다."""
+    phone = phone_number or device_id
     response = client.post(
-        "/api/devices", json={"device_id": device_id, "name": name, "phone_number": phone_number}
+        "/api/devices", json={"device_id": phone, "name": name, "phone_number": phone}
     )
     assert response.status_code == 200, response.text
-    return device_id
+    return response.json()["device"]["id"]
 
 
 def _tasks_in_run(client: TestClient, run_id: int) -> list[dict]:
@@ -2334,13 +2362,13 @@ def _tasks_in_run(client: TestClient, run_id: int) -> list[dict]:
 
 
 def test_create_schedule_with_multiple_target_devices(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
 
-    schedule = make_schedule(client, total_calls=3, target_device_ids=["DEV-A", "DEV-B", "DEV-A"])
+    schedule = make_schedule(client, total_calls=3, target_device_ids=["010-9000-0001", "010-9000-0002", "010-9000-0001"])
 
     # 중복은 한 번만, 한 대가 아니면 device_id 는 비운다.
-    assert schedule["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert schedule["target_device_ids"] == ["010-9000-0001", "010-9000-0002"]
     assert schedule["device_id"] is None
     assert schedule["target_device_count"] == 2
     # 기기마다 같은 횟수(3회)를 따로 발신 → 합계 6건
@@ -2348,31 +2376,31 @@ def test_create_schedule_with_multiple_target_devices(client):
     assert schedule["tasks_per_run"] == 6
 
     devices = {d["device_id"]: d for d in schedule["target_devices"]}
-    assert devices["DEV-A"]["name"] == "갤럭시 A"
-    assert devices["DEV-A"]["phone_number"] == "010-1111-2222"
-    assert devices["DEV-B"]["name"] == "갤럭시 B"
-    assert devices["DEV-B"]["phone_number"] == "010-3333-4444"
+    assert devices["010-9000-0001"]["name"] == "갤럭시 A"
+    assert devices["010-9000-0001"]["phone_number"] == "010-9000-0001"
+    assert devices["010-9000-0002"]["name"] == "갤럭시 B"
+    assert devices["010-9000-0002"]["phone_number"] == "010-9000-0002"
     assert all(d["online"] for d in schedule["target_devices"])
 
 
 def test_schedule_single_device_id_is_backwards_compatible(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
 
-    schedule = make_schedule(client, device_id="DEV-A")
+    schedule = make_schedule(client, device_id="010-9000-0001")
 
-    assert schedule["device_id"] == "DEV-A"
-    assert schedule["target_device_ids"] == ["DEV-A"]
+    assert schedule["device_id"] == "010-9000-0001"
+    assert schedule["target_device_ids"] == ["010-9000-0001"]
     assert schedule["tasks_per_device"] == schedule["tasks_per_run"] == 6
     assert schedule["target_devices"][0]["name"] == "갤럭시 A"
 
 
 def test_schedule_accepts_target_device_id_alias(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
 
-    schedule = make_schedule(client, target_device_id="DEV-A")
+    schedule = make_schedule(client, target_device_id="010-9000-0001")
 
-    assert schedule["target_device_ids"] == ["DEV-A"]
-    assert schedule["device_id"] == "DEV-A"
+    assert schedule["target_device_ids"] == ["010-9000-0001"]
+    assert schedule["device_id"] == "010-9000-0001"
 
 
 def test_schedule_without_devices_stays_auto_share(client):
@@ -2386,24 +2414,24 @@ def test_schedule_without_devices_stays_auto_share(client):
 
 
 def test_update_schedule_switches_between_auto_and_devices(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
     schedule = make_schedule(client, total_calls=2)
     assert schedule["target_device_ids"] == []
 
     body = client.patch(
-        f"/api/schedules/{schedule['id']}", json={"target_device_ids": ["DEV-A", "DEV-B"]}
+        f"/api/schedules/{schedule['id']}", json={"target_device_ids": ["010-9000-0001", "010-9000-0002"]}
     ).json()["schedule"]
-    assert body["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert body["target_device_ids"] == ["010-9000-0001", "010-9000-0002"]
     assert body["device_id"] is None
     assert body["tasks_per_device"] == 2
     assert body["tasks_per_run"] == 4
 
     body = client.patch(
-        f"/api/schedules/{schedule['id']}", json={"target_device_ids": ["DEV-B"]}
+        f"/api/schedules/{schedule['id']}", json={"target_device_ids": ["010-9000-0002"]}
     ).json()["schedule"]
-    assert body["target_device_ids"] == ["DEV-B"]
-    assert body["device_id"] == "DEV-B"
+    assert body["target_device_ids"] == ["010-9000-0002"]
+    assert body["device_id"] == "010-9000-0002"
     assert body["tasks_per_run"] == 2
 
     body = client.patch(f"/api/schedules/{schedule['id']}", json={"target_device_ids": []}).json()["schedule"]
@@ -2412,38 +2440,38 @@ def test_update_schedule_switches_between_auto_and_devices(client):
 
 
 def test_update_schedule_device_id_replaces_multi_selection(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
-    schedule = make_schedule(client, target_device_ids=["DEV-A", "DEV-B"])
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
+    schedule = make_schedule(client, target_device_ids=["010-9000-0001", "010-9000-0002"])
 
-    body = client.patch(f"/api/schedules/{schedule['id']}", json={"device_id": "DEV-A"}).json()["schedule"]
+    body = client.patch(f"/api/schedules/{schedule['id']}", json={"device_id": "010-9000-0001"}).json()["schedule"]
 
-    assert body["target_device_ids"] == ["DEV-A"]
-    assert body["device_id"] == "DEV-A"
+    assert body["target_device_ids"] == ["010-9000-0001"]
+    assert body["device_id"] == "010-9000-0001"
 
 
 def test_copy_schedule_keeps_multiple_target_devices(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
-    schedule = make_schedule(client, total_calls=2, target_device_ids=["DEV-A", "DEV-B"])
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
+    schedule = make_schedule(client, total_calls=2, target_device_ids=["010-9000-0001", "010-9000-0002"])
 
     copied = client.post(f"/api/schedules/{schedule['id']}/copy", json={}).json()["schedule"]
 
-    assert copied["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert copied["target_device_ids"] == ["010-9000-0001", "010-9000-0002"]
     assert copied["status"] == "paused"
     assert copied["tasks_per_device"] == 2
     assert copied["tasks_per_run"] == 4
 
 
 def test_multi_device_run_creates_same_amount_per_device(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
     schedule = make_schedule(
         client,
         numbers=["010-1111-0001", "010-1111-0002", "010-1111-0003"],
         total_calls=4,
         order_mode="sequence",
-        target_device_ids=["DEV-A", "DEV-B"],
+        target_device_ids=["010-9000-0001", "010-9000-0002"],
     )
 
     run_id = client.post(f"/api/schedules/{schedule['id']}/run-now").json()["run_id"]
@@ -2451,17 +2479,17 @@ def test_multi_device_run_creates_same_amount_per_device(client):
 
     assert len(tasks) == 8
     counts = Counter(task["device_id"] for task in tasks)
-    assert counts == {"DEV-A": 4, "DEV-B": 4}
+    assert counts == {"010-9000-0001": 4, "010-9000-0002": 4}
     expected = ["010-1111-0001", "010-1111-0002", "010-1111-0003", "010-1111-0001"]
-    for device_id in ("DEV-A", "DEV-B"):
+    for device_id in ("010-9000-0001", "010-9000-0002"):
         assert [t["phone_number"] for t in tasks if t["device_id"] == device_id] == expected
     # 같은 실행 안에서 순번은 이어지고 겹치지 않는다.
     assert sorted(task["seq"] for task in tasks) == list(range(1, 9))
 
 
 def test_multi_device_random_order_is_shuffled_per_device(client, monkeypatch):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
     numbers = ["010-1111-0001", "010-1111-0002", "010-1111-0003", "010-1111-0004"]
 
     calls: list[list[str]] = []
@@ -2477,50 +2505,50 @@ def test_multi_device_random_order_is_shuffled_per_device(client, monkeypatch):
         numbers=numbers,
         total_calls=4,
         order_mode="random",
-        target_device_ids=["DEV-A", "DEV-B"],
+        target_device_ids=["010-9000-0001", "010-9000-0002"],
     )
 
     run_id = client.post(f"/api/schedules/{schedule['id']}/run-now").json()["run_id"]
     tasks = _tasks_in_run(client, run_id)
 
     assert len(calls) == 2, "기기마다 따로 섞어야 한다"
-    first = [t["phone_number"] for t in tasks if t["device_id"] == "DEV-A"]
-    second = [t["phone_number"] for t in tasks if t["device_id"] == "DEV-B"]
+    first = [t["phone_number"] for t in tasks if t["device_id"] == "010-9000-0001"]
+    second = [t["phone_number"] for t in tasks if t["device_id"] == "010-9000-0002"]
     assert first == numbers
     assert second == list(reversed(numbers))
 
 
 def test_multi_device_tasks_are_claimed_only_by_their_device(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
     schedule = make_schedule(
         client,
         numbers=["010-1111-0001", "010-1111-0002"],
         total_calls=2,
-        target_device_ids=["DEV-A", "DEV-B"],
+        target_device_ids=["010-9000-0001", "010-9000-0002"],
     )
     client.post(f"/api/schedules/{schedule['id']}/run-now")
 
     for _ in range(2):
-        task = client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"]
-        assert task["device_id"] == "DEV-A"
-    assert client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"] is None
+        task = client.get("/api/tasks/poll", params={"device_id": "010-9000-0001"}).json()["task"]
+        assert task["device_id"] == "010-9000-0001"
+    assert client.get("/api/tasks/poll", params={"device_id": "010-9000-0001"}).json()["task"] is None
 
-    task_b = client.get("/api/tasks/poll", params={"device_id": "DEV-B"}).json()["task"]
-    assert task_b["device_id"] == "DEV-B"
+    task_b = client.get("/api/tasks/poll", params={"device_id": "010-9000-0002"}).json()["task"]
+    assert task_b["device_id"] == "010-9000-0002"
 
 
 def test_delete_device_cleans_schedule_target_devices(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
-    schedule = make_schedule(client, target_device_ids=["DEV-A", "DEV-B"])
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
+    schedule = make_schedule(client, target_device_ids=["010-9000-0001", "010-9000-0002"])
 
-    assert client.delete("/api/devices/DEV-A").status_code == 200
+    assert client.delete("/api/devices/010-9000-0001").status_code == 200
     body = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
-    assert body["target_device_ids"] == ["DEV-B"]
-    assert body["device_id"] == "DEV-B"
+    assert body["target_device_ids"] == ["010-9000-0002"]
+    assert body["device_id"] == "010-9000-0002"
 
-    assert client.delete("/api/devices/DEV-B").status_code == 200
+    assert client.delete("/api/devices/010-9000-0002").status_code == 200
     body = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
     assert body["target_device_ids"] == []
     assert body["device_id"] is None
@@ -2553,8 +2581,8 @@ def test_deleted_device_still_shows_in_schedule_with_id_name(client):
 
 
 def test_multi_device_volume_over_limit_is_rejected(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
 
     response = client.post(
         "/api/schedules",
@@ -2565,7 +2593,7 @@ def test_multi_device_volume_over_limit_is_rejected(client):
             "total_calls": 4000,
             "start_at": "2026-11-23T09:00",
             "recurrence": "once",
-            "target_device_ids": ["DEV-A", "DEV-B"],
+            "target_device_ids": ["010-9000-0001", "010-9000-0002"],
         },
     )
 
@@ -2651,21 +2679,21 @@ def test_dashboard_has_multi_device_picker_and_device_column(client):
 
 
 def test_pause_and_resume_keep_multiple_target_devices(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
-    schedule = make_schedule(client, target_device_ids=["DEV-A", "DEV-B"])
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
+    schedule = make_schedule(client, target_device_ids=["010-9000-0001", "010-9000-0002"])
 
     paused = client.post(f"/api/schedules/{schedule['id']}/pause").json()["schedule"]
     assert paused["status"] == "paused"
-    assert paused["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert paused["target_device_ids"] == ["010-9000-0001", "010-9000-0002"]
 
     resumed = client.post(f"/api/schedules/{schedule['id']}/resume").json()["schedule"]
-    assert resumed["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert resumed["target_device_ids"] == ["010-9000-0001", "010-9000-0002"]
     assert resumed["device_id"] is None
 
     # 다른 항목만 고치는 PATCH 도 기기 목록을 건드리지 않는다
     patched = client.patch(f"/api/schedules/{schedule['id']}", json={"name": "이름만 변경"}).json()["schedule"]
-    assert patched["target_device_ids"] == ["DEV-A", "DEV-B"]
+    assert patched["target_device_ids"] == ["010-9000-0001", "010-9000-0002"]
 
 
 # --------------------------------------------------------------------------
@@ -2802,78 +2830,70 @@ def test_logs_have_category_and_full_timestamp(client):
 # --------------------------------------------------------------------------
 # 24. 기기 정보 편집(이름·번호·메모·사용 여부) · 앱 등록이 덮어쓰지 않음
 # --------------------------------------------------------------------------
-def test_device_patch_edits_name_phone_note_and_enabled(client):
-    client.post("/api/devices", json={"device_id": "DEV-EDIT", "name": "앱이름"})
+def test_device_patch_edits_name_note_and_enabled(client):
+    client.post("/api/devices", json={"device_id": "010-9000-0201", "name": "앱이름"})
 
     body = client.patch(
-        "/api/devices/DEV-EDIT",
-        json={"name": "사무실폰", "phone_number": "010-4444-5555", "note": "유심 2번", "enabled": False},
+        "/api/devices/010-9000-0201",
+        json={"name": "사무실폰", "note": "유심 2번", "enabled": False},
     ).json()["device"]
     assert body["name"] == "사무실폰"
-    assert body["phone_number"] == "010-4444-5555"
+    assert body["phone_number"] == "010-9000-0201"
     assert body["note"] == "유심 2번"
     assert body["enabled"] is False
     assert body["name_customized"] is True
-    assert body["phone_customized"] is True
 
     # 이름만 고쳐도 번호·메모는 그대로 남는다.
-    body = client.patch("/api/devices/DEV-EDIT", json={"name": "거실폰"}).json()["device"]
-    assert (body["name"], body["phone_number"], body["note"]) == ("거실폰", "010-4444-5555", "유심 2번")
+    body = client.patch("/api/devices/010-9000-0201", json={"name": "거실폰"}).json()["device"]
+    assert (body["name"], body["phone_number"], body["note"]) == ("거실폰", "010-9000-0201", "유심 2번")
     assert client.patch("/api/devices/NOPE", json={"name": "x"}).status_code == 404
 
 
-def test_device_customized_name_and_phone_survive_app_registration(client):
-    client.post(
-        "/api/devices",
-        json={"device_id": "DEV-KEEP", "name": "앱이 알려준 이름", "phone_number": "010-1111-0001"},
-    )
-    client.patch(
-        "/api/devices/DEV-KEEP",
-        json={"name": "내가 고친 이름", "phone_number": "010-2222-0002", "note": "책상 위"},
-    )
+def test_device_customized_name_survives_app_registration(client):
+    client.post("/api/devices", json={"device_id": "010-9000-0041", "name": "앱이 알려준 이름"})
+    client.patch("/api/devices/010-9000-0041", json={"name": "내가 고친 이름", "note": "책상 위"})
 
-    # 앱은 30초마다 등록 요청을 보낸다(이름·번호가 예전 값, 번호는 빈 값일 수도 있다).
+    # 앱은 30초마다 등록 요청을 보낸다(이름이 예전 값이거나 다른 값).
     for payload in (
-        {"device_id": "DEV-KEEP", "name": "앱이 알려준 이름", "phone_number": ""},
-        {"device_id": "DEV-KEEP", "name": "다른 이름", "phone_number": "010-9999-9999"},
+        {"device_id": "010-9000-0041", "name": "앱이 알려준 이름", "phone_number": ""},
+        {"device_id": "010-9000-0041", "name": "다른 이름", "phone_number": "010-9000-0041"},
     ):
         device = client.post("/api/devices", json=payload).json()["device"]
         assert device["name"] == "내가 고친 이름"
-        assert device["phone_number"] == "010-2222-0002"
+        assert device["phone_number"] == device["id"] == "010-9000-0041"
         assert device["note"] == "책상 위"
-        assert device["name_customized"] is True and device["phone_customized"] is True
+        assert device["name_customized"] is True
 
 
 def test_device_unmodified_name_follows_app_registration(client):
-    client.post("/api/devices", json={"device_id": "DEV-FOLLOW", "name": "예전 이름"})
-    device = client.post("/api/devices", json={"device_id": "DEV-FOLLOW", "name": "새 이름"}).json()["device"]
+    client.post("/api/devices", json={"device_id": "010-9000-0161", "name": "예전 이름"})
+    device = client.post("/api/devices", json={"device_id": "010-9000-0161", "name": "새 이름"}).json()["device"]
     assert device["name"] == "새 이름"
     assert device["name_customized"] is False
 
 
-def test_device_phone_cleared_by_user_is_not_refilled_by_incoming_sms(client):
-    client.post("/api/devices", json={"device_id": "DEV-NUM", "name": "폰", "phone_number": "010-1111-0001"})
-    client.patch("/api/devices/DEV-NUM", json={"phone_number": ""})
+def test_device_key_is_never_empty_or_changed_by_sms(client):
+    client.post("/api/devices", json={"device_id": "010-9000-0141", "name": "폰"})
+    assert client.patch("/api/devices/010-9000-0141", json={"phone_number": ""}).status_code == 422
 
     client.post(
         "/api/sms/incoming",
-        json={"device_id": "DEV-NUM", "sender": "010-2", "body": "문자", "receiver_number": "010-7777-8888"},
+        json={"device_id": "010-9000-0141", "sender": "010-2", "body": "문자", "receiver_number": "010-7777-8888"},
     )
     device = client.get("/api/devices").json()["devices"][0]
-    assert device["phone_number"] == ""
-    assert device["phone_customized"] is True
-    # 문자에는 앱이 알려준 수신 번호가 그대로 보인다.
+    assert device["id"] == device["phone_number"] == "010-9000-0141"
+    # 문자에는 앱이 알려준 수신 번호(그 유심 번호)가 그대로 보인다.
     assert client.get("/api/sms").json()["messages"][0]["receiver_number"] == "010-7777-8888"
 
 
 def test_device_patch_edits_model_and_android_version(client):
     client.post(
         "/api/devices",
-        json={"device_id": "DEV-SPEC", "name": "폰", "model": "samsung SM-S916N", "android_version": "17"},
+        json={"device_id": "010-9000-0071", "name": "폰", "model": "samsung SM-S916N", "android_version": "17"},
     )
 
     body = client.patch(
-        "/api/devices/DEV-SPEC", json={"model": "Galaxy S23 (내가 고침)", "android_version": "14"}
+        "/api/devices/010-9000-0071", json={"model": "Galaxy S23 (내가 고침)", "android_version": "14"}
     ).json()["device"]
     assert body["model"] == "Galaxy S23 (내가 고침)"
     assert body["android_version"] == "14"
@@ -2883,8 +2903,8 @@ def test_device_patch_edits_model_and_android_version(client):
 
     # 앱은 30초마다 등록 정보를 다시 보낸다. 직접 고친 모델·버전은 덮어쓰지 않는다.
     for payload in (
-        {"device_id": "DEV-SPEC", "model": "samsung SM-S916N", "android_version": "17"},
-        {"device_id": "DEV-SPEC"},
+        {"device_id": "010-9000-0071", "model": "samsung SM-S916N", "android_version": "17"},
+        {"device_id": "010-9000-0071"},
     ):
         device = client.post("/api/devices", json=payload).json()["device"]
         assert device["model"] == "Galaxy S23 (내가 고침)"
@@ -2892,74 +2912,108 @@ def test_device_patch_edits_model_and_android_version(client):
         assert device["model_customized"] is True and device["android_customized"] is True
 
     # 비워 보내면 직접 지정을 풀어 앱이 알려주는 값으로 돌아간다.
-    body = client.patch("/api/devices/DEV-SPEC", json={"model": "", "android_version": ""}).json()["device"]
+    body = client.patch("/api/devices/010-9000-0071", json={"model": "", "android_version": ""}).json()["device"]
     assert (body["model"], body["android_version"]) == ("", "")
     assert body["model_customized"] is False and body["android_customized"] is False
     device = client.post(
-        "/api/devices", json={"device_id": "DEV-SPEC", "model": "samsung SM-S916N", "android_version": "17"}
+        "/api/devices", json={"device_id": "010-9000-0071", "model": "samsung SM-S916N", "android_version": "17"}
     ).json()["device"]
     assert (device["model"], device["android_version"]) == ("samsung SM-S916N", "17")
 
 
-def test_device_rename_moves_schedules_tasks_and_sms(client):
-    _register_device(client, "DEV-OLD", "옛 폰", "010-1111-2222")
-    schedule = make_schedule(
-        client, numbers=["010-1111-0001", "010-1111-0002"], total_calls=2, target_device_ids=["DEV-OLD"]
+def _insert_legacy_device(device_id: str, phone_number: str, name: str = "옛 폰") -> None:
+    """예전 형식(기기 ID ≠ 수신번호)의 기기를 DB 에 직접 넣는다(마이그레이션 검사용)."""
+    conn = _conn()
+    conn.execute(
+        """INSERT INTO devices(id, name, phone_number, enabled, created_at)
+           VALUES (?, ?, ?, 1, '2026-11-22T19:07:06+09:00')""",
+        (device_id, name, phone_number),
     )
+    conn.close()
+
+
+def test_migration_moves_legacy_device_key_to_phone_number(client):
+    """운영 DB(5656 + 수신번호)를 새 스키마로 올리면 키·스케줄·작업·문자가 모두 수신번호로 옮겨진다."""
+    _insert_legacy_device("5656", "010-5656-3939", "5656 갤23+")
+    schedule = make_schedule(client, numbers=["010-1111-0001", "010-1111-0002"], total_calls=2)
+    conn = _conn()
+    conn.execute(
+        "UPDATE schedules SET device_id = '5656', target_device_ids = ? WHERE id = ?",
+        (json.dumps(["5656"]), schedule["id"]),
+    )
+    conn.close()
     client.post(f"/api/schedules/{schedule['id']}/run-now")
-    client.post("/api/sms/incoming", json={"device_id": "DEV-OLD", "sender": "010-2", "body": "옛 번호로 온 문자"})
+    conn = _conn()
+    conn.execute("UPDATE tasks SET device_id = '5656'")
+    conn.close()
+    client.post("/api/sms/incoming", json={"device_id": "010-5656-3939", "sender": "010-2", "body": "옛 번호로 온 문자"})
+    conn = _conn()
+    conn.execute("UPDATE sms_inbox SET device_id = '5656'")
+    conn.close()
 
-    body = client.patch("/api/devices/DEV-OLD", json={"new_device_id": "DEV-NEW", "name": "새 폰"}).json()
-    assert body["renamed_from"] == "DEV-OLD"
-    assert body["device"]["id"] == "DEV-NEW"
-    assert body["device"]["name"] == "새 폰"
-    assert [d["id"] for d in client.get("/api/devices").json()["devices"]] == ["DEV-NEW"]
+    db.init_db()  # 서버 재배포와 같은 마이그레이션
 
-    moved = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
-    assert moved["device_id"] == "DEV-NEW"
-    assert moved["target_device_ids"] == ["DEV-NEW"]
-    assert moved["target_devices"][0]["device_id"] == "DEV-NEW"
-    assert moved["target_devices"][0]["name"] == "새 폰"
-    assert [t["device_id"] for t in client.get("/api/tasks").json()["tasks"]] == ["DEV-NEW", "DEV-NEW"]
+    conn = _conn()
+    assert [row["id"] for row in conn.execute("SELECT id FROM devices")] == ["010-5656-3939"]
+    assert conn.execute("SELECT phone_number FROM devices WHERE id = '010-5656-3939'").fetchone()[0] == "010-5656-3939"
+    sched = conn.execute("SELECT device_id, target_device_ids FROM schedules WHERE id = ?", (schedule["id"],)).fetchone()
+    assert sched["device_id"] == "010-5656-3939"
+    assert json.loads(sched["target_device_ids"]) == ["010-5656-3939"]
+    assert {row[0] for row in conn.execute("SELECT device_id FROM tasks")} == {"010-5656-3939"}
+    assert {row[0] for row in conn.execute("SELECT device_id FROM sms_inbox")} == {"010-5656-3939"}
+    # 옛 기기 ID 는 별칭으로 남아, 폰에 옛 앱이 남아 있어도 같은 기기로 이어진다.
+    assert db.device_alias_target(conn, "5656") == "010-5656-3939"
+    conn.close()
+
+    assert client.get("/api/tasks/poll", params={"device_id": "5656"}).status_code == 200
     message = client.get("/api/sms").json()["messages"][0]
-    assert message["device_id"] == "DEV-NEW"
-    assert message["device_name"] == "새 폰"
-
-    # 새 ID 로 작업을 받고, 옛 ID 로는 받지 않는다.
-    assert client.get("/api/tasks/poll", params={"device_id": "DEV-OLD"}).json()["task"] is None
-    task = client.get("/api/tasks/poll", params={"device_id": "DEV-NEW"}).json()["task"]
-    assert task["device_id"] == "DEV-NEW"
+    assert message["device_id"] == "010-5656-3939"
+    assert message["device_name"] == "5656 갤23+"
+    assert message["receiver_number"] == "010-5656-3939"
 
 
-def test_device_rename_keeps_multi_device_schedule_list(client):
-    _register_device(client, "DEV-A", "갤럭시 A")
-    _register_device(client, "DEV-B", "갤럭시 B")
-    schedule = make_schedule(client, target_device_ids=["DEV-A", "DEV-B"])
+def test_migration_keeps_multi_device_schedule_list_and_merges_duplicates(client):
+    _register_device(client, "010-9000-0002", "갤럭시 B")
+    _insert_legacy_device("010-9000-0001", "010-9000-0001", "갤럭시 A")
+    # 같은 번호가 두 번(옛 ID + 수신번호) 등록된 경우: 기록은 수신번호 쪽으로 모이고 중복은 사라진다.
+    _insert_legacy_device("OLD-DUP", "010-9000-0001", "갤럭시 A (중복)")
+    schedule = make_schedule(client, target_device_ids=["OLD-DUP", "010-9000-0002"])
 
-    client.patch("/api/devices/DEV-A", json={"new_device_id": "DEV-A2"})
+    db.init_db()
+
+    ids = sorted(d["id"] for d in client.get("/api/devices").json()["devices"])
+    assert ids == ["010-9000-0001", "010-9000-0002"]
     body = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
-    # 순서를 유지한 채 바뀐 기기만 새 ID 로 바뀐다.
-    assert body["target_device_ids"] == ["DEV-A2", "DEV-B"]
+    # 순서를 유지한 채 바뀐 기기만 수신번호로 바뀐다.
+    assert body["target_device_ids"] == ["010-9000-0001", "010-9000-0002"]
     assert body["device_id"] is None
+    assert client.get("/api/devices").json()["devices"][0]["name"] == "갤럭시 A"
 
 
-def test_device_rename_rejects_duplicate_or_bad_id(client):
-    _register_device(client, "DEV-A", "A")
-    _register_device(client, "DEV-B", "B")
+def test_device_key_change_is_rejected(client):
+    _register_device(client, "010-9000-0001", "A")
+    _register_device(client, "010-9000-0002", "B")
 
-    response = client.patch("/api/devices/DEV-A", json={"new_device_id": "DEV-B"})
-    assert response.status_code == 409
-    assert "DEV-B" in response.json()["detail"]
-    assert {d["id"] for d in client.get("/api/devices").json()["devices"]} == {"DEV-A", "DEV-B"}
+    for payload in (
+        {"new_device_id": "010-9000-0002"},
+        {"new_device_id": "BAD/ID"},
+        {"phone_number": "010-9000-0002"},
+        {"phone_number": ""},
+    ):
+        response = client.patch("/api/devices/010-9000-0001", json=payload)
+        assert response.status_code == 422, payload
+        assert "수신번호(기기 키)는 수정할 수 없습니다." == response.json()["detail"]
+    assert client.patch("/api/devices/NOPE", json={"new_device_id": "X"}).status_code == 404
+    assert {d["id"] for d in client.get("/api/devices").json()["devices"]} == {"010-9000-0001", "010-9000-0002"}
     assert client.get("/api/devices").json()["devices"][0]["name"] == "A"
 
-    for bad in ("BAD/ID", "BAD\\ID"):
-        assert client.patch("/api/devices/DEV-A", json={"new_device_id": bad}).status_code == 422
-    assert client.patch("/api/devices/NOPE", json={"new_device_id": "X"}).status_code == 404
-
-    # 같은 ID 를 보내면 바꿀 것 없이 그대로 둔다.
-    body = client.patch("/api/devices/DEV-A", json={"new_device_id": "DEV-A"}).json()
-    assert body["device"]["id"] == "DEV-A"
+    # 같은 키를 보내면 바꿀 것 없이 그대로 둔다(이름 수정은 된다).
+    body = client.patch(
+        "/api/devices/010-9000-0001", json={"new_device_id": "010-9000-0001", "name": "거실폰"}
+    ).json()
+    assert body["device"]["id"] == "010-9000-0001"
+    assert body["device"]["name"] == "거실폰"
+    assert body["renamed_from"] is None
     assert body["renamed_from"] is None
 
 
@@ -3011,17 +3065,17 @@ def test_soft_delete_hides_every_list_and_stats(client):
 
 
 def test_schedule_soft_delete_cancels_tasks_so_phone_never_dials(client):
-    client.post("/api/devices", json={"device_id": "DEV-SOFT"})
-    schedule = make_schedule(client, numbers=["010-5000-0101"], repeat_count=1, device_id="DEV-SOFT")
+    client.post("/api/devices", json={"device_id": "010-9000-0051"})
+    schedule = make_schedule(client, numbers=["010-5000-0101"], repeat_count=1, device_id="010-9000-0051")
     client.post(f"/api/schedules/{schedule['id']}/run-now")
-    first = client.get("/api/tasks/poll", params={"device_id": "DEV-SOFT"}).json()["task"]
+    first = client.get("/api/tasks/poll", params={"device_id": "010-9000-0051"}).json()["task"]
     assert first is not None
     client.post(f"/api/tasks/{first['id']}/start")
 
     body = client.delete(f"/api/schedules/{schedule['id']}").json()
     assert body["canceled_tasks"] == 1
 
-    polled = client.get("/api/tasks/poll", params={"device_id": "DEV-SOFT"}).json()
+    polled = client.get("/api/tasks/poll", params={"device_id": "010-9000-0051"}).json()
     assert polled["task"] is None
     assert polled["pending_tasks"] == 0
 
@@ -3032,7 +3086,7 @@ def test_schedule_soft_delete_cancels_tasks_so_phone_never_dials(client):
 
     # 이미 발신 중이던 폰이 뒤늦게 결과를 보고해도 되살아나지 않는다.
     assert client.post(
-        f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-SOFT", "status": "done"}
+        f"/api/tasks/{first['id']}/result", json={"device_id": "010-9000-0051", "status": "done"}
     ).status_code == 404
 
 
@@ -3294,22 +3348,20 @@ def test_db_migration_adds_soft_delete_and_device_flags(tmp_path, monkeypatch):
         assert [s["id"] for s in migrated.get("/api/schedules").json()["schedules"]] == [1]
         assert [m["id"] for m in migrated.get("/api/sms").json()["messages"]] == [1]
         assert migrated.get("/api/archive").json()["counts"]["total"] == 0
-        # 대시보드에서 고친 이름·번호는 앱 재등록에도 유지된다.
-        migrated.patch("/api/devices/5656", json={"name": "형원님 폰", "phone_number": "010-5656-3939"})
-        device = migrated.post("/api/devices", json={"device_id": "5656", "name": "5656", "phone_number": ""}).json()["device"]
-        assert device["name"] == "형원님 폰" and device["phone_number"] == "010-5656-3939"
-
-        # 예전 DB 에서도 모델명·안드로이드 버전 수정과 기기 ID 변경이 그대로 동작한다.
-        device = migrated.patch(
-            "/api/devices/5656",
-            json={"model": "samsung SM-S916N (내가 고침)", "android_version": "17", "new_device_id": "5656-NEW"},
-        ).json()["device"]
-        assert device["id"] == "5656-NEW"
-        assert device["model_customized"] is True and device["android_customized"] is True
+        # 대시보드에서 고친 이름·모델은 앱 재등록에도 유지된다.
+        assert migrated.patch("/api/devices/5656", json={"phone_number": "010-5656-3939"}).status_code == 422
+        migrated.patch("/api/devices/5656", json={"name": "형원님 폰", "model": "samsung SM-S916N (내가 고침)", "android_version": "17"})
+        # 폰 앱이 유심 번호를 읽어 등록하면 그 번호가 기기 키가 된다(옛 ID 는 별치).
         device = migrated.post(
-            "/api/devices", json={"device_id": "5656-NEW", "model": "samsung SM-S916N", "android_version": "16"}
+            "/api/devices",
+            json={"device_id": "5656", "name": "5656", "phone_number": "010-5656-3939", "model": "samsung SM-S916N", "android_version": "16"},
         ).json()["device"]
+        assert device["id"] == device["phone_number"] == "010-5656-3939"
+        assert device["name"] == "형원님 폰"
         assert device["model"] == "samsung SM-S916N (내가 고침)" and device["android_version"] == "17"
+        # 옛 기기 ID 로 들어오는 요청도 같은 기기로 이어진다.
+        assert migrated.get("/api/tasks/poll", params={"device_id": "5656"}).status_code == 200
+        assert [d["id"] for d in migrated.get("/api/devices").json()["devices"]] == ["010-5656-3939"]
 
 
 # --------------------------------------------------------------------------
@@ -3354,7 +3406,6 @@ def test_dashboard_has_device_edit_controls(client):
     for keyword in (
         'id="deviceModal"',
         'id="devEditName"',
-        'id="devEditDeviceId"',
         'id="devEditPhone"',
         'id="devEditModel"',
         'id="devEditAndroid"',
@@ -3364,24 +3415,29 @@ def test_dashboard_has_device_edit_controls(client):
         "saveDeviceEdit(",
         "closeDeviceEdit(",
         "기기 정보 편집",
-        "표시 이름 (기기명)",
-        "기기 ID",
-        "수신 번호",
+        "기기 이름",
+        "수신 번호 (고유 키)",
+        "수정 불가",
         "모델명",
         "안드로이드 버전",
         "메모",
-        "스케줄·작업·수신문자 기록도 함께 옮겨지며",
         "devicesSignature",
         "data-lastseen",
     ):
         assert keyword in html, keyword
+    # 기기 ID 입력칸과 '표시 이름' 표기는 사라지고, 수신 번호는 읽기 전용이다.
+    for gone in ('id="devId"', 'id="devEditDeviceId"', "표시 이름", "기기 ID</label>"):
+        assert gone not in html, gone
+    assert 'id="devEditPhone" maxlength="30" disabled readonly' in html
     # 기기 표의 액션은 편집 · 사용 중지 · 삭제 세 가지
     assert "편집</button>" in html
     # 저장 후에는 기기·스케줄·대기열·수신 문자 목록을 함께 다시 읽는다.
     save_fn = html.split("async function saveDeviceEdit()", 1)[1].split("async function deleteDevice", 1)[0]
     for loader in ("loadDevices()", "loadSchedules()", "loadTasks()", "loadRuns()", "loadSms()"):
         assert loader in save_fn, loader
-    assert "new_device_id" in save_fn
+    # 기기 키(수신 번호)는 저장할 때 보내지 않는다.
+    assert "new_device_id" not in save_fn
+    assert "phone_number" not in save_fn
 
 
 def test_openapi_exposes_log_filters_and_archive(client):
@@ -3651,8 +3707,8 @@ ANDROID_TASK_FIELDS = {
 
 def test_sms_schedule_multi_device_enqueue_and_poll_payload(client):
     """문자 스케줄이 기기마다 같은 건수로 만들어지고, 앱(v1.3.6)이 읽는 필드로 내려간다."""
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
     schedule = make_schedule(
         client,
         type="sms",
@@ -3661,7 +3717,7 @@ def test_sms_schedule_multi_device_enqueue_and_poll_payload(client):
         total_calls=2,
         sms_body="안녕하세요. 안내 문자입니다.",
         max_call_duration_sec=None,
-        target_device_ids=["DEV-A", "DEV-B"],
+        target_device_ids=["010-9000-0001", "010-9000-0002"],
     )
     assert schedule["type"] == "sms"
     assert schedule["tasks_per_device"] == 2
@@ -3670,10 +3726,10 @@ def test_sms_schedule_multi_device_enqueue_and_poll_payload(client):
     run = client.post(f"/api/schedules/{schedule['id']}/run-now").json()
     tasks = _tasks_in_run(client, run["run_id"])
     assert len(tasks) == 4
-    assert {task["device_id"] for task in tasks} == {"DEV-A", "DEV-B"}
+    assert {task["device_id"] for task in tasks} == {"010-9000-0001", "010-9000-0002"}
     assert all(task["type"] == "sms" and task["sms_body"] == "안녕하세요. 안내 문자입니다." for task in tasks)
 
-    polled = client.get("/api/tasks/poll", params={"device_id": "DEV-A"}).json()["task"]
+    polled = client.get("/api/tasks/poll", params={"device_id": "010-9000-0001"}).json()["task"]
     assert polled is not None
     assert ANDROID_TASK_FIELDS <= set(polled)
     assert polled["type"] == "sms"
@@ -3682,19 +3738,19 @@ def test_sms_schedule_multi_device_enqueue_and_poll_payload(client):
     assert polled["schedule_name"] == schedule["name"]
     assert polled["repeat_index"] == 1
     assert polled["max_call_duration_sec"] is None
-    assert polled["device_id"] == "DEV-A"
+    assert polled["device_id"] == "010-9000-0001"
 
     # 문자는 결과 보고도 전화와 같다(성공/실패).
     done = client.post(
         f"/api/tasks/{polled['id']}/result",
-        json={"device_id": "DEV-A", "status": "done", "result": "문자 발송 완료"},
+        json={"device_id": "010-9000-0001", "status": "done", "result": "문자 발송 완료"},
     )
     assert done.status_code == 200
     assert done.json()["task"]["status"] == "done"
 
 
 def test_schedule_list_includes_sent_counts(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
     schedule = make_schedule(
         client,
         type="sms",
@@ -3703,16 +3759,16 @@ def test_schedule_list_includes_sent_counts(client):
         total_calls=4,
         sms_body="보낸 회수 테스트",
         max_call_duration_sec=None,
-        target_device_ids=["DEV-A"],
+        target_device_ids=["010-9000-0001"],
     )
     client.post(f"/api/schedules/{schedule['id']}/run-now")
     run_tasks = client.get("/api/tasks", params={"schedule_id": schedule["id"]}).json()["tasks"]
     assert len(run_tasks) == 4
     first, second = run_tasks[0], run_tasks[1]
-    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-A", "status": "done"})
+    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "010-9000-0001", "status": "done"})
     client.post(
         f"/api/tasks/{second['id']}/result",
-        json={"device_id": "DEV-A", "status": "failed", "error": "통신사 오류"},
+        json={"device_id": "010-9000-0001", "status": "failed", "error": "통신사 오류"},
     )
 
     listed = next(s for s in client.get("/api/schedules").json()["schedules"] if s["id"] == schedule["id"])
@@ -3726,8 +3782,8 @@ def test_schedule_list_includes_sent_counts(client):
 
 
 def test_schedule_stats_endpoint_per_number_and_device(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
-    _register_device(client, "DEV-B", "갤럭시 B", "010-3333-4444")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
+    _register_device(client, "010-9000-0002", "갤럭시 B")
     schedule = make_schedule(
         client,
         type="sms",
@@ -3736,7 +3792,7 @@ def test_schedule_stats_endpoint_per_number_and_device(client):
         total_calls=2,
         sms_body="상세 집계",
         max_call_duration_sec=None,
-        target_device_ids=["DEV-A", "DEV-B"],
+        target_device_ids=["010-9000-0001", "010-9000-0002"],
     )
     client.post(f"/api/schedules/{schedule['id']}/run-now")
     tasks = client.get("/api/tasks", params={"schedule_id": schedule["id"], "limit": 100}).json()["tasks"]
@@ -3744,12 +3800,12 @@ def test_schedule_stats_endpoint_per_number_and_device(client):
     by_key = {(task["device_id"], task["phone_number"]): task for task in tasks}
     assert len(by_key) == 4
     client.post(
-        f"/api/tasks/{by_key[('DEV-A', '010-9999-0001')]['id']}/result",
-        json={"device_id": "DEV-A", "status": "done"},
+        f"/api/tasks/{by_key[('010-9000-0001', '010-9999-0001')]['id']}/result",
+        json={"device_id": "010-9000-0001", "status": "done"},
     )
     client.post(
-        f"/api/tasks/{by_key[('DEV-B', '010-9999-0001')]['id']}/result",
-        json={"device_id": "DEV-B", "status": "failed", "error": "전송 실패"},
+        f"/api/tasks/{by_key[('010-9000-0002', '010-9999-0001')]['id']}/result",
+        json={"device_id": "010-9000-0002", "status": "failed", "error": "전송 실패"},
     )
 
     detail = client.get(f"/api/schedules/{schedule['id']}/stats").json()
@@ -3772,13 +3828,13 @@ def test_schedule_stats_endpoint_per_number_and_device(client):
 
     # 기기별: 이름·수신 번호가 붙는다
     by_device = {entry["device_id"]: entry for entry in detail["devices"]}
-    assert set(by_device) == {"DEV-A", "DEV-B"}
-    assert by_device["DEV-A"]["device_name"] == "갤럭시 A"
-    assert by_device["DEV-A"]["phone_number"] == "010-1111-2222"
-    assert by_device["DEV-A"]["done_count"] == 1
-    assert by_device["DEV-A"]["pending_count"] == 1
-    assert by_device["DEV-B"]["failed_count"] == 1
-    assert by_device["DEV-B"]["phone_number"] == "010-3333-4444"
+    assert set(by_device) == {"010-9000-0001", "010-9000-0002"}
+    assert by_device["010-9000-0001"]["device_name"] == "갤럭시 A"
+    assert by_device["010-9000-0001"]["phone_number"] == "010-9000-0001"
+    assert by_device["010-9000-0001"]["done_count"] == 1
+    assert by_device["010-9000-0001"]["pending_count"] == 1
+    assert by_device["010-9000-0002"]["failed_count"] == 1
+    assert by_device["010-9000-0002"]["phone_number"] == "010-9000-0002"
 
     assert client.get("/api/schedules/9999/stats").status_code == 404
 
@@ -3797,7 +3853,7 @@ def test_schedule_stats_excludes_deleted_tasks(client):
 
 
 def test_global_stats_separates_sent_calls_and_sms(client):
-    _register_device(client, "DEV-A", "갤럭시 A", "010-1111-2222")
+    _register_device(client, "010-9000-0001", "갤럭시 A")
     sms = make_schedule(
         client,
         type="sms",
@@ -3805,20 +3861,20 @@ def test_global_stats_separates_sent_calls_and_sms(client):
         repeat_count=1,
         sms_body="발신 집계",
         max_call_duration_sec=None,
-        target_device_ids=["DEV-A"],
+        target_device_ids=["010-9000-0001"],
         start_at="2026-11-20T09:00",
     )
     call = make_schedule(
         client,
         numbers=["010-5555-0002"],
         repeat_count=1,
-        target_device_ids=["DEV-A"],
+        target_device_ids=["010-9000-0001"],
         start_at="2026-11-20T09:00",
     )
     client.post(f"/api/schedules/{sms['id']}/run-now")
     client.post(f"/api/schedules/{call['id']}/run-now")
     for task in client.get("/api/tasks", params={"limit": 100}).json()["tasks"]:
-        client.post(f"/api/tasks/{task['id']}/result", json={"device_id": "DEV-A", "status": "done"})
+        client.post(f"/api/tasks/{task['id']}/result", json={"device_id": "010-9000-0001", "status": "done"})
 
     stats = client.get("/api/stats").json()
     assert stats["sent"]["sms_done"] == 1

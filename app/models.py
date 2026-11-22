@@ -7,6 +7,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import config
+from .phoneutil import normalize_phone
 from .timeutil import RECURRENCES, end_date_deadline, parse_dt
 
 PHONE_RE = re.compile(r"^[0-9+\-()#*\s]{3,30}$")
@@ -69,12 +70,18 @@ def clean_phone_number(value: str | None) -> str:
 
 
 class DeviceRegister(BaseModel):
-    device_id: str = Field(min_length=1, max_length=64)
+    """기기 등록. 기기 키(device_id)는 정규화된 수신번호다.
+
+    앱은 유심에서 읽은 번호를 phone_number 로 보낸다. 서버는 그 값을 정규화해
+    device_id 와 phone_number 를 같은 값으로 맞춘다(번호가 키).
+    """
+
+    device_id: str = Field(default="", max_length=64)
     name: str = Field(default="", max_length=80)
     model: str = Field(default="", max_length=80)
     android_version: str = Field(default="", max_length=40)
     app_version: str = Field(default="", max_length=40)
-    # 기기가 문자를 받는 번호(선택). 앱이 보내지 않으면 대시보드에서 직접 입력한다.
+    # 폰이 문자를 받는 번호 = 기기 키. 앱이 유심에서 읽어 보낸다.
     phone_number: str = Field(default="", max_length=30)
     note: str = Field(default="", max_length=400)
 
@@ -86,10 +93,7 @@ class DeviceRegister(BaseModel):
     @field_validator("device_id")
     @classmethod
     def _trim_id(cls, value: str) -> str:
-        value = value.strip()
-        if not value or "/" in value or "\\" in value:
-            raise ValueError("기기 ID 를 올바르게 입력하세요. (/ 또는 \\ 제외)")
-        return value
+        return (value or "").strip()
 
 
 class Heartbeat(BaseModel):
@@ -99,13 +103,17 @@ class Heartbeat(BaseModel):
 
 
 class DeviceUpdate(BaseModel):
-    """대시보드 ‘기기 정보 편집’. 빠짐(None)은 그대로 두고, 보낸 값만 바꾼다."""
+    """대시보드 ‘기기 정보 편집’. 빠짐(None)은 그대로 두고, 보낸 값만 바꾼다.
+
+    기기 키(수신번호)는 바꿀 수 없다. new_device_id · phone_number 를 보내면
+    422 로 거절한다(기존 값과 같은 값을 보내는 것은 허용).
+    """
 
     name: Optional[str] = Field(default=None, max_length=80)
-    # 기기 ID 변경(선택). 바꾸면 스케줄·작업·수신 문자 기록이 새 ID 로 함께 옮겨진다.
+    # 예전 대시보드 호환용. 값이 지금 키와 다르면 422.
     new_device_id: Optional[str] = Field(default=None, max_length=64)
     note: Optional[str] = Field(default=None, max_length=400)
-    # 기기가 문자를 받는 번호. 빈 문자열을 보내면 지운다(None 이면 그대로 둔다).
+    # 예전 대시보드 호환용. 값이 지금 키와 다르면 422.
     phone_number: Optional[str] = Field(default=None, max_length=30)
     # 앱이 알려주는 기기 정보. 대시보드에서 고치면 앱 재등록이 덮어쓰지 않는다.
     model: Optional[str] = Field(default=None, max_length=80)
@@ -122,7 +130,7 @@ class DeviceUpdate(BaseModel):
     @field_validator("name")
     @classmethod
     def _name(cls, value: str | None) -> str | None:
-        """이름은 공백만 보내면 비운 것으로 보고 기기 ID 로 되돌린다."""
+        """이름은 공백만 보내면 비운 것으로 보고 기기 이름을 기본값으로 돌린다."""
         if value is None:
             return None
         return value.strip()
@@ -130,15 +138,9 @@ class DeviceUpdate(BaseModel):
     @field_validator("new_device_id")
     @classmethod
     def _new_device_id(cls, value: str | None) -> str | None:
-        """새 기기 ID 는 앱이 보내는 기기 ID 와 같은 규칙으로 검사한다."""
         if value is None:
             return None
-        value = value.strip()
-        if not value:
-            return None
-        if "/" in value or "\\" in value:
-            raise ValueError("기기 ID 를 올바르게 입력하세요. (/ 또는 \\ 제외)")
-        return value
+        return value.strip() or None
 
     @field_validator("model", "android_version", "note")
     @classmethod
@@ -162,16 +164,18 @@ MAX_TARGET_DEVICES = 50
 
 
 def clean_device_ids(values: list[str] | None) -> list[str]:
-    """발신 기기 ID 목록. 빈 값은 버리고, 중복은 한 번만 남긴다."""
+    """발신 기기 키 목록. 전화번호는 정규화하고, 빈 값은 버리고, 중복은 한 번만 남긴다."""
     cleaned: list[str] = []
     for item in values or []:
-        value = str(item).strip()
-        if not value:
+        raw = str(item).strip()
+        if not raw:
             continue
+        # 전화번호로 읽히면 정규화해 기기 키와 같은 표기로 맞춘다.
+        value = normalize_phone(raw) or raw
         if "/" in value or "\\" in value:
-            raise ValueError("기기 ID 를 올바르게 입력하세요. (/ 또는 \\ 제외)")
+            raise ValueError("기기 키를 올바르게 입력하세요. (/ 또는 \\ 제외)")
         if len(value) > 64:
-            raise ValueError("기기 ID 는 64자까지입니다.")
+            raise ValueError("기기 키는 64자까지입니다.")
         if value not in cleaned:
             cleaned.append(value)
     if len(cleaned) > MAX_TARGET_DEVICES:

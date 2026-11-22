@@ -36,6 +36,7 @@ from .models import (
     TelegramTest,
 )
 from . import telegram_client
+from .phoneutil import normalize_phone
 from .timeutil import end_date_deadline, iso, local_str, next_occurrence, now, now_iso, parse_dt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -215,18 +216,42 @@ def device_dict(row: sqlite3.Row, current: datetime | None = None) -> dict:
     }
 
 
+def resolve_device_key(conn: sqlite3.Connection, device_id: str | None) -> str:
+    """요청이 보낸 기기 ID 를 지금의 기기 키(정규화된 수신번호)로 푼다.
+
+    - 이미 전화번호면 정규화한 값(010-5656-3939)을 쓴다.
+    - 옛 앱이 보내는 예전 기기 ID(예: 5656)는 device_aliases 를 거쳐 수신번호로 바꾼다.
+      (폰에 새 APK 를 설치하기 전에도 같은 기기로 이어진다)
+    - 그 밖의 값은 그대로 돌려준다(빈 값은 "").
+    """
+    raw = (device_id or "").strip()
+    if not raw:
+        return ""
+    phone = normalize_phone(raw)
+    if phone:
+        return phone
+    aliased = db.device_alias_target(conn, raw)
+    return aliased or raw
+
+
 def ensure_device(conn: sqlite3.Connection, device_id: str, name: str | None = None) -> sqlite3.Row:
-    device_id = (device_id or "").strip()
+    device_id = resolve_device_key(conn, device_id)
     if not device_id:
-        raise HTTPException(status_code=400, detail="device_id 가 필요합니다.")
+        raise HTTPException(status_code=400, detail="기기 키(수신번호)가 필요합니다.")
     row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
     if row is None:
+        phone = normalize_phone(device_id)
+        if not phone:
+            raise HTTPException(
+                status_code=400,
+                detail="기기 키는 수신번호입니다. 폰 앱(v1.3.7 이상)에서 전화번호 읽기 권한을 허용하고 다시 연결하세요.",
+            )
         conn.execute(
-            "INSERT INTO devices(id, name, created_at) VALUES (?, ?, ?)",
-            (device_id, (name or device_id)[:80], iso(now())),
+            "INSERT INTO devices(id, name, phone_number, created_at) VALUES (?, ?, ?, ?)",
+            (phone, (name or phone)[:80], phone, iso(now())),
         )
-        db.log(conn, f"기기 자동 등록: {device_id}", "info")
-        row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        db.log(conn, f"기기 자동 등록: {phone}", "info")
+        row = conn.execute("SELECT * FROM devices WHERE id = ?", (phone,)).fetchone()
     return row
 
 
@@ -624,27 +649,54 @@ def list_devices(conn: sqlite3.Connection = Depends(get_conn)):
 
 @api.post("/devices")
 def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(get_conn)):
+    """기기 등록/갱신. 기기 키는 정규화된 수신번호 하나뿐이다(devices.id == devices.phone_number).
+
+    앱이 유심에서 읽은 번호를 phone_number 로 보내면 그 값이 키가 된다. 옛 앱처럼
+    device_id 에 번호를 담아 보내도 같은 규칙으로 읽는다. 번호를 읽지 못했으면
+    422 로 분명히 알린다(번호 없는 기기는 만들지 않는다).
+    """
     current = iso(now())
-    row = conn.execute("SELECT * FROM devices WHERE id = ?", (payload.device_id,)).fetchone()
+    phone = normalize_phone(payload.phone_number) or normalize_phone(payload.device_id)
+    if not phone:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "수신번호(기기 키)가 필요합니다. 폰에서 유심 전화번호를 읽지 못했습니다. "
+                "앱의 ‘권한 허용’을 눌러 전화번호 읽기 권한을 허용한 뒤 다시 시작하세요."
+            ),
+        )
+    # 옛 앱이 예전 기기 ID(예: 5656)로 등록하면서 번호를 알려주면, 번호가 비어 있던
+    # 그 기기 줄을 그대로 수신번호 키로 옮긴다(기록·메모 유지).
+    legacy_id = (payload.device_id or "").strip()
+    if legacy_id and not normalize_phone(legacy_id) and legacy_id != phone:
+        legacy_row = conn.execute(
+            "SELECT phone_number FROM devices WHERE id = ?", (legacy_id,)
+        ).fetchone()
+        if legacy_row is not None and not (legacy_row["phone_number"] or "").strip():
+            db.move_device_records(conn, legacy_id, phone)
+    # 옛 기기 ID 로 들어와도 같은 기기로 잇는다.
+    phone = resolve_device_key(conn, phone)
+    row = conn.execute("SELECT * FROM devices WHERE id = ?", (phone,)).fetchone()
     if row is None:
         conn.execute(
             """INSERT INTO devices(id, name, model, android_version, app_version, phone_number, note, enabled, last_seen, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
             (
-                payload.device_id,
-                payload.name or payload.device_id,
+                phone,
+                payload.name or phone,
                 payload.model,
                 payload.android_version,
                 payload.app_version,
-                payload.phone_number,
+                phone,
                 payload.note,
                 current,
                 current,
             ),
         )
-        db.log(conn, f"기기 등록: {payload.device_id} ({payload.name})")
+        db.log(conn, f"기기 등록: {phone} ({payload.name})")
     else:
-        # 앱은 30초마다 같은 등록 요청을 보낸다. 대시보드에서 직접 고친 이름·번호·모델·안드로이드 버전은 덮어쓰지 않는다.
+        # 앱은 30초마다 같은 등록 요청을 보낸다. 대시보드에서 직접 고친 이름·모델·안드로이드 버전은 덮어쓰지 않는다.
+        # 수신번호는 기기 키이므로 앱이 무엇을 보내든 서버 값(=키)을 그대로 둔다.
         conn.execute(
             """UPDATE devices SET
                       name = CASE WHEN COALESCE(name_customized, 0) = 1 THEN name
@@ -654,21 +706,20 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
                       android_version = CASE WHEN COALESCE(android_customized, 0) = 1 THEN android_version
                                              ELSE COALESCE(NULLIF(?, ''), android_version) END,
                       app_version = ?,
-                      phone_number = CASE WHEN COALESCE(phone_customized, 0) = 1 THEN phone_number
-                                          ELSE COALESCE(NULLIF(?, ''), phone_number) END,
+                      phone_number = ?,
                       note = COALESCE(NULLIF(?, ''), note), last_seen = ? WHERE id = ?""",
             (
-                payload.name or payload.device_id,
+                payload.name or phone,
                 payload.model,
                 payload.android_version,
                 payload.app_version or row["app_version"],
-                payload.phone_number,
+                phone,
                 payload.note,
                 current,
-                payload.device_id,
+                phone,
             ),
         )
-    row = conn.execute("SELECT * FROM devices WHERE id = ?", (payload.device_id,)).fetchone()
+    row = conn.execute("SELECT * FROM devices WHERE id = ?", (phone,)).fetchone()
     return {"ok": True, "device": device_dict(row)}
 
 
@@ -676,14 +727,15 @@ def register_device(payload: DeviceRegister, conn: sqlite3.Connection = Depends(
 def device_heartbeat(device_id: str, payload: Heartbeat | None = None, conn: sqlite3.Connection = Depends(get_conn)):
     body = payload or Heartbeat(device_id=device_id)
     row = ensure_device(conn, device_id)
-    cfg = remote_config(conn, device_id)
+    device_key = row["id"]
+    cfg = remote_config(conn, device_key)
     conn.execute(
         "UPDATE devices SET last_seen = ?, battery = COALESCE(?, battery), network = COALESCE(NULLIF(?, ''), network) WHERE id = ?",
-        (iso(now()), body.battery, body.network, row["id"]),
+        (iso(now()), body.battery, body.network, device_key),
     )
     pending = conn.execute(
         "SELECT COUNT(*) AS c FROM tasks WHERE deleted_at IS NULL AND status = 'pending' AND (device_id IS NULL OR device_id = ?)",
-        (device_id,),
+        (device_key,),
     ).fetchone()["c"]
     return {
         "ok": True,
@@ -697,28 +749,32 @@ def device_heartbeat(device_id: str, payload: Heartbeat | None = None, conn: sql
 
 @api.patch("/devices/{device_id}")
 def update_device(device_id: str, payload: DeviceUpdate, conn: sqlite3.Connection = Depends(get_conn)):
-    """기기 정보 편집. 보낸 항목만 바꾸고, 기기 ID 를 바꾸면 기록도 새 ID 로 함께 옮긴다."""
-    row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    """기기 정보 편집. 기기 이름·모델·안드로이드 버전·메모·사용 여부만 바꿀 수 있다.
+
+    기기 키(수신번호)는 바꿀 수 없다 — 스케줄·대기열·수신 문자가 모두 이 키를 가리키므로
+    바뀌면 기록이 어긋난다. new_device_id · phone_number 로 다른 값을 보내면 422.
+    """
+    device_key = resolve_device_key(conn, device_id)
+    row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_key,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="기기를 찾을 수 없습니다.")
 
-    target_id = (payload.new_device_id or "").strip() or device_id
-    renaming = target_id != device_id
+    if payload.new_device_id is not None and payload.new_device_id != row["id"]:
+        raise HTTPException(status_code=422, detail="수신번호(기기 키)는 수정할 수 없습니다.")
+    if payload.phone_number is not None:
+        given = normalize_phone(payload.phone_number) or payload.phone_number.strip()
+        if given != row["id"]:
+            raise HTTPException(status_code=422, detail="수신번호(기기 키)는 수정할 수 없습니다.")
 
     updates, values = [], []
     if payload.name is not None:
         updates.append("name = ?")
-        values.append(payload.name[:80] or target_id)
+        values.append(payload.name[:80] or row["id"])
         # 대시보드에서 직접 고친 이름은 앱 등록 정보가 덮어쓰지 않도록 표시한다.
         updates.append("name_customized = 1")
     if payload.note is not None:
         updates.append("note = ?")
         values.append(payload.note[:400])
-    if payload.phone_number is not None:
-        updates.append("phone_number = ?")
-        values.append(payload.phone_number[:30])
-        # 빈 값으로 지운 경우에도 앱이 알려준 번호로 다시 채우지 않는다.
-        updates.append("phone_customized = 1")
     if payload.model is not None:
         updates.append("model = ?")
         values.append(payload.model[:80])
@@ -732,59 +788,22 @@ def update_device(device_id: str, payload: DeviceUpdate, conn: sqlite3.Connectio
         updates.append("enabled = ?")
         values.append(1 if payload.enabled else 0)
 
-    if not updates and not renaming:
+    if not updates:
         return {"ok": True, "device": device_dict(row), "renamed_from": None}
 
-    # 기기 ID 변경은 기기를 가리키는 모든 기록을 한 트랜잭션에서 함께 옮긴다(도중에 끊기면 전부 되돌림).
     try:
-        with db.transaction(conn):
-            if renaming:
-                duplicate = conn.execute("SELECT 1 FROM devices WHERE id = ?", (target_id,)).fetchone()
-                if duplicate is not None:
-                    raise HTTPException(
-                        status_code=409, detail=f"이미 같은 기기 ID 가 있습니다: {target_id}"
-                    )
-                conn.execute("UPDATE devices SET id = ? WHERE id = ?", (target_id, device_id))
-                conn.execute("UPDATE tasks SET device_id = ? WHERE device_id = ?", (target_id, device_id))
-                conn.execute("UPDATE schedules SET device_id = ? WHERE device_id = ?", (target_id, device_id))
-                # 여러 대 지정 스케줄의 기기 목록(JSON 배열)에서도 ID 를 바꾼다(순서·중복 그대로 유지).
-                for sched in conn.execute(
-                    "SELECT id, target_device_ids FROM schedules WHERE target_device_ids LIKE ?",
-                    (f"%{device_id}%",),
-                ).fetchall():
-                    targets = db.json_list(sched["target_device_ids"])
-                    if device_id not in targets:
-                        continue
-                    conn.execute(
-                        "UPDATE schedules SET target_device_ids = ? WHERE id = ?",
-                        (
-                            json.dumps(
-                                [target_id if item == device_id else item for item in targets],
-                                ensure_ascii=False,
-                            ),
-                            sched["id"],
-                        ),
-                    )
-                conn.execute("UPDATE sms_inbox SET device_id = ? WHERE device_id = ?", (target_id, device_id))
-            if updates:
-                conn.execute(
-                    f"UPDATE devices SET {', '.join(updates)} WHERE id = ?", values + [target_id]
-                )
-            if renaming:
-                db.log(conn, f"기기 ID 변경: {device_id} → {target_id}", "warning")
-            if updates:
-                db.log(conn, f"기기 정보 수정: {target_id}")
-    except HTTPException:
-        raise
+        conn.execute(f"UPDATE devices SET {', '.join(updates)} WHERE id = ?", values + [row["id"]])
+        db.log(conn, f"기기 정보 수정: {row['id']}")
     except sqlite3.Error as exc:
         raise HTTPException(status_code=500, detail=f"기기 정보를 저장하지 못했습니다: {exc}") from exc
 
-    row = conn.execute("SELECT * FROM devices WHERE id = ?", (target_id,)).fetchone()
-    return {"ok": True, "device": device_dict(row), "renamed_from": device_id if renaming else None}
+    updated = conn.execute("SELECT * FROM devices WHERE id = ?", (row["id"],)).fetchone()
+    return {"ok": True, "device": device_dict(updated), "renamed_from": None}
 
 
 @api.delete("/devices/{device_id}")
 def delete_device(device_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    device_id = resolve_device_key(conn, device_id)
     row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="기기를 찾을 수 없습니다.")
@@ -1802,14 +1821,14 @@ def bulk_delete_tasks(payload: TaskBulkDelete, conn: sqlite3.Connection = Depend
 
 @api.get("/tasks/poll")
 def poll_task(device_id: str = Query(min_length=1, max_length=64), conn: sqlite3.Connection = Depends(get_conn)):
-    ensure_device(conn, device_id)
-    cfg = remote_config(conn, device_id)
-    conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (iso(now()), device_id))
+    device_key = ensure_device(conn, device_id)["id"]
+    cfg = remote_config(conn, device_key)
+    conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (iso(now()), device_key))
     # 대시보드에서 '사용 중지'된 기기에는 작업을 배정하지 않는다.
-    task = claim_next_task(conn, device_id) if cfg["device_enabled"] else None
+    task = claim_next_task(conn, device_key) if cfg["device_enabled"] else None
     pending = conn.execute(
         "SELECT COUNT(*) AS c FROM tasks WHERE deleted_at IS NULL AND status = 'pending' AND (device_id IS NULL OR device_id = ?)",
-        (device_id,),
+        (device_key,),
     ).fetchone()["c"]
     return {
         "task": task,
@@ -1837,7 +1856,7 @@ def report_task_result(task_id: int, payload: TaskResult, conn: sqlite3.Connecti
     row = conn.execute("SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL", (task_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
-    if row["device_id"] and payload.device_id and row["device_id"] != payload.device_id:
+    if row["device_id"] and payload.device_id and row["device_id"] != resolve_device_key(conn, payload.device_id):
         raise HTTPException(status_code=409, detail="다른 기기에 배정된 작업입니다.")
     if row["status"] in ("done", "failed", "skipped"):
         return {"ok": True, "duplicate": True, "task": task_dict(row)}
@@ -1925,24 +1944,14 @@ def list_runs(limit: int = Query(default=30, ge=1, le=200), conn: sqlite3.Connec
 @api.post("/sms/incoming")
 def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite3.Connection = Depends(get_conn)):
     device = ensure_device(conn, payload.device_id)
-    conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (iso(now()), payload.device_id))
+    device_key = device["id"]
+    conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (iso(now()), device_key))
 
-    # 수신 번호: 앱이 보낸 값(receiver_number/recipient) → 없으면 기기에 등록된 번호.
+    # 수신 번호: 앱이 보낸 값(receiver_number/recipient) → 없으면 기기의 번호(=기기 키).
     receiver_number = (payload.receiver_number or "").strip()
-    device_phone = (_row_value(device, "phone_number") or "").strip()
+    device_phone = (_row_value(device, "phone_number") or "").strip() or device_key
     if not receiver_number:
         receiver_number = device_phone
-    elif not device_phone:
-        # 기기에 번호가 비어 있는데 앱이 실제 수신 번호를 알려 줬다면 기기 정보도 채워 둔다.
-        # 단, 대시보드에서 번호를 직접 지운 기기(phone_customized=1)는 다시 채우지 않는다.
-        cursor = conn.execute(
-            """UPDATE devices SET phone_number = ?
-               WHERE id = ? AND COALESCE(phone_customized, 0) = 0""",
-            (receiver_number[:30], payload.device_id),
-        )
-        if cursor.rowcount:
-            device_phone = receiver_number
-            db.log(conn, f"기기 수신 번호 자동 등록: {payload.device_id} → {receiver_number}")
 
     received_at = None
     if payload.received_at:
@@ -1958,7 +1967,7 @@ def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite
     cursor = conn.execute(
         """INSERT INTO sms_inbox(device_id, sender, receiver_number, body, received_at, created_at, telegram_status)
            VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
-        (payload.device_id, payload.sender, receiver_number, payload.body, received_at, iso(now())),
+        (device_key, payload.sender, receiver_number, payload.body, received_at, iso(now())),
     )
     sms_id = int(cursor.lastrowid)
     saved = save_sms_attachments(sms_id, payload.attachments)
@@ -1980,7 +1989,7 @@ def incoming_sms(payload: SmsIncoming, background: BackgroundTasks, conn: sqlite
         )
 
     row = conn.execute("SELECT * FROM sms_inbox WHERE id = ?", (sms_id,)).fetchone()
-    return {"ok": True, "id": sms_id, "sms": sms_dict(row, {payload.device_id: device_phone})}
+    return {"ok": True, "id": sms_id, "sms": sms_dict(row, {device_key: device_phone})}
 
 
 def _attachment_extension(content_type: str, filename: str) -> str:

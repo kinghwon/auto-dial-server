@@ -423,21 +423,17 @@
 
     <div class="card">
       <div class="card-head">
-        <div><h2>기기 추가</h2><div class="sub">앱의 “기기 ID”와 같은 값을 입력하면 자동으로 연결됩니다</div></div>
+        <div><h2>기기 추가</h2><div class="sub">수신 번호(유심 전화번호)가 그 기기의 고유 키입니다 · 앱이 접속하면 자동 등록되므로 보통은 직접 추가하지 않아도 됩니다</div></div>
       </div>
       <div class="card-body">
         <div class="form-grid">
           <div class="field">
-            <label>기기 ID <span class="hint">영문/숫자/-/_</span></label>
-            <input type="text" id="devId" placeholder="예: OFFICE-01" maxlength="64">
-          </div>
-          <div class="field">
-            <label>표시 이름</label>
-            <input type="text" id="devName" placeholder="예: 사무실폰" maxlength="80">
-          </div>
-          <div class="field">
-            <label>수신 번호 <span class="hint">선택 · 이 폰이 문자를 받는 번호</span></label>
+            <label>수신 번호 (고유 키) <span class="hint">필수 · 폰의 유심 번호</span></label>
             <input type="tel" id="devPhone" placeholder="예: 010-1234-5678" maxlength="30">
+          </div>
+          <div class="field">
+            <label>기기 이름</label>
+            <input type="text" id="devName" placeholder="예: 사무실폰" maxlength="80">
           </div>
           <div class="field span2">
             <label>메모 <span class="hint">선택</span></label>
@@ -447,7 +443,7 @@
         <div class="btn-row" style="margin-top:16px">
           <button class="btn primary" onclick="addDevice()">기기 등록</button>
         </div>
-        <div class="hint-line">안드로이드 앱에서 서버 주소와 같은 기기 ID를 입력하고 “서비스 시작”을 누르면 하트비트가 들어옵니다. 기기를 미리 등록하지 않아도 앱이 접속하면 자동으로 목록에 나타납니다.</div>
+        <div class="hint-line">안드로이드 앱에서 서버 주소를 넣고 “서비스 시작”을 누르면, 앱이 읽은 유심 전화번호가 곧 기기 키가 되어 자동으로 목록에 나타납니다. 수신 번호는 기기 키라서 나중에 바꿀 수 없습니다.</div>
       </div>
     </div>
 
@@ -457,7 +453,7 @@
         <button class="btn sm" onclick="loadDevices()">새로고침</button>
       </div>
       <div class="table-wrap"><table id="devicesTable">
-        <thead><tr><th>상태</th><th>기기</th><th>수신 번호</th><th>모델 / 안드로이드</th><th>배터리</th><th>마지막 연결</th><th></th></tr></thead>
+        <thead><tr><th>상태</th><th>기기 이름</th><th>수신 번호 (고유 키)</th><th>모델 / 안드로이드</th><th>배터리</th><th>마지막 연결</th><th>관리</th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -771,17 +767,13 @@
     <p id="deviceModalSub">여기서 고친 값은 앱이 다시 접속해도 그대로 유지됩니다.</p>
     <div class="form-grid">
       <div class="field">
-        <label>표시 이름 (기기명)</label>
+        <label>기기 이름</label>
         <input type="text" id="devEditName" placeholder="예: 사무실폰" maxlength="80">
       </div>
       <div class="field">
-        <label>수신 번호 <span class="hint">이 폰이 문자를 받는 번호</span></label>
-        <input type="tel" id="devEditPhone" placeholder="예: 010-1234-5678" maxlength="30">
-      </div>
-      <div class="field span2">
-        <label>기기 ID</label>
-        <input type="text" id="devEditDeviceId" placeholder="예: OFFICE-01" maxlength="64">
-        <div class="help">변경 시 연결된 스케줄·작업·수신문자 기록도 함께 옮겨지며, 폰 앱의 기기 ID도 맞춰야 합니다.</div>
+        <label>수신 번호 (고유 키) <span class="hint">수정 불가</span></label>
+        <input type="tel" id="devEditPhone" maxlength="30" disabled readonly>
+        <div class="help">유심 전화번호가 기기 키입니다. 스케줄·대기열·수신 문자가 모두 이 번호를 가리키므로 바꿀 수 없습니다.</div>
       </div>
       <div class="field">
         <label>모델명 <span class="hint">비우면 앱이 알려주는 값</span></label>
@@ -1185,8 +1177,8 @@ async function loadDevices() {
       $("devicesTable").querySelector("tbody").innerHTML = data.devices.length ? data.devices.map((d) => `
         <tr style="${d.enabled ? "" : "opacity:.62"}">
           <td>${d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray")}${d.enabled ? "" : " " + badge("중지됨", "b-warn")}</td>
-          <td><b>${esc(d.name)}</b>${d.name_customized ? ' <span class="muted" style="font-size:11px">(직접 지정)</span>' : ""}<div class="muted mono">${esc(d.id)}</div>${d.note ? `<div class="muted" style="font-size:11.5px">📝 ${esc(d.note)}</div>` : ""}</td>
-          <td class="nowrap"><span class="mono">${d.phone_number ? esc(d.phone_number) : '<span class="muted">미설정</span>'}</span></td>
+          <td><b>${esc(d.name)}</b>${d.name_customized ? ' <span class="muted" style="font-size:11px">(직접 지정)</span>' : ""}${d.note ? `<div class="muted" style="font-size:11.5px">📝 ${esc(d.note)}</div>` : ""}</td>
+          <td class="nowrap"><span class="mono">${esc(d.phone_number || d.id)}</span></td>
           <td class="muted">${esc(d.model || "-")}<div style="font-size:11.5px">${d.android_version ? "Android " + esc(d.android_version) : ""}</div></td>
           <td>${d.battery === null || d.battery === undefined ? '<span class="muted">-</span>' : `${d.battery}%`}</td>
           <td class="muted nowrap" data-lastseen="${esc(d.id)}">${esc(d.last_seen_text)}</td>
@@ -1265,32 +1257,32 @@ async function toggleDevice(id, enable) {
 }
 
 async function addDevice() {
-  const id = $("devId").value.trim();
+  const phoneNumber = $("devPhone").value.trim();
   const name = $("devName").value.trim();
   const note = $("devNote").value.trim();
-  const phoneNumber = $("devPhone").value.trim();
-  if (!id) { toast("기기 ID를 입력하세요.", "err"); return; }
+  if (!phoneNumber) { toast("수신 번호(유심 전화번호)를 입력하세요.", "err"); return; }
   try {
-    await api("/api/devices", { method: "POST", body: JSON.stringify({ device_id: id, name: name || id, note, phone_number: phoneNumber }) });
-    $("devId").value = ""; $("devName").value = ""; $("devNote").value = ""; $("devPhone").value = "";
-    toast("기기를 등록했습니다.", "ok");
+    const result = await api("/api/devices", { method: "POST", body: JSON.stringify({ device_id: phoneNumber, phone_number: phoneNumber, name: name || phoneNumber, note }) });
+    $("devPhone").value = ""; $("devName").value = ""; $("devNote").value = "";
+    const saved = result && result.device ? result.device : {};
+    toast(`기기를 등록했습니다. (${saved.phone_number || saved.id || phoneNumber})`, "ok");
     loadDevices();
   } catch (e) { toast(e.message, "err"); }
 }
 
-/* 등록된 기기 정보(이름·ID·번호·모델·버전·메모·사용 여부)를 모달에서 편집한다. */
+/* 등록된 기기 정보(기기 이름·모델·버전·메모·사용 여부)를 모달에서 편집한다.
+   수신 번호(기기 키)는 읽기 전용이다. */
 function openDeviceEdit(id) {
   const device = (state.devices || []).find((d) => String(d.id) === String(id));
   if (!device) { toast("기기 정보를 찾을 수 없습니다.", "err"); return; }
   state.editingDeviceId = device.id;
   $("devEditName").value = device.name || "";
-  $("devEditDeviceId").value = device.id || "";
-  $("devEditPhone").value = device.phone_number || "";
+  $("devEditPhone").value = device.phone_number || device.id || "";
   $("devEditModel").value = device.model || "";
   $("devEditAndroid").value = device.android_version || "";
   $("devEditNote").value = device.note || "";
   $("devEditEnabled").checked = Boolean(device.enabled);
-  $("deviceModalSub").textContent = `기기 ID ${device.id} · 여기서 고친 이름·번호·모델·버전은 앱이 다시 접속해도 유지됩니다.`;
+  $("deviceModalSub").textContent = `수신 번호 ${device.phone_number || device.id} (고유 키 · 수정 불가) · 여기서 고친 이름·모델·버전은 앱이 다시 접속해도 유지됩니다.`;
   $("deviceModal").classList.add("show");
   $("devEditName").focus();
 }
@@ -1300,45 +1292,42 @@ function closeDeviceEdit() {
   $("deviceModal").classList.remove("show");
 }
 
-/* 기기 정보를 저장한다. 바뀐 항목만 PATCH 로 보내고, 기기 ID 가 바뀌면 관련 목록도 다시 읽는다. */
+/* 기기 정보를 저장한다. 바뀐 항목만 PATCH 로 보낸다(수신 번호는 보내지 않는다). */
 async function saveDeviceEdit() {
   const id = state.editingDeviceId;
   if (!id) return;
   const name = $("devEditName").value.trim();
-  const newId = $("devEditDeviceId").value.trim();
-  if (!name) { toast("표시 이름을 입력하세요.", "err"); return; }
-  if (!newId) { toast("기기 ID 를 입력하세요.", "err"); return; }
-  if (/[\/\\]/.test(newId)) { toast("기기 ID 에 / 또는 \\ 는 쓸 수 없습니다.", "err"); return; }
+  if (!name) { toast("기기 이름을 입력하세요.", "err"); return; }
 
+  const current = state.devices.find((d) => String(d.id) === String(id)) || {};
   const payload = {};
-  if (name !== (state.devices.find((d) => String(d.id) === String(id)) || {}).name) payload.name = name;
-  if (newId !== id) {
-    if (!confirm(`기기 ID 를 ${id} → ${newId} 로 바꿀까요?\n연결된 스케줄·작업·수신 문자 기록이 새 ID 로 옮겨지고, 폰 앱의 기기 ID 도 맞춰야 합니다.`)) return;
-    payload.new_device_id = newId;
+  if (name !== current.name) payload.name = name;
+  if ($("devEditModel").value.trim() !== (current.model || "")) payload.model = $("devEditModel").value.trim();
+  if ($("devEditAndroid").value.trim() !== (current.android_version || "")) payload.android_version = $("devEditAndroid").value.trim();
+  if ($("devEditNote").value.trim() !== (current.note || "")) payload.note = $("devEditNote").value.trim();
+  if ($("devEditEnabled").checked !== Boolean(current.enabled)) payload.enabled = $("devEditEnabled").checked;
+
+  if (!Object.keys(payload).length) {
+    toast("바뀐 내용이 없습니다.", "ok");
+    closeDeviceEdit();
+    return;
   }
-  payload.phone_number = $("devEditPhone").value.trim();
-  payload.model = $("devEditModel").value.trim();
-  payload.android_version = $("devEditAndroid").value.trim();
-  payload.note = $("devEditNote").value.trim();
-  payload.enabled = $("devEditEnabled").checked;
 
   const button = $("devEditSaveBtn");
   button.disabled = true;
   try {
-    const result = await api(`/api/devices/${encodeURIComponent(id)}`, {
+    await api(`/api/devices/${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
     });
-    const savedId = (result && result.device && result.device.id) || id;
-    toast(payload.new_device_id ? `기기 ID 를 ${savedId} 로 바꿨습니다.` : `기기 ${name} 정보를 저장했습니다.`, "ok");
+    toast(`기기 ${name} 정보를 저장했습니다.`, "ok");
     closeDeviceEdit();
-    // 기기명·ID 는 스케줄·대기열·수신 문자 목록에도 나오므로 함께 다시 읽는다.
+    // 기기 이름은 스케줄·대기열·수신 문자 목록에도 나오므로 함께 다시 읽는다.
     loadDevices();
     loadSchedules();
     loadTasks();
     loadRuns();
     loadSms();
-    if (payload.new_device_id) loadLogs();
   } catch (e) {
     toast(e.message, "err");
   } finally {
@@ -1347,7 +1336,9 @@ async function saveDeviceEdit() {
 }
 
 async function deleteDevice(id) {
-  if (!confirm(`기기 ${id} 를 삭제할까요?\n배정된 미완료 작업은 공유 대기열로 돌아갑니다.`)) return;
+  const device = (state.devices || []).find((d) => String(d.id) === String(id)) || {};
+  const label = device.phone_number || id;
+  if (!confirm(`기기 ${label}${device.name && device.name !== label ? ` (${device.name})` : ""} 를 삭제할까요?\n배정된 미완료 작업은 공유 대기열로 돌아갑니다.`)) return;
   try {
     await api(`/api/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
     toast("기기를 삭제했습니다.", "ok");
@@ -1464,15 +1455,15 @@ function renderScheduleDevicePicker() {
   const known = new Set(devices.map((d) => d.id));
   // 기기 목록에서 이미 지워진 기기가 스케줄에 지정돼 있으면 함께 보여 준다.
   scheduleTargetDeviceIds().forEach((id) => {
-    if (!known.has(id)) devices.push({ id, name: id, phone_number: "", online: false, missing: true });
+    if (!known.has(id)) devices.push({ id, name: id, phone_number: id, online: false, missing: true });
   });
   list.innerHTML = devices.length
     ? devices.map((d) => `
-        <label class="device-pick ${d.online ? "" : "off"}" title="${esc(d.name || d.id)} (${esc(d.id)})${d.phone_number ? " · " + esc(d.phone_number) : " · 번호 미설정"}">
+        <label class="device-pick ${d.online ? "" : "off"}" title="${esc(d.name || d.id)} · ${esc(d.phone_number || d.id)}${d.online ? "" : " (오프라인)"}">
           <input type="checkbox" value="${esc(d.id)}" ${state.schedDeviceIds.has(d.id) ? "checked" : ""} ${state.schedDeviceAuto ? "disabled" : ""}
                  onchange="toggleScheduleDevice('${esc(d.id)}', this.checked)">
           <span class="dev-name">${esc(d.name || d.id)}</span>
-          <span class="dev-meta mono">${esc(d.id)} · ${d.phone_number ? esc(d.phone_number) : "번호 미설정"}</span>
+          <span class="dev-meta mono">${esc(d.phone_number || d.id)}</span>
           <span class="spacer"></span>
           ${d.missing ? badge("기기 목록에 없음", "b-warn") : (d.online ? badge("온라인", "b-ok") : badge("오프라인", "b-gray"))}
         </label>`).join("")
@@ -1793,7 +1784,7 @@ function renderSentStats(data) {
     ? data.numbers.map((n) => `<tr><td class="mono">${esc(n.number)}</td>${counts(n)}<td class="muted">${esc(n.last_sent_text)}</td></tr>`).join("")
     : `<tr><td colspan="7" class="muted">번호별 발신 기록이 없습니다.</td></tr>`;
   const deviceRows = data.devices.length
-    ? data.devices.map((d) => `<tr><td><b>${esc(d.device_name)}</b><div class="muted mono" style="font-size:11px">${esc(d.device_id || "-")} ${d.phone_number ? "· " + esc(d.phone_number) : ""}</div></td>${counts(d)}<td class="muted">${esc(d.last_sent_text)}</td></tr>`).join("")
+    ? data.devices.map((d) => `<tr><td><b>${esc(d.device_name)}</b><div class="muted mono" style="font-size:11px">${esc(d.phone_number || d.device_id || "-")}</div></td>${counts(d)}<td class="muted">${esc(d.last_sent_text)}</td></tr>`).join("")
     : `<tr><td colspan="7" class="muted">기기별 발신 기록이 없습니다.</td></tr>`;
 
   $("sentStatsBody").innerHTML =
@@ -2356,7 +2347,7 @@ async function loadSms() {
         <tr>
           <td><input type="checkbox" class="queue-check sms-check" ${state.selectedSms.has(m.id) ? "checked" : ""} onchange="toggleSmsSelection(${m.id}, this.checked)"></td>
           <td class="nowrap mono">${esc(m.received_at_text)}</td>
-          <td><b>${esc(m.device_name)}</b><div class="muted mono" style="font-size:11.5px">${esc(m.device_id)}</div></td>
+          <td><b>${esc(m.device_name)}</b></td>
           <td class="mono nowrap">${esc(m.receiver_number || "-")}</td>
           <td class="mono nowrap">${esc(m.sender || "-")}${m.has_mms ? '<span class="mms-tag">📷 MMS</span>' : ""}</td>
           <td style="max-width:420px">
