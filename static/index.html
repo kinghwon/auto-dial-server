@@ -1233,6 +1233,16 @@ async function runScheduleNow(id) {
 }
 
 async function setScheduleStatus(id, action) {
+  const schedule = (state.schedules || []).find((item) => item.id === id);
+  if (action === "resume" && schedule) {
+    // 1회성 스케줄의 실행 시각이 이미 지나 있으면 재개하는 순간 바로 발신이 나간다.
+    const startAt = schedule.start_at ? new Date(schedule.start_at) : null;
+    const past = startAt && !isNaN(startAt.getTime()) && startAt.getTime() <= Date.now();
+    if (past && schedule.recurrence === "once") {
+      const count = schedule.tasks_per_run ? `총 ${schedule.tasks_per_run}건이 ` : "";
+      if (!confirm(`이 스케줄은 실행 시각(${schedule.start_at_text})이 이미 지나 있어, 재개하면 곧바로 발신이 시작됩니다.\n${count}나갑니다. 재개할까요?\n(시각을 바꾸려면 [수정]에서 고친 뒤 저장하세요.)`)) return;
+    }
+  }
   try {
     await api(`/api/schedules/${id}/${action}`, { method: "POST" });
     toast(action === "pause" ? "일시정지했습니다." : "재개했습니다.", "ok");
