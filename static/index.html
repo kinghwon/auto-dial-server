@@ -875,7 +875,7 @@ function updateSummary() {
   const rounds = Math.ceil(total / numbers.length);
   let preview;
   if (order === "random") {
-    preview = `${numbers.slice(0, 2).join(" → ")} … 라운드마다 무작위로 섮기`;
+    preview = `${numbers.slice(0, 2).join(" → ")} … 라운드마다 무작위로 섞기`;
   } else if (order === "grouped") {
     const first = numbers[0]; const second = numbers[1] || numbers[0];
     preview = `${first} 연속 → ${second} 연속 …`;
