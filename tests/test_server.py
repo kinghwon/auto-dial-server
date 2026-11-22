@@ -3250,6 +3250,8 @@ def test_dashboard_has_device_edit_controls(client):
         "saveDeviceEdit(",
         "closeDeviceEdit(",
         "기기 정보 편집",
+        "devicesSignature",
+        "data-lastseen",
     ):
         assert keyword in html, keyword
     # 기기 표의 액션은 편집 · 사용 중지 · 삭제 세 가지
