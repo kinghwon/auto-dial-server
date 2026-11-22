@@ -15,7 +15,6 @@ COPY app ./app
 COPY static ./static
 
 RUN mkdir -p /data
-VOLUME ["/data"]
 
 EXPOSE 8000
 
