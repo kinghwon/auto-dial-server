@@ -276,8 +276,8 @@
             <div class="help">발신 통화를 폰 안(앱 전용 폴더 recordings)에 저장합니다. 안드로이드 10 이상에서는 통화 녹음이 OS 차단으로 무음이 될 수 있습니다.</div>
           </div>
           <div class="field">
-            <label class="switch"><input type="checkbox" id="rcMuteVol"> 통화 볼륨 0</label>
-            <div class="help">발신하는 동안 폰의 통화 볼륨을 0으로 낮춥니다. 통화가 끝나면 원래 볼륨으로 되돌립니다.</div>
+            <label class="switch"><input type="checkbox" id="rcMuteVol"> 통화 볼륨 최소화</label>
+            <div class="help">발신하는 동안 폰의 통화 볼륨을 최소 단계로 낮추고 음소거를 시도합니다. 통화가 끝나면 원래 볼륨으로 되돌립니다.</div>
           </div>
           <div class="field">
             <label class="switch"><input type="checkbox" id="rcMuteMic"> 내 소리 차단</label>
@@ -776,7 +776,7 @@ async function loadRemoteSettings(force = false) {
     state.remoteDirty = false;
     const yn = (value, onText, offText) => (value ? (onText || "켬") : (offText || "끔"));
     $("rcStatus").textContent = `현재 서버 값 · 확인 ${remote.poll_interval_sec ?? 5}초 · 발신 간격 ${remote.call_gap_sec ?? 3}초 · SMS ${remote.sms_forward_enabled !== false ? "전달" : "안 함"} · MMS ${remote.mms_forward_enabled !== false ? "전달" : "안 함"}` +
-      ` · 녹음 ${yn(remote.call_recording_enabled === true)} · 통화 볼륨 0 ${yn(remote.call_mute_volume !== false)} · 내 소리 차단 ${yn(remote.call_mute_mic !== false)}`;
+      ` · 녹음 ${yn(remote.call_recording_enabled === true)} · 통화 볼륨 최소화 ${yn(remote.call_mute_volume !== false)} · 내 소리 차단 ${yn(remote.call_mute_mic !== false)}`;
   } catch (e) {
     $("rcStatus").textContent = "서버 설정을 불러오지 못했습니다: " + e.message;
   }

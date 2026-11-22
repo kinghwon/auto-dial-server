@@ -1027,7 +1027,7 @@ def save_remote_settings(payload: RemoteSettings, conn: sqlite3.Connection = Dep
     cfg = remote_config(conn)
     db.log(
         conn,
-        "원격 기기 설정 저장: 확인 {}초 · 간격 {}초 · SMS 전달 {} · MMS 전달 {} · 통화 녹음 {} · 통화 볼륨 0 {} · 내 소리 차단 {}".format(
+        "원격 기기 설정 저장: 확인 {}초 · 간격 {}초 · SMS 전달 {} · MMS 전달 {} · 통화 녹음 {} · 통화 볼륨 최소화 {} · 내 소리 차단 {}".format(
             cfg["poll_interval_sec"],
             cfg["call_gap_sec"],
             "ON" if cfg["sms_forward_enabled"] else "OFF",
