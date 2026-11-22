@@ -2644,7 +2644,7 @@ function startClock() {
     const now = new Date();
     const p = (n) => String(n).padStart(2, "0");
     const days = ["일", "월", "화", "수", "목", "금", "토"];
-    $("clock").textContent = `${p(now.getMonth() + 1)}-${p(now.getDate())}(${days[now.getDay()]}) ${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`;
+    $("clock").textContent = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}(${days[now.getDay()]}) ${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`;
   };
   tick();
   setInterval(tick, 1000);
