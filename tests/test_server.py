@@ -710,13 +710,260 @@ def test_stats_endpoint(client):
     assert stats["tasks"]["pending"] == 0
 
 
-def test_schedule_delete_cancels_tasks(client):
+def test_schedule_delete_removes_schedule_runs_and_tasks(client):
+    """실행된 스케줄을 지우면 실행 묶음·발신 작업도 함께 사라진다(고아·FK 오류 없음)."""
     schedule = make_schedule(client, numbers=["010-1234-0001"], repeat_count=1)
     client.post(f"/api/schedules/{schedule['id']}/run-now")
-    assert client.delete(f"/api/schedules/{schedule['id']}").status_code == 200
-    tasks = client.get("/api/tasks", params={"schedule_id": schedule["id"]}).json()["tasks"]
-    assert tasks[0]["status"] == "skipped"
+    task = client.get("/api/tasks").json()["tasks"][0]
+    client.post(f"/api/tasks/{task['id']}/result", json={"status": "done", "result": "통화 성공"})
+
+    response = client.delete(f"/api/schedules/{schedule['id']}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted"] == 1
+    assert body["deleted_runs"] == 1
+    assert body["deleted_tasks"] == 1
+
     assert client.get("/api/schedules").json()["schedules"] == []
+    assert client.get("/api/tasks").json()["tasks"] == []
+    assert client.get("/api/runs").json()["runs"] == []
+
+    conn = _conn()
+    try:
+        assert conn.execute("SELECT COUNT(*) AS c FROM tasks WHERE schedule_id = ?", (schedule["id"],)).fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM runs WHERE schedule_id = ?", (schedule["id"],)).fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+def test_schedule_delete_with_running_task_leaves_no_orphans(client):
+    client.post("/api/devices", json={"device_id": "DEV-DEL"})
+    schedule = make_schedule(client, numbers=["010-2222-0001"], repeat_count=1, device_id="DEV-DEL")
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    polled = client.get("/api/tasks/poll", params={"device_id": "DEV-DEL"}).json()["task"]
+    assert polled is not None
+    client.post(f"/api/tasks/{polled['id']}/start")
+
+    assert client.delete(f"/api/schedules/{schedule['id']}").status_code == 200
+    assert client.get("/api/tasks").json()["tasks"] == []
+    assert client.get("/api/runs").json()["runs"] == []
+
+
+def test_schedule_delete_unknown_returns_404(client):
+    assert client.delete("/api/schedules/9999").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 9-1. 스케줄 복사 / 선택 삭제 / 실행했던 스케줄 삭제
+# --------------------------------------------------------------------------
+def test_schedule_copy_is_paused_and_keeps_settings(client):
+    source = make_schedule(
+        client,
+        name="오전 안내",
+        numbers=["010-3333-0001", "010-3333-0002"],
+        total_calls=6,
+        order_mode="random",
+        start_at="2026-11-24T09:00",
+        recurrence="daily",
+        device_id="DEV-A",
+        max_call_duration_sec=45,
+    )
+    response = client.post(f"/api/schedules/{source['id']}/copy", json={})
+    assert response.status_code == 200
+    copy = response.json()["schedule"]
+
+    assert copy["id"] != source["id"]
+    assert copy["name"] == "오전 안내 (복사)"
+    assert copy["status"] == "paused"  # 확인 전에 저절로 발신되지 않게 일시정지로 시작
+    assert copy["numbers"] == source["numbers"]
+    assert copy["total_calls"] == 6
+    assert copy["order_mode"] == "random"
+    assert copy["recurrence"] == "daily"
+    assert copy["device_id"] == "DEV-A"
+    assert copy["max_call_duration_sec"] == 45
+    assert copy["start_at"] == source["start_at"]
+    assert copy["run_count"] == 0
+    assert copy["latest_run"] is None
+    assert len(client.get("/api/schedules").json()["schedules"]) == 2
+
+
+def test_schedule_copy_custom_name_and_enabled(client):
+    source = make_schedule(client, name="저녁", start_at="2026-11-25T19:00")
+    body = client.post(
+        f"/api/schedules/{source['id']}/copy", json={"enabled": True, "name": "저녁 2"}
+    ).json()
+    copy = body["schedule"]
+    assert copy["name"] == "저녁 2"
+    assert copy["status"] == "active"
+    assert copy["next_run_at"] == source["next_run_at"]
+
+
+def test_schedule_copy_of_finished_schedule_does_not_fire_again(client):
+    schedule = make_schedule(client, numbers=["010-4444-0001"], repeat_count=1, start_at="2026-11-21T09:00")
+    client.post("/api/scheduler/tick")
+    finished = client.get(f"/api/schedules/{schedule['id']}").json()["schedule"]
+    assert finished["status"] == "finished"
+
+    copy = client.post(f"/api/schedules/{schedule['id']}/copy", json={}).json()["schedule"]
+    assert copy["status"] == "paused"
+    assert copy["next_run_at"] is None
+    assert copy["run_count"] == 0
+
+    conn = _conn()
+    try:
+        created = scheduler.run_due_schedules(conn)
+    finally:
+        conn.close()
+    assert created == []
+    runs = client.get("/api/runs").json()["runs"]
+    assert all(run["schedule_id"] != copy["id"] for run in runs)
+
+
+def test_schedule_copy_unknown_returns_404(client):
+    assert client.post("/api/schedules/9999/copy", json={}).status_code == 404
+
+
+def test_bulk_delete_selected_schedules(client):
+    first = make_schedule(client, name="A", numbers=["010-5555-0001"], repeat_count=1)
+    second = make_schedule(client, name="B", numbers=["010-5555-0002"], repeat_count=1)
+    third = make_schedule(client, name="C", numbers=["010-5555-0003"], repeat_count=1)
+    client.post(f"/api/schedules/{first['id']}/run-now")
+    client.post(f"/api/schedules/{third['id']}/run-now")
+
+    response = client.post(
+        "/api/schedules/delete", json={"ids": [first["id"], second["id"], first["id"]]}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted"] == 2
+    assert body["deleted_runs"] == 1
+    assert body["deleted_tasks"] == 1
+
+    assert [s["id"] for s in client.get("/api/schedules").json()["schedules"]] == [third["id"]]
+    assert [run["schedule_id"] for run in client.get("/api/runs").json()["runs"]] == [third["id"]]
+    assert {task["schedule_id"] for task in client.get("/api/tasks").json()["tasks"]} == {third["id"]}
+
+
+def test_bulk_delete_executed_only_keeps_unexecuted_and_recurring(client):
+    """이미 끝난 스케줄만 지우고, 아직 실행 전이거나 계속 예약되는 스케줄은 남긴다."""
+    finished = make_schedule(client, name="끝난 1회", numbers=["010-6666-0001"], repeat_count=1, start_at="2026-11-21T09:00")
+    client.post("/api/scheduler/tick")  # 만기 실행 후 종료(finished) 처리
+    if client.get(f"/api/schedules/{finished['id']}").json()["schedule"]["status"] != "finished":
+        # 서버 시각이 테스트 날짜보다 앞선 경우를 대비해 직접 종료 상태로 맞춘다.
+        conn = _conn()
+        conn.execute("UPDATE schedules SET status = 'finished', next_run_at = NULL WHERE id = ?", (finished["id"],))
+        conn.close()
+    waiting = make_schedule(client, name="대기", numbers=["010-6666-0002"], repeat_count=1)
+    recurring = make_schedule(
+        client,
+        name="매일 반복",
+        numbers=["010-6666-0003"],
+        repeat_count=1,
+        recurrence="daily",
+        start_at="2026-11-21T09:00",
+    )
+    client.post("/api/scheduler/tick")
+    assert len(client.get("/api/runs").json()["runs"]) >= 2
+
+    response = client.post("/api/schedules/delete", json={"executed_only": True})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted"] == 1
+    assert body["deleted_ids"] == [finished["id"]]
+
+    remaining = {s["id"] for s in client.get("/api/schedules").json()["schedules"]}
+    assert remaining == {waiting["id"], recurring["id"]}
+    # 남은 스케줄의 실행 기록은 그대로 유지된다.
+    assert {run["schedule_id"] for run in client.get("/api/runs").json()["runs"]} >= {recurring["id"]}
+
+
+def test_bulk_delete_executed_only_without_history_returns_404(client):
+    make_schedule(client)
+    assert client.post("/api/schedules/delete", json={"executed_only": True}).status_code == 404
+    assert len(client.get("/api/schedules").json()["schedules"]) == 1
+
+
+def test_bulk_delete_all_schedules(client):
+    for index in range(3):
+        make_schedule(client, name=f"S{index}", numbers=[f"010-7777-000{index}"], repeat_count=1)
+    response = client.post("/api/schedules/delete", json={"all_schedules": True})
+    assert response.status_code == 200
+    assert response.json()["deleted"] == 3
+    assert client.get("/api/schedules").json()["schedules"] == []
+
+
+def test_bulk_delete_schedules_requires_target(client):
+    assert client.post("/api/schedules/delete", json={}).status_code == 422
+    assert client.post("/api/schedules/delete", json={"ids": []}).status_code == 422
+
+
+def test_schedule_copy_and_delete_require_api_key(client, monkeypatch):
+    schedule = make_schedule(client, numbers=["010-1234-0009"], repeat_count=1)
+    monkeypatch.setattr(config, "API_KEY", "secret-key")
+    assert client.delete(f"/api/schedules/{schedule['id']}").status_code == 401
+    assert client.post("/api/schedules/delete", json={"ids": [schedule["id"]]}).status_code == 401
+    assert client.post(f"/api/schedules/{schedule['id']}/copy", json={}).status_code == 401
+    assert client.delete("/api/runs/1").status_code == 401
+    assert client.post("/api/runs/delete", json={"all_finished": True}).status_code == 401
+
+
+def test_delete_run_removes_its_tasks(client):
+    schedule = make_schedule(client, numbers=["010-8888-0001", "010-8888-0002"], total_calls=2)
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    run_id = client.get("/api/runs").json()["runs"][0]["id"]
+
+    response = client.delete(f"/api/runs/{run_id}")
+    assert response.status_code == 200
+    assert response.json()["deleted_tasks"] == 2
+    assert client.get("/api/runs").json()["runs"] == []
+    assert client.get("/api/tasks").json()["tasks"] == []
+    # 실행 기록만 지우고 스케줄 자체는 남긴다.
+    assert [s["id"] for s in client.get("/api/schedules").json()["schedules"]] == [schedule["id"]]
+
+
+def test_delete_finished_runs_keeps_pending_runs(client):
+    schedule = make_schedule(client, numbers=["010-9999-0001"], repeat_count=1)
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    first_run = client.get("/api/runs").json()["runs"][0]["id"]
+    task = client.get("/api/tasks").json()["tasks"][0]
+    client.post(f"/api/tasks/{task['id']}/result", json={"status": "done"})
+    client.post(f"/api/schedules/{schedule['id']}/run-now")
+    assert len(client.get("/api/runs").json()["runs"]) == 2
+
+    response = client.post("/api/runs/delete", json={"all_finished": True})
+    assert response.status_code == 200
+    assert response.json()["deleted"] == 1
+    remaining = client.get("/api/runs").json()["runs"]
+    assert len(remaining) == 1 and remaining[0]["id"] != first_run
+
+
+def test_delete_run_unknown_returns_404(client):
+    assert client.delete("/api/runs/12345").status_code == 404
+    assert client.post("/api/runs/delete", json={"ids": [12345]}).status_code == 404
+
+
+def test_openapi_exposes_schedule_copy_and_delete(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "post" in paths["/api/schedules/{schedule_id}/copy"]
+    assert "post" in paths["/api/schedules/delete"]
+    assert "delete" in paths["/api/schedules/{schedule_id}"]
+    assert "delete" in paths["/api/runs/{run_id}"]
+    assert "post" in paths["/api/runs/delete"]
+
+
+def test_dashboard_has_schedule_copy_and_delete_controls(client):
+    html = client.get("/").text
+    for keyword in (
+        "copySchedule(",
+        "/copy",
+        "scheduleSelectAll",
+        "deleteSelectedSchedules",
+        "deleteExecutedSchedules",
+        "실행했던 스케줄 삭제",
+        "/api/schedules/delete",
+        "deleteFinishedRuns",
+    ):
+        assert keyword in html, keyword
 
 
 def test_logs_recorded(client):

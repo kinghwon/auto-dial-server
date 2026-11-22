@@ -437,8 +437,16 @@
         <div><h2>등록된 스케줄</h2><div class="sub" id="scheduleSummary">-</div></div>
         <button class="btn sm" onclick="loadSchedules()">새로고침</button>
       </div>
+      <div class="card-body" style="padding:12px 18px;border-bottom:1px solid var(--line)">
+        <div class="btn-row" style="align-items:center">
+          <button class="btn sm danger" id="scheduleDeleteSelectedBtn" onclick="deleteSelectedSchedules()" disabled>선택 삭제 (0)</button>
+          <button class="btn sm danger" id="scheduleDeleteExecutedBtn" onclick="deleteExecutedSchedules()" disabled>실행했던 스케줄 삭제 (0)</button>
+          <span class="spacer"></span>
+          <span class="muted" id="scheduleDeleteHint" style="font-size:12px">스케줄을 선택해 삭제하거나, 이미 실행이 끝나 다시 예약되지 않는 스케줄만 모아서 지울 수 있습니다.</span>
+        </div>
+      </div>
       <div class="table-wrap"><table id="schedulesTable">
-        <thead><tr><th>스케줄</th><th>유형</th><th>발신량 / 순서</th><th>주기</th><th>다음 실행</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
+        <thead><tr><th style="width:36px"><input type="checkbox" id="scheduleSelectAll" title="현재 목록 전체 선택" onchange="toggleSelectAllSchedules(this)"></th><th>스케줄</th><th>유형</th><th>발신량 / 순서</th><th>주기</th><th>다음 실행</th><th>최근 실행</th><th>상태</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -472,9 +480,15 @@
     </div>
 
     <div class="card">
-      <div class="card-head"><div><h2>실행 묶음</h2><div class="sub">스케줄 1회 실행 = 1개 묶음</div></div></div>
+      <div class="card-head">
+        <div><h2>실행 묶음</h2><div class="sub">스케줄 1회 실행 = 1개 묶음</div></div>
+        <div class="filters">
+          <button class="btn sm danger" onclick="deleteFinishedRuns()">완료 기록 전체 삭제</button>
+          <button class="btn sm" onclick="loadRuns()">새로고침</button>
+        </div>
+      </div>
       <div class="table-wrap"><table id="runsTable">
-        <thead><tr><th>#</th><th>스케줄</th><th>유형</th><th>예정 시각</th><th>진행</th><th>상태</th><th>생성</th></tr></thead>
+        <thead><tr><th>#</th><th>스케줄</th><th>유형</th><th>예정 시각</th><th>진행</th><th>상태</th><th>생성</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
     </div>
@@ -586,6 +600,7 @@ const state = {
   tab: "dashboard",
   devices: [],
   schedules: [],
+  selectedSchedules: new Set(),
   taskFilter: "",
   selectedTasks: new Set(),
   visibleTasks: [],
@@ -958,7 +973,11 @@ function setScheduleEditMode(schedule) {
   state.editingScheduleId = schedule ? schedule.id : null;
   $("scheduleFormTitle").textContent = schedule ? `스케줄 수정 (#${schedule.id})` : "새 발신 스케줄";
   $("scheduleFormSub").textContent = schedule
-    ? "값을 고친 뒤 '스케줄 수정 저장'을 누르면 바로 반영됩니다."
+    ? (schedule.status === "paused"
+        ? "일시정지 상태입니다. 값을 고쳐 저장한 뒤 목록에서 [재개]를 누르면 예약됩니다."
+        : (schedule.status === "finished"
+            ? "이미 종료된 스케줄입니다. 실행 시각을 미래로 고쳐 저장하면 다시 예약할 수 있습니다."
+            : "값을 고친 뒤 '스케줄 수정 저장'을 누르면 바로 반영됩니다."))
     : "번호를 원하는 순서대로, 정해진 총 횟수만큼 예약 발신합니다";
   $("createScheduleBtn").textContent = schedule ? "스케줄 수정 저장" : "스케줄 등록";
   $("cancelScheduleEditBtn").style.display = schedule ? "" : "none";
@@ -1000,9 +1019,13 @@ function resetScheduleForm() {
   updateSummary();
 }
 
-function startEditSchedule(id) {
+function startEditSchedule(id, quiet = false) {
   const schedule = state.schedules.find((item) => item.id === id);
   if (!schedule) return;
+  openScheduleForm(schedule, quiet);
+}
+
+function openScheduleForm(schedule, quiet = false) {
   setScheduleEditMode(schedule);
   $("schedName").value = schedule.name || "";
   $("schedNumbers").value = (schedule.numbers || []).join("\n");
@@ -1021,7 +1044,7 @@ function startEditSchedule(id) {
   toggleTypeFields();
   updateSummary();
   $("pane-schedules").scrollIntoView({ behavior: "smooth", block: "start" });
-  toast(`#${schedule.id} 스케줄을 불러왔습니다. 값을 고친 뒤 저장하세요.`);
+  if (!quiet) toast(`#${schedule.id} 스케줄을 불러왔습니다. 값을 고친 뒤 저장하세요.`);
 }
 
 function cancelScheduleEdit() {
@@ -1099,6 +1122,7 @@ async function loadSchedules() {
           const legacyText = s.total_calls == null ? ` (${s.number_count}개 × ${s.repeat_count}회)` : "";
           return `
           <tr>
+            <td><input type="checkbox" class="queue-check" ${state.selectedSchedules.has(s.id) ? "checked" : ""} onchange="toggleScheduleSelection(${s.id}, this.checked)"></td>
             <td><b>${esc(s.name)}</b><div class="muted" style="font-size:11.5px">#${s.id} · ${esc(detail)}</div></td>
             <td>${typeTag(s.type)}</td>
             <td class="nowrap"><b>${esc(amountText)}</b><div class="muted" style="font-size:11.5px">${esc(orderText)} · 번호 ${s.number_count}개${esc(legacyText)}</div></td>
@@ -1109,6 +1133,7 @@ async function loadSchedules() {
             <td>
               <div class="cell-actions">
                 <button class="btn sm" onclick="startEditSchedule(${s.id})">수정</button>
+                <button class="btn sm" onclick="copySchedule(${s.id})" title="같은 설정으로 복사본을 만들고 일시정지 상태로 둡니다">복사</button>
                 <button class="btn sm" onclick="runScheduleNow(${s.id})">지금 실행</button>
                 ${s.status === "active"
                   ? `<button class="btn sm" onclick="setScheduleStatus(${s.id},'pause')">일시정지</button>`
@@ -1118,7 +1143,83 @@ async function loadSchedules() {
             </td>
           </tr>`;
         }).join("")
-      : emptyRow(8, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
+      : emptyRow(9, "등록된 스케줄이 없습니다. 위에서 첫 스케줄을 만들어 보세요.", "🗓️");
+
+    const activeIds = new Set(data.schedules.map((s) => s.id));
+    Array.from(state.selectedSchedules).forEach((id) => { if (!activeIds.has(id)) state.selectedSchedules.delete(id); });
+    updateScheduleToolbar();
+    syncScheduleSelectAll();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function isExecutedSchedule(schedule) {
+  if (!schedule) return false;
+  const hasHistory = (schedule.run_count || 0) > 0 || Boolean(schedule.last_run_at) || Boolean(schedule.latest_run);
+  const willRunAgain = schedule.status !== "finished" && Boolean(schedule.next_run_at);
+  return hasHistory && !willRunAgain;
+}
+
+function toggleScheduleSelection(id, checked) {
+  if (checked) state.selectedSchedules.add(Number(id)); else state.selectedSchedules.delete(Number(id));
+  updateScheduleToolbar();
+}
+
+function syncScheduleSelectAll() {
+  const box = $("scheduleSelectAll");
+  if (!box) return;
+  const list = state.schedules || [];
+  const selected = list.filter((s) => state.selectedSchedules.has(s.id)).length;
+  box.checked = list.length > 0 && selected === list.length;
+  box.indeterminate = selected > 0 && selected < list.length;
+  box.disabled = list.length === 0;
+}
+
+function toggleSelectAllSchedules(box) {
+  if (box.checked) (state.schedules || []).forEach((s) => state.selectedSchedules.add(s.id));
+  else state.selectedSchedules.clear();
+  loadSchedules();
+}
+
+function updateScheduleToolbar() {
+  const selected = state.selectedSchedules.size;
+  const executed = (state.schedules || []).filter(isExecutedSchedule).length;
+  const selectedBtn = $("scheduleDeleteSelectedBtn");
+  const executedBtn = $("scheduleDeleteExecutedBtn");
+  if (selectedBtn) {
+    selectedBtn.textContent = `선택 삭제 (${selected})`;
+    selectedBtn.disabled = selected === 0;
+  }
+  if (executedBtn) {
+    executedBtn.textContent = `실행했던 스케줄 삭제 (${executed})`;
+    executedBtn.disabled = executed === 0;
+  }
+  const hint = $("scheduleDeleteHint");
+  if (hint) {
+    hint.textContent = selected
+      ? `${selected}개 선택됨 · 삭제하면 스케줄과 실행 기록이 함께 사라집니다.`
+      : "스케줄을 선택해 삭제하거나, 이미 실행이 끝나 다시 예약되지 않는 스케줄만 모아서 지울 수 있습니다.";
+  }
+}
+
+function scheduleDeleteMessage(result) {
+  const parts = [`스케줄 ${result.deleted}개를 삭제했습니다.`];
+  if (result.deleted_runs) parts.push(`실행 기록 ${result.deleted_runs}개`);
+  if (result.deleted_tasks) parts.push(`발신 작업 ${result.deleted_tasks}건`);
+  return parts.join(" ");
+}
+
+async function copySchedule(id) {
+  const source = (state.schedules || []).find((item) => item.id === id);
+  const label = source ? `'${source.name}' (#${id})` : `#${id}`;
+  try {
+    const result = await api(`/api/schedules/${id}/copy`, { method: "POST", body: JSON.stringify({}) });
+    const copy = result.schedule;
+    await loadSchedules();
+    openScheduleForm(copy, true);
+    toast(
+      `${label} 설정을 #${copy.id} '(복사)'로 복사했습니다. 일시정지 상태로 만들어 두었으니 실행 시각을 확인한 뒤 저장하고 목록에서 [재개]를 누르면 예약됩니다.`,
+      "ok"
+    );
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -1140,12 +1241,52 @@ async function setScheduleStatus(id, action) {
 }
 
 async function deleteSchedule(id) {
-  if (!confirm("스케줄을 삭제할까요?\n남은 발신 작업은 취소됩니다.")) return;
+  const schedule = (state.schedules || []).find((item) => item.id === id);
+  const label = schedule ? `'${schedule.name}' (#${id})` : `#${id}`;
+  const lines = [`스케줄 ${label}을(를) 삭제할까요?`];
+  if (schedule && schedule.next_run_at) lines.push("예약된 다음 발신과 대기 중인 작업도 함께 취소·삭제됩니다.");
+  if (schedule && isExecutedSchedule(schedule)) lines.push("이미 실행된 기록(실행 묶음·발신 작업)도 함께 사라집니다.");
+  lines.push("삭제한 뒤에는 되돌릴 수 없습니다.");
+  if (!confirm(lines.join("\n"))) return;
   try {
-    await api(`/api/schedules/${id}`, { method: "DELETE" });
-    toast("스케줄을 삭제했습니다.", "ok");
+    const result = await api(`/api/schedules/${id}`, { method: "DELETE" });
+    state.selectedSchedules.delete(id);
+    toast(scheduleDeleteMessage(result), "ok");
     if (state.editingScheduleId === id) resetScheduleForm();
     loadSchedules();
+    loadRuns();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteSelectedSchedules() {
+  const ids = Array.from(state.selectedSchedules);
+  if (!ids.length) { toast("삭제할 스케줄을 선택하세요.", "err"); return; }
+  const names = (state.schedules || []).filter((s) => ids.includes(s.id)).map((s) => `· ${s.name} (#${s.id})`);
+  const more = names.length > 10 ? `\n외 ${names.length - 10}개` : "";
+  if (!confirm(`선택한 스케줄 ${ids.length}개를 삭제할까요?\n${names.slice(0, 10).join("\n")}${more}\n\n실행 기록·발신 작업 기록도 함께 삭제되며 되돌릴 수 없습니다.`)) return;
+  try {
+    const result = await api("/api/schedules/delete", { method: "POST", body: JSON.stringify({ ids }) });
+    state.selectedSchedules.clear();
+    if (ids.includes(state.editingScheduleId)) resetScheduleForm();
+    toast(scheduleDeleteMessage(result), "ok");
+    loadSchedules();
+    loadRuns();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteExecutedSchedules() {
+  const executed = (state.schedules || []).filter(isExecutedSchedule);
+  if (!executed.length) { toast("실행했던 스케줄이 없습니다."); return; }
+  const names = executed.map((s) => `· ${s.name} (#${s.id} · ${s.run_count || 0}회 실행)`);
+  const more = names.length > 10 ? `\n외 ${names.length - 10}개` : "";
+  if (!confirm(`이미 실행이 끝나 다시 예약되지 않는 스케줄 ${executed.length}개를 삭제할까요?\n${names.slice(0, 10).join("\n")}${more}\n\n계속 예약되는 활성·일시정지 스케줄은 그대로 두며, 삭제한 기록은 되돌릴 수 없습니다.`)) return;
+  try {
+    const result = await api("/api/schedules/delete", { method: "POST", body: JSON.stringify({ executed_only: true }) });
+    if (result.deleted_ids && result.deleted_ids.includes(state.editingScheduleId)) resetScheduleForm();
+    state.selectedSchedules.clear();
+    toast(scheduleDeleteMessage(result), "ok");
+    loadSchedules();
+    loadRuns();
   } catch (e) { toast(e.message, "err"); }
 }
 
@@ -1302,14 +1443,35 @@ async function loadRuns() {
       ? data.runs.map((r) => `
         <tr>
           <td class="muted mono">${r.id}</td>
-          <td class="truncate">${esc(r.schedule_name || "-")}</td>
+          <td class="truncate">${esc(r.schedule_name || "-")}${r.schedule_id == null ? ' <span class="muted" style="font-size:11.5px">(스케줄 삭제됨)</span>' : ""}</td>
           <td>${typeTag(r.type)}</td>
           <td class="nowrap muted">${esc(r.scheduled_for_text)}</td>
           <td style="min-width:130px">${progressBar(r.done_tasks, r.total_tasks)}</td>
           <td>${statusBadge(RUN_STATUS, r.status)}</td>
           <td class="muted nowrap">${esc(r.created_at_text)}</td>
+          <td class="nowrap"><button class="btn sm danger" onclick="deleteRun(${r.id})">삭제</button></td>
         </tr>`).join("")
-      : emptyRow(7, "실행 기록이 없습니다.", "🕒");
+      : emptyRow(8, "실행 기록이 없습니다.", "🕒");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteRun(id) {
+  if (!confirm(`실행 묶음 #${id}과 그 안의 발신 작업 기록을 삭제할까요?\n스케줄 자체는 그대로 남고, 되돌릴 수 없습니다.`)) return;
+  try {
+    const result = await api(`/api/runs/${id}`, { method: "DELETE" });
+    toast(`실행 기록 1개와 발신 작업 ${result.deleted_tasks}건을 삭제했습니다.`, "ok");
+    loadRuns();
+    loadSchedules();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function deleteFinishedRuns() {
+  if (!confirm("완료·실패·취소로 끝난 실행 기록을 모두 삭제할까요?\n대기·진행 중인 묶음은 그대로 두며, 삭제한 기록은 되돌릴 수 없습니다.")) return;
+  try {
+    const result = await api("/api/runs/delete", { method: "POST", body: JSON.stringify({ all_finished: true }) });
+    toast(`끝난 실행 기록 ${result.deleted}개와 발신 작업 ${result.deleted_tasks}건을 삭제했습니다.`, "ok");
+    loadRuns();
+    loadSchedules();
   } catch (e) { toast(e.message, "err"); }
 }
 

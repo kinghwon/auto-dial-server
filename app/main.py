@@ -22,6 +22,9 @@ from .models import (
     DeviceUpdate,
     Heartbeat,
     RemoteSettings,
+    RunBulkDelete,
+    ScheduleBulkDelete,
+    ScheduleCopy,
     ScheduleCreate,
     ScheduleUpdate,
     SmsBulkDelete,
@@ -788,20 +791,260 @@ def run_schedule_now(schedule_id: int, conn: sqlite3.Connection = Depends(get_co
     return {"ok": True, "run_id": run_id}
 
 
+def _purge_schedules(conn: sqlite3.Connection, schedule_ids: list[int]) -> dict:
+    """스케줄과 그 실행 기록(runs)·발신 작업(tasks)을 함께 지운다.
+
+    이미 실행된 스케줄을 지워도 실행 묶음·발신 작업이 고아(orphan)로 남지 않는다.
+    FK 제약이 걸린 DB에서도 자식 행을 먼저 지우므로 오류가 나지 않는다.
+    """
+    ids = [int(item) for item in dict.fromkeys(schedule_ids or [])]
+    if not ids:
+        return {"deleted_ids": [], "deleted": 0, "deleted_runs": 0, "deleted_tasks": 0, "missing_ids": []}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, name FROM schedules WHERE id IN ({placeholders})", ids
+    ).fetchall()
+    found = [row["id"] for row in rows]
+    found_set = set(found)
+    missing = [item for item in ids if item not in found_set]
+    if not found:
+        return {"deleted_ids": [], "deleted": 0, "deleted_runs": 0, "deleted_tasks": 0, "missing_ids": missing}
+
+    found_placeholders = ",".join("?" for _ in found)
+    run_ids = [
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM runs WHERE schedule_id IN ({found_placeholders})", found
+        )
+    ]
+
+    if run_ids:
+        run_placeholders = ",".join("?" for _ in run_ids)
+        deleted_tasks = conn.execute(
+            f"SELECT COUNT(*) AS c FROM tasks WHERE schedule_id IN ({found_placeholders}) OR run_id IN ({run_placeholders})",
+            found + run_ids,
+        ).fetchone()["c"]
+        conn.execute(
+            f"DELETE FROM tasks WHERE schedule_id IN ({found_placeholders}) OR run_id IN ({run_placeholders})",
+            found + run_ids,
+        )
+        conn.execute(f"DELETE FROM runs WHERE id IN ({run_placeholders})", run_ids)
+    else:
+        deleted_tasks = conn.execute(
+            f"SELECT COUNT(*) AS c FROM tasks WHERE schedule_id IN ({found_placeholders})", found
+        ).fetchone()["c"]
+        conn.execute(f"DELETE FROM tasks WHERE schedule_id IN ({found_placeholders})", found)
+
+    deleted_schedules = conn.execute(
+        f"DELETE FROM schedules WHERE id IN ({found_placeholders})", found
+    ).rowcount
+    return {
+        "deleted_ids": found,
+        "deleted": int(deleted_schedules or 0),
+        "deleted_runs": len(run_ids),
+        "deleted_tasks": int(deleted_tasks or 0),
+        "missing_ids": missing,
+    }
+
+
 @api.delete("/schedules/{schedule_id}")
 def delete_schedule(schedule_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """스케줄 1개 삭제. 이미 실행된 스케줄이어도 실행 기록·발신 작업까지 함께 지운다."""
     row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
-    conn.execute(
-        """UPDATE tasks SET status = 'skipped', finished_at = ?, error = '스케줄 삭제로 취소'
-           WHERE schedule_id = ? AND status IN ('pending','assigned','running')""",
-        (iso(now()), schedule_id),
-    )
-    conn.execute("UPDATE runs SET status = 'canceled', finished_at = ? WHERE schedule_id = ? AND status IN ('pending','running')", (iso(now()), schedule_id))
-    conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
-    db.log(conn, f"스케줄 삭제: #{schedule_id} {row['name']}", "warning")
-    return {"ok": True, "deleted": schedule_id}
+    with db.transaction(conn):
+        result = _purge_schedules(conn, [schedule_id])
+        db.log(
+            conn,
+            f"스케줄 삭제: #{schedule_id} '{row['name']}' "
+            f"(실행 기록 {result['deleted_runs']}개 · 발신 작업 {result['deleted_tasks']}건 함께 삭제)",
+            "warning",
+        )
+    return {"ok": True, "deleted": schedule_id, **result}
+
+
+@api.post("/schedules/delete")
+def bulk_delete_schedules(payload: ScheduleBulkDelete, conn: sqlite3.Connection = Depends(get_conn)):
+    """스케줄 여러 개 삭제.
+
+    - ids           : 선택한 스케줄
+    - executed_only : 이미 실행된 적이 있고 다시 예약되지 않는 스케줄
+                      (실행 기록이 있으면서 status='finished' 이거나 next_run_at 이 없는 것)
+    - all_schedules : 등록된 모든 스케줄
+    실행 기록(runs)과 발신 작업(tasks)도 함께 지워 고아 기록이 남지 않는다.
+    """
+    if payload.all_schedules:
+        ids = [row["id"] for row in conn.execute("SELECT id FROM schedules ORDER BY id")]
+        label = "전체"
+    elif payload.executed_only:
+        # 되풀이되어 다시 실행될 스케줄(매일·매주 등 활성/일시정지)은 건드리지 않는다.
+        ids = [
+            row["id"]
+            for row in conn.execute(
+                """SELECT s.id FROM schedules s
+                   WHERE (s.run_count > 0 OR s.last_run_at IS NOT NULL
+                          OR EXISTS (SELECT 1 FROM runs r WHERE r.schedule_id = s.id))
+                     AND (s.status = 'finished' OR s.next_run_at IS NULL)
+                   ORDER BY s.id"""
+            )
+        ]
+        label = "실행했던"
+    else:
+        ids = list(payload.ids)
+        label = "선택"
+
+    if not ids:
+        raise HTTPException(status_code=404, detail="삭제할 스케줄이 없습니다.")
+
+    with db.transaction(conn):
+        result = _purge_schedules(conn, ids)
+        db.log(
+            conn,
+            f"스케줄 {label} 삭제: {result['deleted']}개 "
+            f"(실행 기록 {result['deleted_runs']}개 · 발신 작업 {result['deleted_tasks']}건)",
+            "warning",
+        )
+    return {"ok": True, **result}
+
+
+@api.post("/schedules/{schedule_id}/copy")
+def copy_schedule(
+    schedule_id: int,
+    payload: ScheduleCopy | None = None,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """스케줄 복사. 이름·번호·발신량·순서·시각·주기·기기를 그대로 복사한다.
+
+    기본은 일시정지(paused) 상태로 만들어, 이미 지난 시각의 스케줄을 복사해도
+    확인하기 전에 저절로 발신되지 않게 한다. body 에 enabled=true 를 보내면 활성으로 만든다.
+    """
+    row = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+
+    options = payload or ScheduleCopy()
+    base_name = (row["name"] or f"스케줄 {schedule_id}").strip()
+    name = (options.name or f"{base_name} (복사)")[:120]
+
+    start_at = parse_dt(row["start_at"]) or now()
+    current = now()
+    status = "active" if options.enabled else "paused"
+    if options.enabled:
+        next_run = _next_run_after_edit(
+            start_at, row["recurrence"] or "once", current, allow_now=True, run_count=0
+        )
+    else:
+        # 일시정지 복사본: 미래 시각일 때만 예약 시각을 보여 주고, 지난 시각이면 비워 둔다.
+        next_run = iso(start_at) if start_at > current else None
+
+    total_calls = row["total_calls"] if "total_calls" in row.keys() else None
+    created = iso(current)
+    with db.transaction(conn):
+        cursor = conn.execute(
+            """INSERT INTO schedules(name, type, numbers, repeat_count, total_calls, order_mode,
+                                     max_call_duration_sec, sms_body, start_at, recurrence, device_id,
+                                     status, next_run_at, run_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+            (
+                name,
+                row["type"],
+                row["numbers"],
+                row["repeat_count"],
+                total_calls,
+                row["order_mode"] or "sequence",
+                row["max_call_duration_sec"],
+                row["sms_body"],
+                row["start_at"],
+                row["recurrence"],
+                row["device_id"],
+                status,
+                next_run,
+                created,
+            ),
+        )
+        new_id = int(cursor.lastrowid)
+        db.log(
+            conn,
+            f"스케줄 복사: #{schedule_id} '{row['name']}' → #{new_id} '{name}' "
+            f"({'활성' if options.enabled else '일시정지'})",
+        )
+    new_row = conn.execute("SELECT * FROM schedules WHERE id = ?", (new_id,)).fetchone()
+    return {"ok": True, "source_id": schedule_id, "schedule": schedule_dict(conn, new_row)}
+
+
+# 실행 묶음(run) 삭제: 스케줄을 남긴 채 실행 기록만 정리하고 싶을 때
+FINISHED_RUN_STATUSES = ("done", "partial", "failed", "canceled")
+
+
+def _purge_runs(conn: sqlite3.Connection, run_ids: list[int]) -> tuple[int, int]:
+    """실행 묶음과 그 안의 발신 작업을 지운다. (지운 작업 수, 지운 묶음 수)"""
+    ids = [int(item) for item in dict.fromkeys(run_ids or [])]
+    if not ids:
+        return 0, 0
+    placeholders = ",".join("?" for _ in ids)
+    deleted_tasks = conn.execute(
+        f"SELECT COUNT(*) AS c FROM tasks WHERE run_id IN ({placeholders})", ids
+    ).fetchone()["c"]
+    conn.execute(f"DELETE FROM tasks WHERE run_id IN ({placeholders})", ids)
+    deleted_runs = conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", ids).rowcount
+    return int(deleted_tasks or 0), int(deleted_runs or 0)
+
+
+@api.delete("/runs/{run_id}")
+def delete_run(run_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """실행 묶음 1개 삭제(그 안의 발신 작업 포함)."""
+    row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="실행 기록을 찾을 수 없습니다.")
+    with db.transaction(conn):
+        deleted_tasks, deleted_runs = _purge_runs(conn, [run_id])
+        db.log(
+            conn,
+            f"실행 기록 삭제: run #{run_id} '{row['schedule_name']}' (발신 작업 {deleted_tasks}건)",
+            "warning",
+        )
+    return {"ok": True, "deleted": deleted_runs, "deleted_tasks": deleted_tasks}
+
+
+@api.post("/runs/delete")
+def bulk_delete_runs(payload: RunBulkDelete, conn: sqlite3.Connection = Depends(get_conn)):
+    """실행 기록 여러 개 삭제 / 이미 끝난 실행 기록 전체 삭제(all_finished)."""
+    if payload.all_finished:
+        placeholders = ",".join("?" for _ in FINISHED_RUN_STATUSES)
+        ids = [
+            row["id"]
+            for row in conn.execute(
+                f"SELECT id FROM runs WHERE status IN ({placeholders}) ORDER BY id",
+                list(FINISHED_RUN_STATUSES),
+            )
+        ]
+    else:
+        ids = list(payload.ids)
+    if not ids:
+        raise HTTPException(status_code=404, detail="삭제할 실행 기록이 없습니다.")
+    placeholders = ",".join("?" for _ in ids)
+    found = {
+        row["id"]
+        for row in conn.execute(f"SELECT id FROM runs WHERE id IN ({placeholders})", ids)
+    }
+    missing = [item for item in ids if item not in found]
+    target = [item for item in ids if item in found]
+    if not target:
+        raise HTTPException(status_code=404, detail="삭제할 실행 기록이 없습니다.")
+    with db.transaction(conn):
+        deleted_tasks, deleted_runs = _purge_runs(conn, target)
+        db.log(
+            conn,
+            f"실행 기록 삭제: {deleted_runs}개 (발신 작업 {deleted_tasks}건)",
+            "warning",
+        )
+    return {
+        "ok": True,
+        "deleted": deleted_runs,
+        "deleted_tasks": deleted_tasks,
+        "missing_ids": missing,
+    }
 
 
 # --------------------------------------------------------------------------

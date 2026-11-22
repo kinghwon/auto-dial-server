@@ -184,6 +184,70 @@ class TaskBulkDelete(BaseModel):
         return self
 
 
+class ScheduleCopy(BaseModel):
+    """스케줄 복사. 기본은 일시정지 상태로 만들어 예약이 저절로 나가지 않게 한다."""
+
+    name: Optional[str] = Field(default=None, max_length=120)
+    enabled: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ScheduleBulkDelete(BaseModel):
+    """스케줄 부분 삭제(ids) / 실행했던 스케줄 삭제(executed_only) / 전체 삭제(all_schedules)."""
+
+    ids: list[int] = Field(default_factory=list, max_length=1000)
+    executed_only: bool = False
+    all_schedules: bool = False
+
+    @field_validator("ids")
+    @classmethod
+    def _ids(cls, value: list[int]) -> list[int]:
+        cleaned: list[int] = []
+        for item in value:
+            number = int(item)
+            if number not in cleaned:
+                cleaned.append(number)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _require_target(self):
+        if not self.all_schedules and not self.executed_only and not self.ids:
+            raise ValueError(
+                "삭제할 스케줄(ids)을 지정하거나 executed_only=true 또는 all_schedules=true 를 보내야 합니다."
+            )
+        return self
+
+
+class RunBulkDelete(BaseModel):
+    """실행 묶음 부분 삭제(ids) / 이미 끝난 실행 기록 전체 삭제(all_finished)."""
+
+    ids: list[int] = Field(default_factory=list, max_length=1000)
+    all_finished: bool = False
+
+    @field_validator("ids")
+    @classmethod
+    def _ids(cls, value: list[int]) -> list[int]:
+        cleaned: list[int] = []
+        for item in value:
+            number = int(item)
+            if number not in cleaned:
+                cleaned.append(number)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _require_target(self):
+        if not self.all_finished and not self.ids:
+            raise ValueError("삭제할 실행 기록(ids)을 지정하거나 all_finished=true 를 보내야 합니다.")
+        return self
+
+
 class SmsBulkDelete(BaseModel):
     """수신 문자 부분 삭제(ids) / 전체 삭제(all_sms)."""
 
