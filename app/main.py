@@ -632,7 +632,7 @@ def claim_next_task(conn: sqlite3.Connection, device_id: str) -> dict | None:
 
 
 # 대기열 삭제에서 실제로 없애는 상태 / 취소로 처리하는 상태
-DELETABLE_STATUSES = ("pending", "assigned")
+DELETABLE_STATUSES = ("pending", "assigned", "done", "failed", "skipped")
 ACTIVE_STATUSES = ("pending", "assigned", "running")
 
 
@@ -699,15 +699,24 @@ def _delete_queue_tasks(
     conn: sqlite3.Connection,
     task_ids: list[int] | None = None,
     all_pending: bool = False,
+    all_tasks: bool = False,
     run_id: int | None = None,
 ) -> dict:
     """대기열에서 작업을 지운다.
 
-    - pending(대기)·assigned(배정) 는 tasks 행을 실제로 삭제한다.
+    - pending/assigned/done/failed/skipped 는 tasks 행을 실제로 삭제해 목록에서도 지운다.
     - running(발신 중) 은 폰이 이미 걸고 있어 되돌릴 수 없으므로 취소(skipped)로 표시한다.
-    - done/failed/skipped 는 기록이므로 건드리지 않고 protected_ids 로 알려 준다.
     """
-    if all_pending:
+    if all_tasks:
+        clauses: list[str] = []
+        values: list = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            values.append(run_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = conn.execute(f"SELECT id, run_id, status FROM tasks{where}", values).fetchall()
+        requested: list[int] = []
+    elif all_pending:
         clauses = ["status IN ('pending','assigned','running')"]
         values: list = []
         if run_id is not None:
@@ -729,7 +738,7 @@ def _delete_queue_tasks(
     found_ids = {row["id"] for row in rows}
     removed = [row["id"] for row in rows if row["status"] in DELETABLE_STATUSES]
     canceled = [row["id"] for row in rows if row["status"] == "running"]
-    kept = [row["id"] for row in rows if row["status"] not in ACTIVE_STATUSES]
+    kept: list[int] = []
     missing = [task_id for task_id in requested if task_id not in found_ids]
 
     if not removed and not canceled:
@@ -737,10 +746,11 @@ def _delete_queue_tasks(
             raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
         raise HTTPException(
             status_code=409,
-            detail="대기·배정 중인 작업만 삭제할 수 있습니다. (완료·취소된 작업은 기록으로 남습니다)",
+            detail="삭제할 작업이 없습니다.",
         )
 
-    run_ids = {row["run_id"] for row in rows if row["status"] in ACTIVE_STATUSES}
+    affected = set(removed) | set(canceled)
+    run_ids = {row["run_id"] for row in rows if row["id"] in affected}
     finished = iso(now())
     with db.transaction(conn):
         if removed:
@@ -756,7 +766,7 @@ def _delete_queue_tasks(
                 [finished] + canceled,
             )
         runs = _recount_runs_after_delete(conn, run_ids)
-        label = "전체" if all_pending else "선택"
+        label = "전체" if (all_tasks or all_pending) else "선택"
         detail = []
         if removed:
             detail.append(f"{len(removed)}건 삭제")
@@ -786,11 +796,12 @@ def delete_task(task_id: int, conn: sqlite3.Connection = Depends(get_conn)):
 
 @api.post("/tasks/bulk-delete")
 def bulk_delete_tasks(payload: TaskBulkDelete, conn: sqlite3.Connection = Depends(get_conn)):
-    """대기열 부분 삭제(task_ids) / 전체 삭제(all_pending)."""
+    """대기열 부분 삭제(task_ids) / 전체 삭제(all_pending 또는 all_tasks)."""
     return _delete_queue_tasks(
         conn,
         task_ids=payload.task_ids,
         all_pending=payload.all_pending,
+        all_tasks=payload.all_tasks,
         run_id=payload.run_id,
     )
 

@@ -781,9 +781,8 @@ def test_delete_finished_task_is_rejected(client):
     )
 
     response = client.delete(f"/api/tasks/{task['id']}")
-    assert response.status_code == 409
-    kept = queue_tasks(client, schedule_id=schedule["id"])
-    assert len(kept) == 1 and kept[0]["status"] == "done"
+    assert response.status_code == 200
+    assert queue_tasks(client, schedule_id=schedule["id"]) == []
 
 
 def test_delete_running_task_marks_it_canceled(client):
@@ -898,11 +897,21 @@ def test_bulk_delete_reports_protected_and_missing(client):
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["deleted_count"] == 1
-    assert body["protected_ids"] == [first["id"]]
+    assert body["deleted_count"] == 2
     assert body["missing_ids"] == [98765]
-    kept = queue_tasks(client, schedule_id=schedule["id"])
-    assert len(kept) == 1 and kept[0]["status"] == "failed"
+    assert queue_tasks(client, schedule_id=schedule["id"]) == []
+
+
+def test_bulk_delete_all_tasks_clears_entire_list(client):
+    client.post("/api/devices", json={"device_id": "DEV-ALL"})
+    schedule, _ = pending_run(client, numbers=["010-8888-2001", "010-8888-2002"])
+    first = client.get("/api/tasks/poll", params={"device_id": "DEV-ALL"}).json()["task"]
+    client.post(f"/api/tasks/{first['id']}/result", json={"device_id": "DEV-ALL", "status": "done"})
+
+    response = client.post("/api/tasks/bulk-delete", json={"all_tasks": True})
+    assert response.status_code == 200, response.text
+    assert response.json()["deleted_count"] == 2
+    assert queue_tasks(client, schedule_id=schedule["id"]) == []
 
 
 def test_bulk_delete_requires_target(client):

@@ -124,10 +124,11 @@ class ScheduleUpdate(BaseModel):
 
 
 class TaskBulkDelete(BaseModel):
-    """대기열 부분 삭제(task_ids) / 전체 삭제(all_pending)."""
+    """대기열 부분 삭제(task_ids) / 전체 삭제(all_pending 또는 all_tasks)."""
 
     task_ids: list[int] = Field(default_factory=list, max_length=1000)
     all_pending: bool = False
+    all_tasks: bool = False
     # 특정 실행 묶음(run) 안에서만 지우고 싶을 때
     run_id: Optional[int] = Field(default=None, ge=1)
 
@@ -142,8 +143,8 @@ class TaskBulkDelete(BaseModel):
 
     @model_validator(mode="after")
     def _require_target(self):
-        if not self.all_pending and not self.task_ids:
-            raise ValueError("삭제할 작업(task_ids)을 지정하거나 all_pending=true 를 보내야 합니다.")
+        if not self.all_pending and not self.all_tasks and not self.task_ids:
+            raise ValueError("삭제할 작업(task_ids)을 지정하거나 all_pending=true 또는 all_tasks=true 를 보내야 합니다.")
         return self
 
 
