@@ -2,15 +2,29 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -2728,6 +2742,194 @@ def manual_tick(conn: sqlite3.Connection = Depends(get_conn)):
     return {"ok": True, **scheduler.tick(conn)}
 
 
+# --------------------------------------------------------------------------
+# 앱 APK 배포(자동 터치 등): /data/apks/{app_id}/latest.json + APK 파일
+#
+# · 조회(latest/download)는 인증 없이 공개한다 — 폰 앱이 업데이트를 확인하려면
+#   키 없이도 받아야 하고, APK 자체는 비밀 정보가 아니다.
+# · 업로드(upload)는 위 api 라우터에 붙여 SERVER_API_KEY 가 설정된 경우 그 키를 요구한다.
+# --------------------------------------------------------------------------
+APK_MEDIA_TYPE = "application/vnd.android.package-archive"
+APK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+APK_VERSION_PATTERN = re.compile(r"^[0-9A-Za-z._-]{1,32}$")
+
+apps = APIRouter(prefix="/api/apps")
+
+
+def _app_apk_dir(app_id: str) -> Path:
+    """앱 ID 를 검사하고 그 앱의 APK 폴더 경로를 돌려준다(경로 탈출 차단)."""
+    cleaned = (app_id or "").strip()
+    if not APK_ID_PATTERN.match(cleaned):
+        raise HTTPException(status_code=404, detail="앱 ID가 올바르지 않습니다.")
+    return Path(config.APK_DIR) / cleaned
+
+
+def _read_apk_latest(app_id: str) -> Optional[dict]:
+    meta_path = _app_apk_dir(app_id) / "latest.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _public_base_url(request: Optional[Request]) -> str:
+    configured = (getattr(config, "PUBLIC_BASE_URL", "") or "").rstrip("/")
+    if configured:
+        return configured
+    if request is None:
+        return ""
+    return str(request.base_url).rstrip("/")
+
+
+def _app_apk_meta(app_id: str, meta: dict, request: Optional[Request]) -> dict:
+    """latest.json 의 내부 정보를 앱이 쓰는 응답 형식으로 바꾼다."""
+    base = _public_base_url(request)
+    return {
+        "app_id": app_id,
+        "version_code": int(meta.get("version_code") or 0),
+        "version_name": str(meta.get("version_name") or ""),
+        "download_url": f"{base}/api/apps/{app_id}/download",
+        "sha256": str(meta.get("sha256") or ""),
+        "size_bytes": int(meta.get("size_bytes") or 0),
+        "release_notes": str(meta.get("release_notes") or ""),
+        "updated_at": str(meta.get("updated_at") or ""),
+        "file_name": str(meta.get("file_name") or ""),
+    }
+
+
+@apps.get("/{app_id}/latest")
+def app_apk_latest(app_id: str, request: Request):
+    """앱 업데이트 확인용 최신 버전 정보."""
+    meta = _read_apk_latest(app_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="등록된 APK가 없습니다.")
+    return _app_apk_meta(app_id.strip(), meta, request)
+
+
+@apps.get("/{app_id}/download")
+def app_apk_download(app_id: str):
+    """최신 APK 파일 스트리밍."""
+    meta = _read_apk_latest(app_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="등록된 APK가 없습니다.")
+    file_name = str(meta.get("file_name") or "")
+    if not file_name or "/" in file_name or "\\" in file_name or ".." in file_name:
+        raise HTTPException(status_code=404, detail="APK 파일 정보가 올바르지 않습니다.")
+    path = _app_apk_dir(app_id) / file_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="APK 파일이 서버에 없습니다.")
+    version_name = str(meta.get("version_name") or "latest").strip() or "latest"
+    return FileResponse(
+        path,
+        media_type=APK_MEDIA_TYPE,
+        filename=f"{app_id.strip()}-{version_name}.apk",
+        headers={
+            "Cache-Control": "no-store",
+            "X-APK-SHA256": str(meta.get("sha256") or ""),
+            "X-APK-Version-Code": str(meta.get("version_code") or ""),
+        },
+    )
+
+
+@api.post("/apps/{app_id}/upload")
+async def upload_app_apk(
+    request: Request,
+    app_id: str,
+    file: UploadFile = File(...),
+    version_code: int = Form(...),
+    version_name: str = Form(...),
+    release_notes: str = Form(""),
+    force: bool = Form(False),
+):
+    """새 버전 APK 를 올리고 latest.json 을 갱신한다(multipart)."""
+    target_dir = _app_apk_dir(app_id)
+    app_id = app_id.strip()
+    if version_code < 1:
+        raise HTTPException(status_code=400, detail="version_code 는 1 이상이어야 합니다.")
+    version_name = (version_name or "").strip()
+    if not APK_VERSION_PATTERN.match(version_name):
+        raise HTTPException(status_code=400, detail="version_name 이 올바르지 않습니다(영문·숫자·._- 32자 이내).")
+    upload_name = (file.filename or "").strip()
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    if not upload_name.lower().endswith(".apk") and content_type not in (APK_MEDIA_TYPE, "application/octet-stream", ""):
+        raise HTTPException(status_code=400, detail="APK 파일만 올릴 수 있습니다.")
+
+    current = _read_apk_latest(app_id)
+    if current and not force:
+        current_code = int(current.get("version_code") or 0)
+        if version_code < current_code:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"이미 더 높은 버전({current.get('version_name')}, code {current_code})이 있습니다. "
+                    "강제로 올리려면 force=true 로 보내세요."
+                ),
+            )
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.error("APK 폴더를 만들지 못했습니다: %s", exc)
+        raise HTTPException(status_code=500, detail="APK 저장 폴더를 만들지 못했습니다.")
+
+    file_name = f"{app_id}-{version_name}.apk"
+    dest = target_dir / file_name
+    part = target_dir / f"{file_name}.part"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with part.open("wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > config.MAX_APK_BYTES:
+                    raise ValueError("too large")
+                digest.update(chunk)
+                fh.write(chunk)
+        if size == 0:
+            raise ValueError("empty")
+        part.replace(dest)
+    except ValueError as exc:
+        part.unlink(missing_ok=True)
+        if str(exc) == "too large":
+            raise HTTPException(status_code=413, detail="APK 파일이 너무 큽니다.")
+        raise HTTPException(status_code=400, detail="빈 파일은 올릴 수 없습니다.")
+    except OSError as exc:
+        part.unlink(missing_ok=True)
+        logger.error("APK 저장 실패: %s", exc)
+        raise HTTPException(status_code=500, detail="APK 파일을 저장하지 못했습니다.")
+    finally:
+        await file.close()
+
+    meta = {
+        "app_id": app_id,
+        "version_code": version_code,
+        "version_name": version_name,
+        "file_name": file_name,
+        "sha256": digest.hexdigest(),
+        "size_bytes": size,
+        "release_notes": (release_notes or "").strip()[:2000],
+        "updated_at": now_iso(),
+    }
+    meta_path = target_dir / "latest.json"
+    tmp_meta = target_dir / "latest.json.part"
+    try:
+        tmp_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_meta.replace(meta_path)
+    except OSError as exc:
+        logger.error("latest.json 저장 실패: %s", exc)
+        raise HTTPException(status_code=500, detail="버전 정보를 저장하지 못했습니다.")
+
+    logger.info("APK 업로드: %s v%s (code %s, %s bytes)", app_id, version_name, version_code, size)
+    return {"ok": True, "app": _app_apk_meta(app_id, meta, request)}
+
+
+app.include_router(apps)
 app.include_router(api)
 
 if STATIC_DIR.exists():

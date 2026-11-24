@@ -35,6 +35,13 @@ DB_PATH = Path(os.getenv("DB_PATH") or (DATA_DIR / "autodialer.db"))
 # MMS 첨부(사진)를 잠시 보관하는 곳. 재전송·재시도 때 파일을 다시 읽는다.
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR") or (DATA_DIR / "media"))
 
+# 안드로이드 앱 APK 배포 폴더. 앱별 하위 폴더(app_id)에 latest.json + APK 를 둔다.
+APK_DIR = Path(os.getenv("APK_DIR") or (DATA_DIR / "apks"))
+# 앱이 돌려주는 download_url 에 쓸 공개 주소. 비어 있으면 요청 주소를 그대로 쓴다.
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+# 업로드 허용 APK 최대 크기(바이트)
+MAX_APK_BYTES = int(os.getenv("MAX_APK_BYTES", str(300 * 1024 * 1024)))
+
 TZ_NAME = os.getenv("APP_TZ", "Asia/Seoul")
 TZ = ZoneInfo(TZ_NAME)
 
@@ -55,6 +62,7 @@ TASK_TIMEOUT_SEC = int(os.getenv("TASK_TIMEOUT_SEC", "900"))
 
 # 앱이 서버에 묻는 기본 주기(초) - 앱이 자체 설정을 쓰면 그 값이 우선
 DEFAULT_POLL_INTERVAL_SEC = int(os.getenv("DEFAULT_POLL_INTERVAL_SEC", "5"))
+
 
 # 텔레그램 전송 재시도 최대 횟수
 TELEGRAM_MAX_ATTEMPTS = int(os.getenv("TELEGRAM_MAX_ATTEMPTS", "3"))

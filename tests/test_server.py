@@ -23,6 +23,7 @@ from app.timeutil import TZ, add_months, next_occurrence, parse_dt
 def isolate_db(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(config, "MEDIA_DIR", tmp_path / "media")
+    monkeypatch.setattr(config, "APK_DIR", tmp_path / "apks")
     monkeypatch.setattr(config, "SCHEDULER_ENABLED", False)
     monkeypatch.setattr(config, "API_KEY", "")
     db.init_db()
@@ -53,6 +54,12 @@ def make_schedule(client: TestClient, **overrides):
     response = client.post("/api/schedules", json=payload)
     assert response.status_code == 200, response.text
     return response.json()["schedule"]
+
+
+def _future_start(days: int = 1, hour: int = 9) -> str:
+    """오늘 기준 며칠 뒤 시각(테스트가 실행 날짜에 흔들리지 않도록)."""
+    base = datetime.now(TZ) + timedelta(days=days)
+    return base.replace(hour=hour, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
 
 
 # --------------------------------------------------------------------------
@@ -865,17 +872,20 @@ def test_bulk_delete_executed_only_keeps_unexecuted_and_recurring(client):
         conn = _conn()
         conn.execute("UPDATE schedules SET status = 'finished', next_run_at = NULL WHERE id = ?", (finished["id"],))
         conn.close()
-    waiting = make_schedule(client, name="대기", numbers=["010-6666-0002"], repeat_count=1)
+    waiting = make_schedule(
+        client, name="대기", numbers=["010-6666-0002"], repeat_count=1, start_at=_future_start(1)
+    )
     recurring = make_schedule(
         client,
         name="매일 반복",
         numbers=["010-6666-0003"],
         repeat_count=1,
         recurrence="daily",
-        start_at="2026-11-21T09:00",
+        start_at=_future_start(2),
     )
     client.post("/api/scheduler/tick")
-    assert len(client.get("/api/runs").json()["runs"]) >= 2
+    # 아직 실행 전인 스케줄은 실행 기록을 만들지 않는다(끝난 1회만 기록).
+    assert len(client.get("/api/runs").json()["runs"]) >= 1
 
     response = client.post("/api/schedules/delete", json={"executed_only": True})
     assert response.status_code == 200
@@ -885,8 +895,10 @@ def test_bulk_delete_executed_only_keeps_unexecuted_and_recurring(client):
 
     remaining = {s["id"] for s in client.get("/api/schedules").json()["schedules"]}
     assert remaining == {waiting["id"], recurring["id"]}
-    # 남은 스케줄의 실행 기록은 그대로 유지된다.
-    assert {run["schedule_id"] for run in client.get("/api/runs").json()["runs"]} >= {recurring["id"]}
+    # 남은 스케줄은 계속 실행할 수 있고, 그 실행 기록도 정상으로 남는다.
+    client.post(f"/api/schedules/{recurring['id']}/run-now")
+    run_schedule_ids = {run["schedule_id"] for run in client.get("/api/runs").json()["runs"]}
+    assert run_schedule_ids == {recurring["id"]}
 
 
 def test_bulk_delete_executed_only_without_history_returns_404(client):
@@ -1648,10 +1660,12 @@ def test_update_schedule_only_changes_given_fields(client):
 
 
 def test_update_schedule_recomputes_next_run_on_recurrence(client):
-    schedule = make_schedule(client, start_at="2026-11-23T09:00", recurrence="once")
+    start_text = _future_start(2)
+    expected = parse_dt(start_text)
+    schedule = make_schedule(client, start_at=start_text, recurrence="once")
     updated = client.patch(f"/api/schedules/{schedule['id']}", json={"recurrence": "daily"}).json()["schedule"]
     assert updated["recurrence"] == "daily"
-    assert parse_dt(updated["next_run_at"]) == datetime(2026, 11, 23, 9, 0, tzinfo=TZ)
+    assert parse_dt(updated["next_run_at"]) == expected
 
 
 def test_update_start_at_reactivates_finished_schedule(client):
@@ -3948,3 +3962,120 @@ def test_global_stats_separates_sent_calls_and_sms(client):
     assert stats["sent"]["call_today"] == 1
     # 수신 문자 수와 발신 문자 수는 따로 센다.
     assert stats["sms"]["today"] == 0
+
+
+# --------------------------------------------------------------------------
+# 앱 APK 배포(자동 터치 업데이트)
+# --------------------------------------------------------------------------
+APK_BYTES = b"PK\x03\x04" + bytes(range(256)) * 40
+
+
+def test_app_apk_upload_and_latest(client):
+    resp = client.post(
+        "/api/apps/auto-touch/upload",
+        files={"file": ("auto-touch.apk", APK_BYTES, "application/vnd.android.package-archive")},
+        data={"version_code": "1", "version_name": "1.0.0", "release_notes": "첫 배포"},
+    )
+    assert resp.status_code == 200, resp.text
+    uploaded = resp.json()["app"]
+    assert uploaded["app_id"] == "auto-touch"
+    assert uploaded["version_code"] == 1
+    assert uploaded["version_name"] == "1.0.0"
+    assert uploaded["size_bytes"] == len(APK_BYTES)
+    assert len(uploaded["sha256"]) == 64
+
+    latest = client.get("/api/apps/auto-touch/latest")
+    assert latest.status_code == 200
+    body = latest.json()
+    assert body["version_name"] == "1.0.0"
+    assert body["version_code"] == 1
+    assert body["release_notes"] == "첫 배포"
+    assert body["sha256"] == uploaded["sha256"]
+    assert body["size_bytes"] == len(APK_BYTES)
+    assert body["download_url"].endswith("/api/apps/auto-touch/download")
+    assert body["updated_at"]
+
+
+def test_app_apk_download_streams_file(client):
+    client.post(
+        "/api/apps/auto-touch/upload",
+        files={"file": ("auto-touch.apk", APK_BYTES, "application/vnd.android.package-archive")},
+        data={"version_code": "1", "version_name": "1.0.0"},
+    )
+    resp = client.get("/api/apps/auto-touch/download")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/vnd.android.package-archive"
+    assert resp.content == APK_BYTES
+    assert resp.headers["x-apk-version-code"] == "1"
+    assert len(resp.headers["x-apk-sha256"]) == 64
+
+
+def test_app_apk_latest_missing_returns_404(client):
+    assert client.get("/api/apps/auto-touch/latest").status_code == 404
+    assert client.get("/api/apps/auto-touch/download").status_code == 404
+    assert client.get("/api/apps/no-such-app/latest").status_code == 404
+
+
+def test_app_apk_rejects_non_apk_file(client):
+    resp = client.post(
+        "/api/apps/auto-touch/upload",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+        data={"version_code": "1", "version_name": "1.0.0"},
+    )
+    assert resp.status_code == 400
+
+
+def test_app_apk_rejects_older_version_without_force(client):
+    files = {"file": ("auto-touch.apk", APK_BYTES, "application/vnd.android.package-archive")}
+    assert client.post(
+        "/api/apps/auto-touch/upload",
+        files=files,
+        data={"version_code": "3", "version_name": "1.2.0"},
+    ).status_code == 200
+    older = client.post(
+        "/api/apps/auto-touch/upload",
+        files=files,
+        data={"version_code": "2", "version_name": "1.1.0"},
+    )
+    assert older.status_code == 409
+    forced = client.post(
+        "/api/apps/auto-touch/upload",
+        files=files,
+        data={"version_code": "2", "version_name": "1.1.0", "force": "true"},
+    )
+    assert forced.status_code == 200
+    assert client.get("/api/apps/auto-touch/latest").json()["version_name"] == "1.1.0"
+
+
+def test_app_apk_upload_requires_api_key_but_reads_are_public(client, monkeypatch):
+    client.post(
+        "/api/apps/auto-touch/upload",
+        files={"file": ("auto-touch.apk", APK_BYTES, "application/vnd.android.package-archive")},
+        data={"version_code": "1", "version_name": "1.0.0"},
+    )
+    monkeypatch.setattr(config, "API_KEY", "secret-key")
+    blocked = client.post(
+        "/api/apps/auto-touch/upload",
+        files={"file": ("auto-touch.apk", APK_BYTES + b"x", "application/vnd.android.package-archive")},
+        data={"version_code": "2", "version_name": "1.1.0"},
+    )
+    assert blocked.status_code == 401
+    allowed = client.post(
+        "/api/apps/auto-touch/upload",
+        files={"file": ("auto-touch.apk", APK_BYTES + b"x", "application/vnd.android.package-archive")},
+        data={"version_code": "2", "version_name": "1.1.0"},
+        headers={"X-API-Key": "secret-key"},
+    )
+    assert allowed.status_code == 200
+    # 폰 앱이 키 없이 업데이트를 확인할 수 있어야 한다.
+    assert client.get("/api/apps/auto-touch/latest").status_code == 200
+    assert client.get("/api/apps/auto-touch/download").status_code == 200
+
+
+def test_app_apk_invalid_app_id_is_rejected(client):
+    resp = client.post(
+        "/api/apps/..%2Fescape/upload",
+        files={"file": ("a.apk", APK_BYTES, "application/vnd.android.package-archive")},
+        data={"version_code": "1", "version_name": "1.0.0"},
+    )
+    assert resp.status_code in (400, 404)
