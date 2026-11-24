@@ -3055,12 +3055,19 @@ def app_macros_save(app_id: str, payload: MacroBackupIn):
             status_code=413,
             detail=f"한 번에 저장할 수 있는 동작은 {macro_store.MAX_STEPS}개까지입니다.",
         )
+    folders = payload.folders or []
+    if len(folders) > macro_store.MAX_FOLDERS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"한 번에 저장할 수 있는 폴더는 {macro_store.MAX_FOLDERS}개까지입니다.",
+        )
     try:
         meta, created = macro_store.save_backup(
             cleaned,
             payload.name,
             payload.device_name,
             [m for m in macros if isinstance(m, dict)],
+            [f for f in folders if isinstance(f, dict)],
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

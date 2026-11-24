@@ -36,6 +36,7 @@ MAX_NAME_LEN = 60
 MAX_DEVICE_NAME_LEN = 60
 MAX_MACROS = 200
 MAX_STEPS = 5000
+MAX_FOLDERS = 200
 
 _lock = threading.Lock()
 
@@ -105,13 +106,15 @@ def list_backups(app_id: str) -> list[dict]:
 
 
 def get_backup(app_id: str, backup_id: str) -> Optional[dict]:
-    """백업 하나의 전체 내용(매크로 본문 포함)."""
+    """백업 하나의 전체 내용(매크로·폴더 본문 포함)."""
     with _lock:
         backups = _read(app_id)
     for item in backups:
         if item.get("id") == backup_id:
             payload = _meta(item)
             payload["macros"] = item.get("macros") or []
+            # v1.0.8 이전 백업에는 폴더가 없다 — 빈 목록으로 돌려준다.
+            payload["folders"] = item.get("folders") or []
             return payload
     return None
 
@@ -131,9 +134,11 @@ def save_backup(
     name: str,
     device_name: Optional[str],
     macros: list[dict],
+    folders: Optional[list[dict]] = None,
 ) -> tuple[dict, bool]:
     """백업을 저장한다. 같은 이름이 있으면 그 백업을 덮어쓴다.
 
+    @param folders '자동 터치' 앱의 매크로 폴더 목록(v1.0.8+). 예전 앱은 보내지 않는다(빈 목록).
     @return (백업 요약, 새로 만들었는지 여부)
     """
     cleaned_name = (name or "").strip()[:MAX_NAME_LEN]
@@ -165,5 +170,6 @@ def save_backup(
         existing["step_count"] = step_count
         existing["updated_at"] = stamp
         existing["macros"] = macros
+        existing["folders"] = folders or []
         _write(app_id, backups)
         return _meta(existing), created

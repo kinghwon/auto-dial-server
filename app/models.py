@@ -527,9 +527,11 @@ class RemoteSettings(BaseModel):
 class MacroBackupIn(BaseModel):
     """'자동 터치' 매크로 묶음 백업 저장 요청.
 
-    `macros` 는 앱이 저장한 매크로 JSON 목록을 그대로 받는다(서버는 구조를 해석하지 않는다).
+    `macros`·`folders` 는 앱이 저장한 JSON 목록을 그대로 받는다(서버는 구조를 해석하지 않는다).
+    `folders` 는 v1.0.8 부터 쓰는 매크로 폴더 목록이라, 예전 앱이 보내면 빈 목록이다(하위 호환).
     """
 
     name: str = Field(default="", max_length=60)
     device_name: Optional[str] = Field(default=None, max_length=60)
     macros: list[dict] = Field(default_factory=list)
+    folders: list[dict] = Field(default_factory=list)

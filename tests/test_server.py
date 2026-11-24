@@ -4242,6 +4242,49 @@ def test_macro_backup_save_list_detail_delete(client):
     assert client.delete(f"/api/apps/auto-touch/macros/{backup_id}").status_code == 404
 
 
+def _folder(name="출근", folder_id="f-1"):
+    return {"id": folder_id, "name": name, "color": -531585, "x": 100, "y": 300, "size": 64}
+
+
+def test_macro_backup_keeps_folders_and_old_payloads_still_work(client):
+    """v1.0.8 매크로 폴더는 그대로 보관·반환하고, 예전 앱(폴더 없음) 백업도 깨지지 않는다."""
+    folder_macro = dict(_macro("로그인", 1), folderId="f-1")
+    saved = client.post(
+        "/api/apps/auto-touch/macros",
+        json={
+            "name": "폴더백업",
+            "device_name": "SM-S916N",
+            "folders": [_folder("출근", "f-1"), _folder("집", "f-2")],
+            "macros": [folder_macro, _macro("단독", 1, "m-2")],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    backup_id = saved.json()["backup"]["id"]
+    detail = client.get(f"/api/apps/auto-touch/macros/{backup_id}").json()["backup"]
+    assert [f["name"] for f in detail["folders"]] == ["출근", "집"]
+    assert detail["folders"][0]["id"] == "f-1"
+    assert detail["macros"][0]["folderId"] == "f-1"
+    assert "folderId" not in detail["macros"][1]
+
+    # 예전 앱처럼 folders 없이 저장한 백업도 그대로 동작하고, 불러올 때 빈 폴더 목록을 준다.
+    old_id = client.post(
+        "/api/apps/auto-touch/macros",
+        json={"name": "옛백업", "macros": [_macro("A", 1)]},
+    ).json()["backup"]["id"]
+    old_detail = client.get(f"/api/apps/auto-touch/macros/{old_id}").json()["backup"]
+    assert old_detail["folders"] == []
+    assert old_detail["macros"][0]["name"] == "A"
+
+
+def test_macro_backup_rejects_too_many_folders(client):
+    too_many = [_folder(f"F{i}", f"f-{i}") for i in range(201)]
+    resp = client.post(
+        "/api/apps/auto-touch/macros",
+        json={"name": "폴더많음", "folders": too_many, "macros": [_macro("A", 1)]},
+    )
+    assert resp.status_code == 413
+
+
 def test_macro_backup_same_name_overwrites_in_place(client):
     first = client.post(
         "/api/apps/auto-touch/macros",
