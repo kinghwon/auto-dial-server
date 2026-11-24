@@ -26,10 +26,10 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, db, macro_store, scheduler
+from . import apps_page, config, db, macro_store, scheduler
 from .db import json_list
 from .models import (
     ArchiveRestore,
@@ -525,6 +525,16 @@ def index():
     if not index_file.exists():
         return JSONResponse({"detail": "static/index.html 이 없습니다."}, status_code=500)
     return FileResponse(index_file)
+
+
+@app.get("/apps", include_in_schema=False)
+def apps_download_page(request: Request):
+    """폰 브라우저용 앱 다운로드 페이지(앱별 최신 APK 카드)."""
+    items = _list_app_apks(request)
+    return HTMLResponse(
+        apps_page.render_apps_page(items),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/health", include_in_schema=False)
@@ -2813,6 +2823,87 @@ def app_apk_latest(app_id: str, request: Request):
     if meta is None:
         raise HTTPException(status_code=404, detail="등록된 APK가 없습니다.")
     return _app_apk_meta(app_id.strip(), meta, request)
+
+
+# --------------------------------------------------------------------------
+# 앱별 최신 APK 목록: 폰 브라우저(/apps)와 대시보드 '앱 다운로드' 탭이 함께 쓴다
+# --------------------------------------------------------------------------
+# 앱 표시 이름·설명(모르는 앱은 app_id 를 그대로 보여 준다)
+APP_DISPLAY_NAMES = {
+    "auto-dialer": "자동 발신",
+    "auto-touch": "자동 터치",
+}
+APP_DESCRIPTIONS = {
+    "auto-dialer": "서버가 예약한 전화·문자를 이 폰에서 자동으로 실행합니다.",
+    "auto-touch": "화면 터치를 기록해 반복 실행하는 매크로 앱입니다.",
+}
+# 목록에서 먼저 보여 줄 순서(그 밖의 앱은 app_id 알파벳순으로 뒤에 붙는다)
+APP_LIST_ORDER = ("auto-dialer", "auto-touch")
+
+
+def _app_apk_available(folder: Path, meta: dict) -> bool:
+    """latest.json 이 가리키는 APK 파일이 실제로 있는지(경로 탈출 포함 검사)."""
+    file_name = str(meta.get("file_name") or "").strip()
+    if not file_name or "/" in file_name or "\\" in file_name or ".." in file_name:
+        return False
+    try:
+        return (folder / file_name).is_file()
+    except OSError:
+        return False
+
+
+def _app_sort_key(app_id: str) -> tuple:
+    if app_id in APP_LIST_ORDER:
+        return (0, APP_LIST_ORDER.index(app_id), app_id)
+    return (1, 0, app_id)
+
+
+def _list_app_apks(request: Optional[Request]) -> list[dict]:
+    """서버에 APK 를 올린 앱들의 최신 버전 정보를 돌려준다."""
+    root = Path(config.APK_DIR)
+    items: list[dict] = []
+    try:
+        folders = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return items
+    base = _public_base_url(request)
+    for folder in folders:
+        app_id = folder.name
+        if not APK_ID_PATTERN.match(app_id):
+            continue
+        meta = _read_apk_latest(app_id)
+        if not meta:
+            continue
+        updated_at = str(meta.get("updated_at") or "")
+        size_bytes = int(meta.get("size_bytes") or 0)
+        items.append(
+            {
+                "app_id": app_id,
+                "display_name": APP_DISPLAY_NAMES.get(app_id, app_id),
+                "description": APP_DESCRIPTIONS.get(app_id, ""),
+                "version_code": int(meta.get("version_code") or 0),
+                "version_name": str(meta.get("version_name") or ""),
+                "file_name": str(meta.get("file_name") or ""),
+                "sha256": str(meta.get("sha256") or ""),
+                "size_bytes": size_bytes,
+                "size_text": apps_page.format_size(size_bytes),
+                "updated_at": updated_at,
+                "updated_at_text": local_str(updated_at, "%Y-%m-%d %H:%M") if updated_at else "",
+                "release_notes": str(meta.get("release_notes") or ""),
+                "download_url": f"{base}/api/apps/{app_id}/download",
+                "available": _app_apk_available(folder, meta),
+            }
+        )
+    items.sort(key=lambda item: _app_sort_key(item["app_id"]))
+    return items
+
+
+@apps.get("")
+@apps.get("/")
+def app_apk_list(request: Request):
+    """서버에 올린 앱별 최신 APK 목록(폰 브라우저·대시보드 공용)."""
+    items = _list_app_apks(request)
+    return {"ok": True, "count": len(items), "apps": items}
 
 
 @apps.get("/{app_id}/download")

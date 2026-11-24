@@ -4073,6 +4073,105 @@ def test_app_apk_upload_requires_api_key_but_reads_are_public(client, monkeypatc
     assert client.get("/api/apps/auto-touch/download").status_code == 200
 
 
+def _upload_app(client, app_id, version_code, version_name, body=APK_BYTES, notes=""):
+    return client.post(
+        f"/api/apps/{app_id}/upload",
+        files={"file": (f"{app_id}.apk", body, "application/vnd.android.package-archive")},
+        data={"version_code": str(version_code), "version_name": version_name, "release_notes": notes},
+    )
+
+
+def test_app_apk_list_empty(client):
+    resp = client.get("/api/apps")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["count"] == 0
+    assert body["apps"] == []
+
+
+def test_app_apk_list_shows_all_uploaded_apps(client):
+    assert _upload_app(client, "auto-touch", 8, "1.0.7", notes="UI 최적화").status_code == 200
+    assert _upload_app(client, "auto-dialer", 14, "1.3.9", notes="서버 자동 업데이트").status_code == 200
+
+    body = client.get("/api/apps").json()
+    assert body["count"] == 2
+    # 자동 발신이 먼저, 자동 터치가 다음(정해진 표시 순서)
+    assert [app["app_id"] for app in body["apps"]] == ["auto-dialer", "auto-touch"]
+
+    dialer = body["apps"][0]
+    assert dialer["display_name"] == "자동 발신"
+    assert dialer["version_code"] == 14
+    assert dialer["version_name"] == "1.3.9"
+    assert dialer["size_bytes"] == len(APK_BYTES)
+    assert dialer["size_text"].endswith("KB") or dialer["size_text"].endswith("MB")
+    assert dialer["updated_at"]
+    assert dialer["updated_at_text"]
+    assert dialer["release_notes"] == "서버 자동 업데이트"
+    assert dialer["available"] is True
+    assert dialer["download_url"].endswith("/api/apps/auto-dialer/download")
+    assert len(dialer["sha256"]) == 64
+    assert body["apps"][1]["version_name"] == "1.0.7"
+
+
+def test_app_apk_list_marks_missing_file_unavailable(client):
+    assert _upload_app(client, "auto-dialer", 14, "1.3.9").status_code == 200
+    apk_dir = Path(config.APK_DIR) / "auto-dialer"
+    for path in apk_dir.glob("*.apk"):
+        path.unlink()
+    app = client.get("/api/apps").json()["apps"][0]
+    assert app["available"] is False
+    # 파일이 없으면 다운로드는 404
+    assert client.get("/api/apps/auto-dialer/download").status_code == 404
+
+
+def test_app_apk_list_uses_unknown_app_id_as_display_name(client):
+    assert _upload_app(client, "my-tool", 1, "0.1.0").status_code == 200
+    app = client.get("/api/apps").json()["apps"][0]
+    assert app["app_id"] == "my-tool"
+    assert app["display_name"] == "my-tool"
+
+
+def test_app_apk_list_is_public_without_api_key(client, monkeypatch):
+    assert _upload_app(client, "auto-touch", 8, "1.0.7").status_code == 200
+    monkeypatch.setattr(config, "API_KEY", "secret-key")
+    assert client.get("/api/apps").status_code == 200
+    assert client.get("/apps").status_code == 200
+
+
+def test_apps_page_html_lists_apps_with_download_links(client):
+    assert _upload_app(client, "auto-touch", 8, "1.0.7", notes="버튼 색상 정리").status_code == 200
+    assert _upload_app(client, "auto-dialer", 14, "1.3.9", notes="서버 자동 업데이트").status_code == 200
+
+    resp = client.get("/apps")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    html = resp.text
+    assert "앱 다운로드" in html
+    assert "자동 발신" in html and "자동 터치" in html
+    assert "v1.3.9" in html and "v1.0.7" in html
+    assert "서버 자동 업데이트" in html
+    assert "/api/apps/auto-dialer/download" in html
+    assert "/api/apps/auto-touch/download" in html
+    assert "⬇️ APK 다운로드" in html
+    # 자동 발신 카드가 먼저 나온다
+    assert html.index("자동 발신") < html.index("자동 터치")
+
+
+def test_apps_page_html_empty_state(client):
+    resp = client.get("/apps")
+    assert resp.status_code == 200
+    assert "아직 서버에 올린 앱이 없습니다" in resp.text
+
+
+def test_apps_page_html_escapes_release_notes(client):
+    evil = "<script>alert(1)</script>"
+    assert _upload_app(client, "auto-dialer", 14, "1.3.9", notes=evil).status_code == 200
+    html = client.get("/apps").text
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+
+
 def test_app_apk_invalid_app_id_is_rejected(client):
     resp = client.post(
         "/api/apps/..%2Fescape/upload",
