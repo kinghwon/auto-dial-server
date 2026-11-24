@@ -39,6 +39,10 @@ MEDIA_DIR = Path(os.getenv("MEDIA_DIR") or (DATA_DIR / "media"))
 APK_DIR = Path(os.getenv("APK_DIR") or (DATA_DIR / "apks"))
 # 앱이 돌려주는 download_url 에 쓸 공개 주소. 비어 있으면 요청 주소를 그대로 쓴다.
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+# '자동 터치' 같은 앱의 매크로 백업(JSON) 보관 폴더. 자동 발신 DB 와는 별개다.
+MACRO_BACKUP_DIR = Path(os.getenv("MACRO_BACKUP_DIR") or (DATA_DIR / "macro_backups"))
+# 앱 하나에 저장할 수 있는 매크로 백업 개수 상한
+MAX_MACRO_BACKUPS = int(os.getenv("MAX_MACRO_BACKUPS", "200"))
 # 업로드 허용 APK 최대 크기(바이트)
 MAX_APK_BYTES = int(os.getenv("MAX_APK_BYTES", str(300 * 1024 * 1024)))
 

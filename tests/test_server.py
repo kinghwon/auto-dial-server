@@ -24,6 +24,7 @@ def isolate_db(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(config, "MEDIA_DIR", tmp_path / "media")
     monkeypatch.setattr(config, "APK_DIR", tmp_path / "apks")
+    monkeypatch.setattr(config, "MACRO_BACKUP_DIR", tmp_path / "macro_backups")
     monkeypatch.setattr(config, "SCHEDULER_ENABLED", False)
     monkeypatch.setattr(config, "API_KEY", "")
     db.init_db()
@@ -4079,3 +4080,131 @@ def test_app_apk_invalid_app_id_is_rejected(client):
         data={"version_code": "1", "version_name": "1.0.0"},
     )
     assert resp.status_code in (400, 404)
+
+
+# --------------------------------------------------------------------------
+# 자동 터치 매크로 백업 API (/api/apps/auto-touch/macros)
+# --------------------------------------------------------------------------
+def _macro(name="로그인", steps=2, macro_id="m-1"):
+    actions = [
+        {"x": 100 + i, "y": 200 + i, "endX": 100 + i, "endY": 200 + i, "drag": False,
+         "actionType": "TAP", "delay": 500, "duration": 40}
+        for i in range(steps)
+    ]
+    return {
+        "id": macro_id,
+        "name": name,
+        "color": -529099,
+        "size": 64,
+        "repeat": 2,
+        "x": 100,
+        "y": 200,
+        "actions": actions,
+    }
+
+
+def test_macro_backup_save_list_detail_delete(client):
+    payload = {
+        "name": "출근용",
+        "device_name": "SM-S916N",
+        "macros": [_macro("로그인", 2), _macro("출석", 3, "m-2")],
+    }
+    saved = client.post("/api/apps/auto-touch/macros", json=payload)
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    assert body["ok"] is True
+    assert body["created"] is True
+    backup = body["backup"]
+    assert backup["name"] == "출근용"
+    assert backup["device_name"] == "SM-S916N"
+    assert backup["macro_count"] == 2
+    assert backup["step_count"] == 5
+    assert backup["updated_at"]
+    backup_id = backup["id"]
+
+    listed = client.get("/api/apps/auto-touch/macros")
+    assert listed.status_code == 200
+    listing = listed.json()
+    assert listing["count"] == 1
+    assert listing["backups"][0]["id"] == backup_id
+    assert "macros" not in listing["backups"][0]
+
+    detail = client.get(f"/api/apps/auto-touch/macros/{backup_id}")
+    assert detail.status_code == 200
+    macros = detail.json()["backup"]["macros"]
+    assert [m["name"] for m in macros] == ["로그인", "출석"]
+    assert macros[0]["actions"][0]["x"] == 100
+
+    deleted = client.delete(f"/api/apps/auto-touch/macros/{backup_id}")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] == backup_id
+    assert client.get("/api/apps/auto-touch/macros").json()["count"] == 0
+    assert client.get(f"/api/apps/auto-touch/macros/{backup_id}").status_code == 404
+    assert client.delete(f"/api/apps/auto-touch/macros/{backup_id}").status_code == 404
+
+
+def test_macro_backup_same_name_overwrites_in_place(client):
+    first = client.post(
+        "/api/apps/auto-touch/macros",
+        json={"name": "집", "macros": [_macro("A", 1)]},
+    ).json()["backup"]
+    second = client.post(
+        "/api/apps/auto-touch/macros",
+        json={"name": "집", "macros": [_macro("A", 1), _macro("B", 4, "m-2")]},
+    ).json()
+    assert second["created"] is False
+    assert second["backup"]["id"] == first["id"]
+    assert second["backup"]["macro_count"] == 2
+    assert second["backup"]["step_count"] == 5
+    assert client.get("/api/apps/auto-touch/macros").json()["count"] == 1
+
+
+def test_macro_backup_blank_name_gets_default(client):
+    body = client.post(
+        "/api/apps/auto-touch/macros",
+        json={"name": "   ", "macros": [_macro("A", 1)]},
+    ).json()
+    assert body["backup"]["name"].startswith("백업 ")
+
+
+def test_macro_backup_list_is_newest_first(client):
+    for name in ("첫번째", "두번째", "세번째"):
+        client.post("/api/apps/auto-touch/macros", json={"name": name, "macros": [_macro("A", 1)]})
+    names = [item["name"] for item in client.get("/api/apps/auto-touch/macros").json()["backups"]]
+    assert names[0] == "세번째"
+    assert set(names) == {"첫번째", "두번째", "세번째"}
+
+
+def test_macro_backup_does_not_touch_auto_dialer_data(client):
+    schedule = make_schedule(client)
+    client.post("/api/apps/auto-touch/macros", json={"name": "백업", "macros": [_macro("A", 2)]})
+    schedules = client.get("/api/schedules").json()["schedules"]
+    assert [item["id"] for item in schedules] == [schedule["id"]]
+    assert client.get("/api/health").json()["ok"] is True
+
+
+def test_macro_backup_rejects_bad_app_id_and_backup_id(client):
+    assert client.get("/api/apps/..%2Fescape/macros").status_code in (404, 400)
+    client.post("/api/apps/auto-touch/macros", json={"name": "백업", "macros": [_macro("A", 1)]})
+    assert client.get("/api/apps/auto-touch/macros/..%2F..%2Fetc").status_code == 404
+    assert client.get("/api/apps/auto-touch/macros/nope-nope-nope").status_code == 404
+
+
+def test_macro_backup_rejects_too_many_macros(client):
+    too_many = [_macro(f"M{i}", 0, f"m-{i}") for i in range(201)]
+    resp = client.post("/api/apps/auto-touch/macros", json={"name": "큰백업", "macros": too_many})
+    assert resp.status_code == 413
+    assert client.get("/api/apps/auto-touch/macros").json()["count"] == 0
+
+
+def test_macro_backup_keeps_macros_after_server_reload(client, tmp_path):
+    """파일로 보관되므로 서버를 다시 읽어도 남아 있어야 한다(메모리 의존 금지)."""
+    backup_id = client.post(
+        "/api/apps/auto-touch/macros",
+        json={"name": "영구", "macros": [_macro("A", 2)]},
+    ).json()["backup"]["id"]
+    stored = tmp_path / "macro_backups" / "auto-touch" / "backups.json"
+    assert stored.is_file()
+    reloaded = json.loads(stored.read_text(encoding="utf-8"))
+    assert reloaded["backups"][0]["id"] == backup_id
+    assert reloaded["backups"][0]["macros"][0]["name"] == "A"

@@ -522,3 +522,14 @@ class RemoteSettings(BaseModel):
     call_recording_enabled: Optional[bool] = None  # 통화 녹음(기본 끔)
     call_mute_volume: Optional[bool] = None  # 통화 볼륨 0(기본 켬)
     call_mute_mic: Optional[bool] = None  # 내 소리 차단 = 마이크 음소거(기본 켬)
+
+
+class MacroBackupIn(BaseModel):
+    """'자동 터치' 매크로 묶음 백업 저장 요청.
+
+    `macros` 는 앱이 저장한 매크로 JSON 목록을 그대로 받는다(서버는 구조를 해석하지 않는다).
+    """
+
+    name: str = Field(default="", max_length=60)
+    device_name: Optional[str] = Field(default=None, max_length=60)
+    macros: list[dict] = Field(default_factory=list)

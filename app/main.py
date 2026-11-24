@@ -29,13 +29,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, db, scheduler
+from . import config, db, macro_store, scheduler
 from .db import json_list
 from .models import (
     ArchiveRestore,
     DeviceRegister,
     DeviceUpdate,
     Heartbeat,
+    MacroBackupIn,
     RemoteSettings,
     RunBulkDelete,
     ScheduleBulkDelete,
@@ -2756,12 +2757,17 @@ APK_VERSION_PATTERN = re.compile(r"^[0-9A-Za-z._-]{1,32}$")
 apps = APIRouter(prefix="/api/apps")
 
 
-def _app_apk_dir(app_id: str) -> Path:
-    """앱 ID 를 검사하고 그 앱의 APK 폴더 경로를 돌려준다(경로 탈출 차단)."""
+def _checked_app_id(app_id: str) -> str:
+    """앱 ID 를 검사해 돌려준다(경로 탈출·잘못된 값 차단)."""
     cleaned = (app_id or "").strip()
     if not APK_ID_PATTERN.match(cleaned):
         raise HTTPException(status_code=404, detail="앱 ID가 올바르지 않습니다.")
-    return Path(config.APK_DIR) / cleaned
+    return cleaned
+
+
+def _app_apk_dir(app_id: str) -> Path:
+    """앱 ID 를 검사하고 그 앱의 APK 폴더 경로를 돌려준다(경로 탈출 차단)."""
+    return Path(config.APK_DIR) / _checked_app_id(app_id)
 
 
 def _read_apk_latest(app_id: str) -> Optional[dict]:
@@ -2929,8 +2935,76 @@ async def upload_app_apk(
     return {"ok": True, "app": _app_apk_meta(app_id, meta, request)}
 
 
+# --------------------------------------------------------------------------
+# '자동 터치' 매크로 백업: /data/macro_backups/auto-touch/backups.json
+#
+# · 폰 앱이 키 없이 저장·불러오기·삭제를 하므로 공개한다(자동 발신 DB 와 완전히 분리된 파일).
+# --------------------------------------------------------------------------
+@apps.get("/{app_id}/macros")
+def app_macros_list(app_id: str):
+    """저장된 매크로 백업 목록(최신순, 매크로 본문 제외)."""
+    cleaned = _checked_app_id(app_id)
+    backups = macro_store.list_backups(cleaned)
+    return {"ok": True, "app_id": cleaned, "count": len(backups), "backups": backups}
+
+
+@apps.post("/{app_id}/macros")
+def app_macros_save(app_id: str, payload: MacroBackupIn):
+    """매크로 묶음을 저장한다(같은 이름이면 덮어쓰기)."""
+    cleaned = _checked_app_id(app_id)
+    macros = payload.macros or []
+    if len(macros) > macro_store.MAX_MACROS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"한 번에 저장할 수 있는 매크로는 {macro_store.MAX_MACROS}개까지입니다.",
+        )
+    steps = macro_store.count_steps([m for m in macros if isinstance(m, dict)])
+    if steps > macro_store.MAX_STEPS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"한 번에 저장할 수 있는 동작은 {macro_store.MAX_STEPS}개까지입니다.",
+        )
+    try:
+        meta, created = macro_store.save_backup(
+            cleaned,
+            payload.name,
+            payload.device_name,
+            [m for m in macros if isinstance(m, dict)],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except OSError as exc:
+        logger.error("매크로 백업 저장 실패: %s", exc)
+        raise HTTPException(status_code=500, detail="매크로 백업을 저장하지 못했습니다.")
+    logger.info("매크로 백업 저장: %s '%s' %s개", cleaned, meta["name"], meta["macro_count"])
+    return {"ok": True, "app_id": cleaned, "created": created, "backup": meta}
+
+
+@apps.get("/{app_id}/macros/{backup_id}")
+def app_macros_detail(app_id: str, backup_id: str):
+    """백업 하나의 전체 매크로 JSON."""
+    cleaned = _checked_app_id(app_id)
+    if not macro_store.BACKUP_ID_RE.match((backup_id or "").strip()):
+        raise HTTPException(status_code=404, detail="백업 ID가 올바르지 않습니다.")
+    backup = macro_store.get_backup(cleaned, backup_id.strip())
+    if backup is None:
+        raise HTTPException(status_code=404, detail="저장된 백업이 없습니다.")
+    return {"ok": True, "app_id": cleaned, "backup": backup}
+
+
+@apps.delete("/{app_id}/macros/{backup_id}")
+def app_macros_delete(app_id: str, backup_id: str):
+    """백업 삭제."""
+    cleaned = _checked_app_id(app_id)
+    if not macro_store.BACKUP_ID_RE.match((backup_id or "").strip()):
+        raise HTTPException(status_code=404, detail="백업 ID가 올바르지 않습니다.")
+    if not macro_store.delete_backup(cleaned, backup_id.strip()):
+        raise HTTPException(status_code=404, detail="저장된 백업이 없습니다.")
+    logger.info("매크로 백업 삭제: %s %s", cleaned, backup_id)
+    return {"ok": True, "app_id": cleaned, "deleted": backup_id.strip()}
+
+
 app.include_router(apps)
 app.include_router(api)
-
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
