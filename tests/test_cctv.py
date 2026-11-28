@@ -102,6 +102,9 @@ def test_viewer_reconnects_stream_when_tab_comes_back(client):
     assert "pauseStream" in html
     assert "/api/cctv/stream?t=" in html
     assert "frame_seq" in html            # 프레임이 멈춘 것을 상태로 확인
+    assert 'id="btnCamera"' in html       # 전면/후면을 한 버튼에서 토글
+    assert "카메라: " in html
+    assert 'id="btnFront"' not in html
 
 
 def test_viewer_apis_require_login(client):

@@ -165,8 +165,7 @@ VIEWER_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="controls">
-    <button data-cmd="front" id="btnFront">🤳 전면</button>
-    <button data-cmd="back" id="btnBack">📷 후면</button>
+    <button id="btnCamera" title="전면/후면 바꾸기">📷 카메라: 후면</button>
     <button id="btnFlash" title="플래시 켜기/끄기">🔦 플래시 꺼짐</button>
     <button id="btnSnap">💾 스냅샷</button>
     <button id="btnFull">⛶ 크게 보기</button>
@@ -400,8 +399,7 @@ VIEWER_HTML = """<!DOCTYPE html>
         $('btnQLow').className = s.quality === 'low' ? 'on' : '';
         $('btnQMid').className = s.quality === 'mid' ? 'on' : '';
         $('btnQHigh').className = s.quality === 'high' ? 'on' : '';
-        $('btnFront').className = s.camera === 'front' ? 'on' : '';
-        $('btnBack').className = s.camera === 'back' ? 'on' : '';
+        $('btnCamera').textContent = s.camera === 'front' ? '🤳 카메라: 전면' : '📷 카메라: 후면';
         $('btnFlash').textContent = s.flash ? '💡 플래시 켜짐' : '🔦 플래시 꺼짐';
         $('btnFlash').className = s.flash ? 'on' : '';
         $('streamState').textContent = s.streaming_wanted ? '실시간 전송 중' : '대기(전송 안 함)';
@@ -438,6 +436,14 @@ VIEWER_HTML = """<!DOCTYPE html>
       post('/api/cctv/command', { command: cmd }).catch(function (e) { alert(e.message); });
       setTimeout(refresh, 600);
     });
+  });
+
+  // 카메라도 한 버튼 토글로: 지금 상태의 반대(전면 ↔ 후면)를 보낸다.
+  $('btnCamera').addEventListener('click', function () {
+    var next = ($('camstat').textContent === '전면') ? 'back' : 'front';
+    post('/api/cctv/command', { command: next })
+      .then(function () { setTimeout(refresh, 500); })
+      .catch(function (e) { alert(e.message); });
   });
 
   // 플래시 켜기/끄기는 한 버튼으로: 지금 상태의 반대를 보낸다.
