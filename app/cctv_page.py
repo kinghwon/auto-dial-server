@@ -136,7 +136,7 @@ VIEWER_HTML = """<!DOCTYPE html>
   @media (min-width: 700px) { .gridview.show { grid-template-columns: 1fr 1fr; } }
   .tile {
     position: relative; background: #000; border: 1px solid #1c2230; border-radius: 12px;
-    overflow: hidden; aspect-ratio: 4 / 3;
+    overflow: hidden; aspect-ratio: 4 / 3; min-height: 180px;   /* aspect-ratio 를 모르는 예전 브라우저용 */
   }
   .tile img {
     width: 100%; height: 100%; object-fit: contain; display: block; cursor: pointer;
