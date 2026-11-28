@@ -156,6 +156,8 @@ VIEWER_HTML = """<!DOCTYPE html>
   }
   .controls button:active { background: #202734; }
   .controls button.on { background: #1c3a2a; border-color: #2a6b45; color: #a7f3c6; }
+  .controls button:disabled { opacity: .45; cursor: default; }
+  .controls button:disabled:active { background: #161b24; }
   .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; color: #93a0b4; }
   .row .val { color: #dfe5ee; font-weight: 600; }
   .card {
@@ -351,14 +353,32 @@ VIEWER_HTML = """<!DOCTYPE html>
   }
 
   // ---- 영상 회전: 기기별로 0° → 90° → 180° → 270° (localStorage) --------
+  // 예전에는 기기 구분 없이 'cctv-rotation' 하나를 썼다. 첫 기기만 그 값을 물려받고
+  // 나머지 기기는 0° 부터 시작하도록 한 번만 옮긴다.
+  var legacyRot = null;
+  try {
+    var legacyValue = parseInt(localStorage.getItem('cctv-rotation'), 10);
+    if (!isNaN(legacyValue) && legacyValue % 90 === 0) legacyRot = ((legacyValue % 360) + 360) % 360;
+  } catch (e) { legacyRot = null; }
+
   function rotationFor(key) {
-    var value = 0;
     try {
-      var saved = parseInt(localStorage.getItem('cctv-rotation:' + (key || '')), 10);
-      if (isNaN(saved)) saved = parseInt(localStorage.getItem('cctv-rotation'), 10);
-      if (!isNaN(saved) && saved % 90 === 0) value = ((saved % 360) + 360) % 360;
-    } catch (e) { value = 0; }
-    return value;
+      var raw = localStorage.getItem('cctv-rotation:' + (key || ''));
+      if (raw !== null) {
+        var saved = parseInt(raw, 10);
+        if (!isNaN(saved) && saved % 90 === 0) return ((saved % 360) + 360) % 360;
+      }
+    } catch (e) {}
+    if (legacyRot !== null) {
+      var value = legacyRot;
+      legacyRot = null;
+      try {
+        localStorage.removeItem('cctv-rotation');
+        localStorage.setItem('cctv-rotation:' + (key || ''), String(value));
+      } catch (e) {}
+      return value;
+    }
+    return 0;
   }
 
   var rot = rotationFor(selected);
@@ -367,7 +387,6 @@ VIEWER_HTML = """<!DOCTYPE html>
     rot = ((deg % 360) + 360) % 360;
     try {
       localStorage.setItem('cctv-rotation:' + (selected || ''), String(rot));
-      localStorage.setItem('cctv-rotation', String(rot));   // 예전 키도 함께 유지
     } catch (e) {}
     var btn = $('btnRotate');
     if (btn) btn.textContent = '🔄 회전 ' + rot + '°';
@@ -683,8 +702,16 @@ VIEWER_HTML = """<!DOCTYPE html>
     $('btnQMid').className = s.quality === 'mid' ? 'on' : '';
     $('btnQHigh').className = s.quality === 'high' ? 'on' : '';
     $('btnCamera').textContent = s.camera === 'front' ? '🤳 카메라: 전면' : '📷 카메라: 후면';
-    $('btnFlash').textContent = s.flash ? '💡 플래시 켜짐' : '🔦 플래시 꺼짐';
-    $('btnFlash').className = s.flash ? 'on' : '';
+    // 전면 카메라에는 플래시가 없다 — 버튼을 잠근다(불필요한 명령을 막는다).
+    var front = s.camera === 'front';
+    $('btnFlash').disabled = front;
+    if (front) {
+      $('btnFlash').textContent = '🔦 플래시(후면 전용)';
+      $('btnFlash').className = '';
+    } else {
+      $('btnFlash').textContent = s.flash ? '💡 플래시 켜짐' : '🔦 플래시 꺼짐';
+      $('btnFlash').className = s.flash ? 'on' : '';
+    }
     $('streamState').textContent = s.streaming_wanted ? '실시간 전송 중' : '대기(전송 안 함)';
     Array.prototype.forEach.call($('fpsRow').querySelectorAll('button'), function (btn) {
       var value = parseInt(btn.getAttribute('data-fps'), 10);
@@ -759,6 +786,9 @@ VIEWER_HTML = """<!DOCTYPE html>
 
   // 플래시 켜기/끄기는 한 버튼으로: 지금 상태의 반대를 보낸다.
   $('btnFlash').addEventListener('click', function () {
+    if ($('camstat').textContent === '전면') {
+      return;   // 전면 카메라에서는 플래시를 쓰지 않는다
+    }
     var next = !flashOn;
     flashOn = next;
     $('btnFlash').textContent = next ? '💡 플래시 켜짐' : '🔦 플래시 꺼짐';
