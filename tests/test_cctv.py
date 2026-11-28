@@ -77,7 +77,7 @@ def test_viewer_page_requires_login(client):
 
 
 def test_viewer_page_has_rotation_button_and_remembers_it(client):
-    """뷰어에 90도씩 회전하는 버튼이 있고, 각도를 localStorage 에 기억한다."""
+    """뷰어에 90도씩 회전하는 버튼이 있고, 각도를 기기별 localStorage 에 기억한다."""
     _password_from_config()
     _login(client)
     response = client.get("/cctv")
@@ -89,6 +89,33 @@ def test_viewer_page_has_rotation_button_and_remembers_it(client):
     assert "localStorage" in html
     assert "rotateBlob" in html             # 스냅샷도 회전해서 저장
     assert "layoutVideo" in html            # 90°/270° 에서 크기 재배치
+    assert "rotationFor" in html            # 기기별 각도 기억
+
+
+def test_viewer_shows_device_tabs_and_grid(client):
+    """여러 기기를 탭으로 골라 보고 '한눈에 보기'로 동시에 본다."""
+    _password_from_config()
+    _login(client)
+    html = client.get("/cctv").text
+    assert 'id="devTabs"' in html
+    assert 'id="btnGrid"' in html
+    assert 'id="grid"' in html
+    assert "한눈에 보기" in html
+    assert "/api/cctv/devices" in html
+    assert "streamUrlFor" in html
+    assert "device=" in html
+
+
+def test_viewer_has_fps_selector(client):
+    """웹 뷰어에서도 초당 프레임(1·2·3·5·8·10)을 고를 수 있다."""
+    _password_from_config()
+    _login(client)
+    html = client.get("/cctv").text
+    for fps in (1, 2, 3, 5, 8, 10):
+        assert 'data-fps="%d"' % fps in html
+    assert "fpsRow" in html
+    assert "fpsNow" in html
+    assert "'fps'" in html or '"fps"' in html
 
 
 def test_viewer_reconnects_stream_when_tab_comes_back(client):
@@ -100,7 +127,8 @@ def test_viewer_reconnects_stream_when_tab_comes_back(client):
     assert "pageshow" in html
     assert "connectStream" in html
     assert "pauseStream" in html
-    assert "/api/cctv/stream?t=" in html
+    assert "/api/cctv/stream" in html        # streamUrlFor() 가 기기별 주소를 만든다
+    assert "streamUrlFor" in html
     assert "frame_seq" in html            # 프레임이 멈춘 것을 상태로 확인
     assert 'id="btnCamera"' in html       # 전면/후면을 한 버튼에서 토글
     assert "카메라: " in html
@@ -398,8 +426,9 @@ def test_viewer_logs_need_login(client):
     assert response.json()["logs"] == []
 
 
-def test_camera_logs_are_kept_newest_two_hundred(client):
+def test_camera_logs_are_kept_newest_thousand(client):
     cctv.load_config()
+    assert cctv.LOG_MAX_LINES == 1000
     lines = ["줄 {}".format(i) for i in range(250)]
     response = client.post(
         "/api/cctv/camera/logs",
@@ -424,11 +453,24 @@ def test_camera_logs_are_kept_newest_two_hundred(client):
     # 더 보내면 오래된 것부터 밀려난다
     client.post("/api/cctv/camera/logs", json={"logs": ["새 줄"]}, headers=_camera_headers())
     logs = client.get("/api/cctv/logs").json()["logs"]
-    assert len(logs) == 200
+    assert len(logs) == 201
     assert logs[-1]["line"] == "새 줄"
-    assert logs[0]["line"] == "줄 1"
     assert client.get("/api/cctv/logs?limit=5").json()["logs"][-1]["line"] == "새 줄"
     assert len(client.get("/api/cctv/logs?limit=5").json()["logs"]) == 5
+
+
+def test_camera_logs_are_capped_at_thousand(client):
+    cctv.load_config()
+    for _ in range(6):
+        client.post(
+            "/api/cctv/camera/logs",
+            json={"logs": ["줄 {}".format(i) for i in range(200)]},
+            headers=_camera_headers(),
+        )
+    _password_from_config()
+    _login(client)
+    logs = client.get("/api/cctv/logs?limit=1000").json()["logs"]
+    assert len(logs) == 1000
 
 
 def test_heartbeat_carries_logs(client):
@@ -470,3 +512,240 @@ def test_camera_logs_validate_payload_and_trim(client):
     assert len(logs) == 3  # 빈 줄은 버린다
     assert len(logs[-1]["line"]) < 5000
     assert logs[-1]["line"].endswith("(잘림)")
+
+
+# --- 다중 기기 (기기별 독립 슬롯) --------------------------------------------
+def _cam(device_id: str = "", device_name: str = "") -> dict:
+    """프레임·로그 업로드용 헤더(이름은 ASCII 만 헤더로 보낼 수 있다)."""
+    headers = dict(_camera_headers())
+    if device_id:
+        headers["X-CCTV-Device-Id"] = device_id
+    if device_name and device_name.isascii():
+        headers["X-CCTV-Device-Name"] = device_name
+    return headers
+
+
+def _heartbeat(client: TestClient, device_id: str = "", device_name: str = "", **extra):
+    body = {"device_id": device_id, "device_name": device_name}
+    body.update(extra)
+    return client.post("/api/cctv/camera/heartbeat", json=body, headers=_camera_headers())
+
+
+def test_device_key_is_normalized():
+    assert cctv.normalize_device_key("LENOVO TB371FC") == "lenovo-tb371fc"
+    assert cctv.normalize_device_key("  갤럭시 S23+ ") == "갤럭시-s23"
+    assert cctv.normalize_device_key("a/b:c") == "a-b-c"
+    assert cctv.normalize_device_key("") == ""
+
+
+def test_two_devices_get_independent_slots(client):
+    _password_from_config()
+    _login(client)
+    first = _heartbeat(client, "dev-a", "LENOVO TB371FC", battery=88, camera="back", quality="mid", fps=3)
+    second = _heartbeat(client, "dev-b", "갤럭시 S23+", battery=42, camera="front", quality="high", fps=5)
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["device"] == "dev-a"
+    assert second.json()["device"] == "dev-b"
+
+    a = client.get("/api/cctv/status?device=dev-a").json()
+    b = client.get("/api/cctv/status?device=dev-b").json()
+    assert a["battery"] == 88 and a["camera"] == "back" and a["fps"] == 3
+    assert b["battery"] == 42 and b["camera"] == "front" and b["fps"] == 5
+    assert a["device_name"] == "LENOVO TB371FC"
+    assert b["device_name"] == "갤럭시 S23+"
+    assert a["device_count"] == 2
+
+
+def test_device_frames_are_kept_separately(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "폰 A")
+    _heartbeat(client, "dev-b", "폰 B")
+    a_frame = JPEG + b"A"
+    b_frame = JPEG + b"B"
+    assert client.post(
+        "/api/cctv/camera/frame",
+        content=a_frame,
+        headers={**_cam("dev-a", "폰 A"), "Content-Type": "image/jpeg"},
+    ).status_code == 200
+    assert client.post(
+        "/api/cctv/camera/frame",
+        content=b_frame,
+        headers={**_cam("dev-b", "폰 B"), "Content-Type": "image/jpeg"},
+    ).status_code == 200
+
+    assert client.get("/api/cctv/frame?device=dev-a").content == a_frame
+    assert client.get("/api/cctv/frame?device=dev-b").content == b_frame
+    assert client.get("/api/cctv/status?device=dev-a").json()["frame_seq"] == 1
+    assert client.get("/api/cctv/status?device=dev-b").json()["frame_seq"] == 1
+
+
+def test_devices_endpoint_lists_all(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "LENOVO TB371FC", battery=77)
+    _heartbeat(client, "dev-b", "갤럭시 S23+", battery=31)
+    response = client.get("/api/cctv/devices")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 2
+    keys = [item["device"] for item in data["devices"]]
+    assert set(keys) == {"dev-a", "dev-b"}
+    assert all(item["online"] for item in data["devices"])
+    assert data["selected"] in keys
+    assert client.get("/api/cctv/devices").json()["devices"][0]["battery"] in (77, 31)
+
+
+def test_devices_endpoint_requires_login(client):
+    assert client.get("/api/cctv/devices").status_code == 401
+
+
+def test_default_selection_is_recent_online_device(client, monkeypatch):
+    _password_from_config()
+    _login(client)
+    start = cctv._now()
+    monkeypatch.setattr(cctv, "_now", lambda: start)
+    _heartbeat(client, "dev-a", "폰 A", battery=50)
+    monkeypatch.setattr(cctv, "_now", lambda: start + 3)
+    _heartbeat(client, "dev-b", "폰 B", battery=60)
+    # 기기를 지정하지 않으면 가장 최근에 들은 기기
+    assert client.get("/api/cctv/status").json()["device"] == "dev-b"
+    # A 가 20초 넘게 조용해 오프라인이 되면 온라인 기기를 고른다
+    monkeypatch.setattr(cctv, "_now", lambda: start + 40)
+    status = client.get("/api/cctv/status").json()
+    assert status["device"] in ("dev-a", "dev-b")
+    assert status["camera_online"] is False
+
+
+def test_viewer_activity_is_per_device(client):
+    """한 기기를 보는 것이 다른 기기의 전송을 깨우지 않는다."""
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "폰 A")
+    _heartbeat(client, "dev-b", "폰 B")
+    client.post("/api/cctv/camera/frame", content=JPEG, headers=_cam("dev-a", "폰 A"))
+    assert client.get("/api/cctv/frame?device=dev-a").status_code == 200
+
+    a = _heartbeat(client, "dev-a", "폰 A").json()
+    b = _heartbeat(client, "dev-b", "폰 B").json()
+    assert a["streaming_wanted"] is True
+    assert b["streaming_wanted"] is False
+    devices = {item["device"]: item for item in client.get("/api/cctv/devices").json()["devices"]}
+    assert devices["dev-a"]["streaming_wanted"] is True
+    assert devices["dev-b"]["streaming_wanted"] is False
+
+
+def test_commands_go_to_the_selected_device_only(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "폰 A")
+    _heartbeat(client, "dev-b", "폰 B")
+    assert client.post("/api/cctv/command", json={"command": "flash_on", "device": "dev-a"}).status_code == 200
+    assert client.post("/api/cctv/command", json={"command": "front", "device": "dev-b"}).status_code == 200
+    a = _heartbeat(client, "dev-a", "폰 A").json()
+    b = _heartbeat(client, "dev-b", "폰 B").json()
+    assert a["commands"] == ["flash_on"]
+    assert b["commands"] == ["front"]
+    # 한 번 꺼내면 사라진다
+    assert _heartbeat(client, "dev-a", "폰 A").json()["commands"] == []
+
+
+def test_command_device_can_come_from_query(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "폰 A")
+    _heartbeat(client, "dev-b", "폰 B")
+    response = client.post("/api/cctv/command?device=dev-b", json={"command": "quality_low"})
+    assert response.status_code == 200
+    assert response.json()["device"] == "dev-b"
+    assert _heartbeat(client, "dev-b", "폰 B").json()["commands"] == ["quality_low"]
+    assert _heartbeat(client, "dev-a", "폰 A").json()["commands"] == []
+
+
+def test_fps_command_queues_choice(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "폰 A")
+    response = client.post("/api/cctv/command", json={"command": "fps", "fps": 5, "device": "dev-a"})
+    assert response.status_code == 200
+    assert response.json()["command"] == "fps_5"
+    assert _heartbeat(client, "dev-a", "폰 A").json()["commands"] == ["fps_5"]
+
+    # fps_8 형태도 받는다
+    assert client.post("/api/cctv/command", json={"command": "fps_8", "device": "dev-a"}).status_code == 200
+    assert _heartbeat(client, "dev-a", "폰 A").json()["commands"] == ["fps_8"]
+
+
+def test_fps_command_rejects_unsupported_value(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "폰 A")
+    for bad in (4, 0, 60, "fast"):
+        response = client.post("/api/cctv/command", json={"command": "fps", "fps": bad, "device": "dev-a"})
+        assert response.status_code == 400, bad
+    assert cctv.FPS_CHOICES == (1, 2, 3, 5, 8, 10)
+
+
+def test_heartbeat_reports_fps_and_fps_choices(client):
+    _password_from_config()
+    _login(client)
+    response = _heartbeat(client, "dev-a", "폰 A", fps=8)
+    assert response.json()["fps_choices"] == [1, 2, 3, 5, 8, 10]
+    assert client.get("/api/cctv/status?device=dev-a").json()["fps"] == 8
+
+
+def test_device_id_keeps_slot_when_name_changes(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "예전 이름", battery=10)
+    _heartbeat(client, "dev-a", "새 이름", battery=20)
+    data = client.get("/api/cctv/devices").json()
+    assert data["count"] == 1
+    status = client.get("/api/cctv/status?device=dev-a").json()
+    assert status["device_name"] == "새 이름"
+    assert status["battery"] == 20
+
+
+def test_unknown_device_returns_404(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "폰 A")
+    assert client.get("/api/cctv/frame?device=nope").status_code == 404
+    assert client.get("/api/cctv/stream?device=nope").status_code == 404
+    assert client.get("/api/cctv/status?device=nope").json()["camera_online"] is False
+
+
+def test_logs_can_be_filtered_by_device(client):
+    cctv.load_config()
+    client.post(
+        "/api/cctv/camera/logs",
+        json={"logs": ["A 로그"], "device_id": "dev-a", "device_name": "폰 A"},
+        headers=_camera_headers(),
+    )
+    client.post(
+        "/api/cctv/camera/logs",
+        json={"logs": ["B 로그"], "device_id": "dev-b", "device_name": "폰 B"},
+        headers=_camera_headers(),
+    )
+    _password_from_config()
+    _login(client)
+    all_logs = client.get("/api/cctv/logs").json()["logs"]
+    assert len(all_logs) == 2
+    a_logs = client.get("/api/cctv/logs?device=dev-a").json()["logs"]
+    assert [item["line"] for item in a_logs] == ["A 로그"]
+    assert a_logs[0]["device_key"] == "dev-a"
+
+
+def test_stream_selects_device(client):
+    _password_from_config()
+    _login(client)
+    _heartbeat(client, "dev-a", "폰 A")
+    _heartbeat(client, "dev-b", "폰 B")
+    client.post("/api/cctv/camera/frame", content=JPEG, headers=_cam("dev-b", "폰 B"))
+    with client.stream("GET", "/api/cctv/stream?device=dev-b") as response:
+        assert response.status_code == 200
+        chunk = next(response.iter_bytes())
+        assert b"--frame" in chunk
+    devices = {item["device"]: item for item in client.get("/api/cctv/devices").json()["devices"]}
+    assert devices["dev-b"]["streaming_wanted"] is True
+    assert devices["dev-a"]["streaming_wanted"] is False

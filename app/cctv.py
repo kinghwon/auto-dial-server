@@ -45,11 +45,18 @@ ALLOWED_COMMANDS = {
     "quality_low",
     "quality_mid",
     "quality_high",
+    "fps",
 }
+# 뷰어·앱에서 고를 수 있는 초당 프레임
+FPS_CHOICES = (1, 2, 3, 5, 8, 10)
+DEFAULT_FPS = 3
+# 이 시간(초) 동안 하트비트가 없으면 그 기기는 오프라인으로 본다.
+DEVICE_ONLINE_SEC = 20
+DEVICE_KEY_MAX = 64
 LOGIN_MAX_FAILS = 5
 LOGIN_LOCK_SEC = 10 * 60
-# 앱이 보내는 진단 로그: 디스크에는 쓰지 않고 메모리에 최근 200줄만 들고 있는다.
-LOG_MAX_LINES = 200
+# 앱이 보내는 진단 로그: 디스크에는 쓰지 않고 메모리에 최근 1000줄만 들고 있는다.
+LOG_MAX_LINES = 1000
 # 한 번의 요청에서 받아 주는 로그 줄 수 상한(앱이 밀린 로그를 몰아 보낼 때 대비)
 LOG_MAX_LINES_PER_POST = 200
 # 로그 한 줄(스택트레이스는 여러 줄) 최대 길이
@@ -172,11 +179,41 @@ def regenerate_camera_token() -> str:
 
 
 # --------------------------------------------------------------------------
-# 메모리 상태 (최신 프레임 1장 + 카메라 상태 + 제어 큐 + 뷰어 활동 시각)
+# 메모리 상태 -- 기기별로 독립된 카메라 슬롯
+#   최신 프레임 1장 + 카메라 상태 + 제어 큐 + 뷰어 활동 시각을 기기마다 따로 둔다.
+#   디스크에는 아무것도 쓰지 않는다.
 # --------------------------------------------------------------------------
-class _State:
-    def __init__(self) -> None:
-        self.lock = threading.RLock()
+def normalize_device_key(raw) -> str:
+    """기기 ID·이름을 딕셔너리 키와 URL 에 쓸 수 있는 짧은 문자열로 만든다.
+
+    예: "LENOVO TB371FC" -> "lenovo-tb371fc", "갤럭시 S23+" -> "갤럭시-s23"
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    chars: list[str] = []
+    for ch in text:
+        if ch.isalnum():
+            chars.append(ch)
+        elif ch in " -_.:/|,":
+            chars.append("-")
+    key = "".join(chars)
+    while "--" in key:
+        key = key.replace("--", "-")
+    return key.strip("-.")[:DEVICE_KEY_MAX]
+
+
+def _camera_device_key(device_id: str = "", device_name: str = "") -> str:
+    """폰이 보낸 고유 ID(없으면 기기 이름)로 슬롯 키를 만든다."""
+    return normalize_device_key(device_id) or normalize_device_key(device_name) or "default"
+
+
+class _Device:
+    """카메라 한 대의 메모리 슬롯."""
+
+    def __init__(self, key: str, device_id: str = "") -> None:
+        self.key = key
+        self.device_id = device_id or key
         self.frame: Optional[bytes] = None
         self.frame_seq = 0
         self.frame_at = 0.0
@@ -186,23 +223,88 @@ class _State:
         self.viewer_last = 0.0
         self.viewer_streams = 0
         self.frames_from_camera = 0
+
+    @property
+    def name(self) -> str:
+        return str(self.camera.get("device_name") or self.key)
+
+    def online(self) -> bool:
+        return self.camera_seen > 0 and (_now() - self.camera_seen) < DEVICE_ONLINE_SEC
+
+    def reset(self) -> None:
+        self.frame = None
+        self.frame_seq = 0
+        self.frame_at = 0.0
+        self.camera = {}
+        self.camera_seen = 0.0
+        self.commands = []
+        self.viewer_last = 0.0
+        self.viewer_streams = 0
+        self.frames_from_camera = 0
+
+
+class _Registry:
+    """기기 슬롯 모음 + 앱 진단 로그(전체 공용)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.devices: dict[str, _Device] = {}
         self.logs: list[dict] = []
 
     def reset(self) -> None:
         with self.lock:
-            self.frame = None
-            self.frame_seq = 0
-            self.frame_at = 0.0
-            self.camera = {}
-            self.camera_seen = 0.0
-            self.commands = []
-            self.viewer_last = 0.0
-            self.viewer_streams = 0
-            self.frames_from_camera = 0
+            self.devices = {}
             self.logs = []
 
+    def get(self, key: Optional[str]) -> Optional[_Device]:
+        if not key:
+            return None
+        with self.lock:
+            return self.devices.get(key)
 
-_state = _State()
+    def ensure(self, key: str, device_id: str = "") -> _Device:
+        with self.lock:
+            device = self.devices.get(key)
+            if device is None:
+                device = _Device(key, device_id)
+                # 기기가 붙기 전에 뷰어가 보낸 명령은 'default' 자리표시자에 쌓여 있다.
+                # 첫 실제 기기가 등록되면 그 명령을 넘겨 받는다(하위 호환).
+                placeholder = self.devices.get("default")
+                if key != "default" and placeholder is not None and not placeholder.camera_seen:
+                    device.commands = list(placeholder.commands)
+                    device.viewer_last = placeholder.viewer_last
+                    self.devices.pop("default", None)
+                self.devices[key] = device
+                logger.info("CCTV 기기 등록: %s (%s)", key, device.name)
+            elif device_id and not device.device_id:
+                device.device_id = device_id
+            return device
+
+    def ordered(self) -> list[_Device]:
+        """온라인 기기 먼저, 그다음 최근에 들은 기기 순."""
+        with self.lock:
+            items = list(self.devices.values())
+        items.sort(key=lambda d: (0 if d.online() else 1, -(d.camera_seen or 0), -(d.frame_at or 0), d.key))
+        return items
+
+    def pick(self, key: Optional[str] = None) -> Optional[_Device]:
+        """지정한 기기, 없으면 최근 온라인 기기(하위 호환: 기기 미지정 호출)."""
+        if key and str(key).strip():
+            wanted = normalize_device_key(key)
+            device = self.get(wanted)
+            if device is not None:
+                return device
+            # 키가 아니라 기기 ID 로 온 경우도 받아 준다
+            with self.lock:
+                for item in self.devices.values():
+                    if normalize_device_key(item.device_id) == wanted:
+                        return item
+            return None
+        items = self.ordered()
+        return items[0] if items else None
+
+
+_state = _Registry()
 _login_fails: dict[str, list[float]] = {}
 
 
@@ -212,20 +314,29 @@ def reset_state() -> None:
     _login_fails.clear()
 
 
-def _viewer_active() -> bool:
+def _viewer_active(device: _Device) -> bool:
+    """이 기기의 영상을 지금 뷰어가 보고 있는가."""
     window = float(getattr(config, "CCTV_VIEWER_ACTIVE_SEC", 10) or 10)
     with _state.lock:
-        last = _state.viewer_last
-        streams = _state.viewer_streams
+        last = device.viewer_last
+        streams = device.viewer_streams
     return streams > 0 or (_now() - last) <= window
 
 
-def _touch_viewer() -> None:
+def _touch_viewer(device: Optional[_Device]) -> None:
+    if device is None:
+        return
     with _state.lock:
-        _state.viewer_last = _now()
+        device.viewer_last = _now()
 
 
-def _append_logs(lines: list, device: str = "", version: str = "", source: str = "") -> int:
+def _append_logs(
+    lines: list,
+    device: str = "",
+    version: str = "",
+    source: str = "",
+    device_key: str = "",
+) -> int:
     """폰이 보낸 로그 줄을 메모리에 쌓는다(최근 LOG_MAX_LINES 개만 유지).
 
     디스크에는 아무것도 쓰지 않는다. 각 항목은 서버가 받은 시각과 함께 남겨
@@ -246,6 +357,7 @@ def _append_logs(lines: list, device: str = "", version: str = "", source: str =
                     "at": _now_text(),
                     "at_epoch": round(_now(), 3),
                     "device": str(device or "")[:80],
+                    "device_key": str(device_key or "")[:DEVICE_KEY_MAX],
                     "version": str(version or "")[:32],
                     "source": str(source or "")[:16],
                     "line": text,
@@ -307,13 +419,16 @@ def _check_basic(header: Optional[str]) -> bool:
     return username == data.get("username", "admin") and verify_password(password, data["password_hash"])
 
 
-def require_viewer(request: Request) -> None:
-    """뷰어 인증(쿠키 세션 또는 HTTP Basic). 없으면 401."""
+def require_viewer(request: Request, device: Optional[_Device] = None) -> None:
+    """뷰어 인증(쿠키 세션 또는 HTTP Basic). 없으면 401.
+
+    device 를 주면 그 기기의 '봄' 시각을 지금으로 미룬다(그 기기만 전송).
+    """
     if check_session(request.cookies.get(COOKIE_NAME)):
-        _touch_viewer()
+        _touch_viewer(device)
         return
     if _check_basic(request.headers.get("authorization")):
-        _touch_viewer()
+        _touch_viewer(device)
         return
     raise HTTPException(
         status_code=401,
@@ -387,7 +502,6 @@ router = APIRouter(tags=["cctv"])
 def cctv_page_view(request: Request):
     """뷰어 페이지. 로그인하지 않았으면 로그인 화면만 돌려준다(401)."""
     if check_session(request.cookies.get(COOKIE_NAME)) or _check_basic(request.headers.get("authorization")):
-        _touch_viewer()
         return HTMLResponse(cctv_page.render_viewer(), headers={"Cache-Control": "no-store"})
     return HTMLResponse(cctv_page.render_login(), status_code=401, headers={"Cache-Control": "no-store"})
 
@@ -450,58 +564,97 @@ def cctv_logout():
 
 
 @router.get("/api/cctv/status")
-def cctv_status(request: Request):
+def cctv_status(request: Request, device: Optional[str] = None):
+    """선택한 기기(?device=)의 상태. 기기를 지정하지 않으면 최근 온라인 기기."""
     require_viewer(request)
     data = load_config(create=False)
     with _state.lock:
-        camera = dict(_state.camera)
-        camera_seen = _state.camera_seen
-        frame_at = _state.frame_at
-        frame_seq = _state.frame_seq
-        streams = _state.viewer_streams
-    online = (camera_seen > 0) and ((_now() - camera_seen) < 20)
+        target = _state.pick(device)
+    _touch_viewer(target)
+    if target is None:
+        # 아직 등록된 기기가 없어도 기존 형식(오프라인)으로 답한다.
+        return {
+            "ok": True,
+            "device": None,
+            "device_count": 0,
+            "camera_online": False,
+            "streaming_wanted": False,
+            "viewer_streams": 0,
+            "viewer_window_sec": float(getattr(config, "CCTV_VIEWER_ACTIVE_SEC", 10) or 10),
+            "battery": None,
+            "charging": None,
+            "camera": None,
+            "flash": None,
+            "quality": None,
+            "fps": None,
+            "device_name": None,
+            "app_version": None,
+            "model": None,
+            "android": None,
+            "sdk": None,
+            "engine": None,
+            "screen_on": None,
+            "last_seen_sec_ago": None,
+            "last_frame_sec_ago": None,
+            "frame_seq": 0,
+            "log_lines": 0,
+            "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "camera_token_hint": data["camera_token"][:4] + "…" + data["camera_token"][-4:],
+            "username": data.get("username", "admin"),
+        }
+    summary = _device_summary(target)
+    with _state.lock:
+        log_lines = sum(1 for item in _state.logs if item.get("device_key") == target.key)
+        device_count = len(_state.devices)
+    result = {"ok": True, "device_count": device_count, "log_lines": log_lines}
+    result.update(summary)
+    result.update(
+        {
+            "viewer_window_sec": float(getattr(config, "CCTV_VIEWER_ACTIVE_SEC", 10) or 10),
+            "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "camera_token_hint": data["camera_token"][:4] + "…" + data["camera_token"][-4:],
+            "username": data.get("username", "admin"),
+        }
+    )
+    return result
+
+
+@router.get("/api/cctv/devices")
+def cctv_devices(request: Request, device: Optional[str] = None):
+    """연결된 전체 기기 목록(온라인 먼저, 최근에 들은 순)."""
+    require_viewer(request)
+    with _state.lock:
+        items = _state.ordered()
+        selected = _state.pick(device)
+        payload = [_device_summary(item) for item in items]
+        selected_key = selected.key if selected else None
     return {
         "ok": True,
-        "camera_online": online,
-        "streaming_wanted": _viewer_active(),
-        "viewer_streams": streams,
-        "viewer_window_sec": float(getattr(config, "CCTV_VIEWER_ACTIVE_SEC", 10) or 10),
-        "battery": camera.get("battery"),
-        "charging": camera.get("charging"),
-        "camera": camera.get("camera"),
-        "flash": camera.get("flash"),
-        "quality": camera.get("quality"),
-        "device_name": camera.get("device_name"),
-        "app_version": camera.get("app_version"),
-        "model": camera.get("model"),
-        "android": camera.get("android"),
-        "sdk": camera.get("sdk"),
-        "engine": camera.get("engine"),
-        "screen_on": camera.get("screen_on"),
-        "fps": camera.get("fps"),
-        "last_seen_sec_ago": round(_now() - camera_seen) if camera_seen else None,
-        "last_frame_sec_ago": round(_now() - frame_at) if frame_at else None,
-        "frame_seq": frame_seq,
-        "log_lines": len(_state.logs),
+        "count": len(payload),
+        "devices": payload,
+        "selected": selected_key,
         "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "camera_token_hint": data["camera_token"][:4] + "…" + data["camera_token"][-4:],
-        "username": data.get("username", "admin"),
     }
 
 
 @router.get("/api/cctv/frame")
-def cctv_frame(request: Request):
-    """최신 JPEG 한 장(메모리)."""
+def cctv_frame(request: Request, device: Optional[str] = None):
+    """선택한 기기의 최신 JPEG 한 장(메모리)."""
     require_viewer(request)
     with _state.lock:
-        frame = _state.frame
-        seq = _state.frame_seq
+        target = _state.pick(device)
+    if target is None:
+        raise HTTPException(status_code=404, detail="등록된 기기가 없습니다.")
+    _touch_viewer(target)
+    with _state.lock:
+        frame = target.frame
+        seq = target.frame_seq
     if not frame:
         raise HTTPException(status_code=404, detail="아직 카메라 영상이 없습니다.")
     return Response(
         content=frame,
         media_type="image/jpeg",
-        headers={"Cache-Control": "no-store", "X-Frame-Seq": str(seq)},
+        headers={"Cache-Control": "no-store", "X-Frame-Seq": str(seq), "X-CCTV-Device": target.key},
     )
 
 
@@ -516,11 +669,15 @@ def _mjpeg_chunk(jpeg: bytes) -> bytes:
 
 
 @router.get("/api/cctv/stream")
-async def cctv_stream(request: Request):
-    """MJPEG 실시간 스트림(뷰어가 연결한 동안만 카메라에 전송 요청)."""
+async def cctv_stream(request: Request, device: Optional[str] = None):
+    """MJPEG 실시간 스트림(이 기기를 보는 동안만 그 기기에 전송 요청)."""
     require_viewer(request)
     with _state.lock:
-        _state.viewer_streams += 1
+        target = _state.pick(device)
+    if target is None:
+        raise HTTPException(status_code=404, detail="등록된 기기가 없습니다.")
+    with _state.lock:
+        target.viewer_streams += 1
 
     async def gen():
         last_seq = -1
@@ -528,10 +685,10 @@ async def cctv_stream(request: Request):
             while True:
                 if await request.is_disconnected():
                     break
-                _touch_viewer()
+                _touch_viewer(target)
                 with _state.lock:
-                    frame = _state.frame
-                    seq = _state.frame_seq
+                    frame = target.frame
+                    seq = target.frame_seq
                 if frame and seq != last_seq:
                     last_seq = seq
                     yield _mjpeg_chunk(frame)
@@ -540,31 +697,95 @@ async def cctv_stream(request: Request):
             pass
         finally:
             with _state.lock:
-                _state.viewer_streams = max(0, _state.viewer_streams - 1)
+                target.viewer_streams = max(0, target.viewer_streams - 1)
 
     return StreamingResponse(
         gen(),
         media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no", "X-CCTV-Device": target.key},
     )
 
 
+def _parse_fps_command(command: str, body: dict) -> Optional[str]:
+    """'fps' 명령을 'fps_5' 형태로 바꾸고, 고를 수 없는 값이면 None."""
+    raw = body.get("fps", body.get("value"))
+    if raw is None and command.startswith("fps_"):
+        raw = command[len("fps_"):]
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+    if value not in FPS_CHOICES:
+        return None
+    return "fps_{}".format(value)
+
+
 @router.post("/api/cctv/command")
-async def cctv_command(request: Request):
-    """뷰어가 카메라에 전/후면·플래시·화질 명령을 넣는다."""
+async def cctv_command(request: Request, device: Optional[str] = None):
+    """뷰어가 기기에 전/후면·플래시·화질·FPS 명령을 넣는다."""
     require_viewer(request)
     try:
         body = await request.json()
     except ValueError:
         body = {}
-    command = str((body or {}).get("command") or "").strip().lower()
-    if command not in ALLOWED_COMMANDS:
+    body = body if isinstance(body, dict) else {}
+    command = str(body.get("command") or "").strip().lower()
+    if command == "fps" or command.startswith("fps_"):
+        parsed = _parse_fps_command(command, body)
+        if parsed is None:
+            raise HTTPException(
+                status_code=400,
+                detail="FPS 는 " + ", ".join(str(v) for v in FPS_CHOICES) + " 중 하나여야 합니다.",
+            )
+        command = parsed
+    elif command not in ALLOWED_COMMANDS:
         raise HTTPException(status_code=400, detail="알 수 없는 명령입니다.")
     with _state.lock:
-        _state.commands.append(command)
-        queued = len(_state.commands)
-    logger.info("CCTV 명령 대기열 추가: %s", command)
-    return {"ok": True, "command": command, "queued": queued}
+        target = _state.pick(device or body.get("device"))
+        if target is None:
+            # 아직 기기가 안 붙었어도 명령을 쌓아 둔다(첫 기기가 등록되면 넘겨 받는다).
+            target = _state.ensure("default")
+        target.commands.append(command)
+        queued = len(target.commands)
+        target_key = target.key
+    logger.info("CCTV 명령 대기열 추가(%s): %s", target_key, command)
+    return {"ok": True, "command": command, "queued": queued, "device": target_key}
+
+
+def _device_summary(device: _Device) -> dict:
+    """기기 한 대의 상태(목록·상태 응답 공용)."""
+    with _state.lock:
+        camera = dict(device.camera)
+        camera_seen = device.camera_seen
+        frame_at = device.frame_at
+        frame_seq = device.frame_seq
+        streams = device.viewer_streams
+        frames = device.frames_from_camera
+    return {
+        "device": device.key,
+        "device_id": device.device_id,
+        "device_name": camera.get("device_name") or device.key,
+        "camera_online": device.online(),
+        "online": device.online(),
+        "streaming_wanted": _viewer_active(device),
+        "viewer_streams": streams,
+        "battery": camera.get("battery"),
+        "charging": camera.get("charging"),
+        "camera": camera.get("camera"),
+        "flash": camera.get("flash"),
+        "quality": camera.get("quality"),
+        "fps": camera.get("fps"),
+        "app_version": camera.get("app_version"),
+        "model": camera.get("model"),
+        "android": camera.get("android"),
+        "sdk": camera.get("sdk"),
+        "engine": camera.get("engine"),
+        "screen_on": camera.get("screen_on"),
+        "last_seen_sec_ago": round(_now() - camera_seen) if camera_seen else None,
+        "last_frame_sec_ago": round(_now() - frame_at) if frame_at else None,
+        "frame_seq": frame_seq,
+        "frames_from_camera": frames,
+    }
 
 
 @router.post("/api/cctv/settings")
@@ -597,22 +818,38 @@ async def cctv_settings(request: Request):
 
 
 # --- 카메라(폰) 쪽 -----------------------------------------------------------
+def _body_device(body: dict, header_id: Optional[str], header_name: Optional[str]) -> tuple[str, str]:
+    """폰이 보낸 본문·헤더에서 (device_id, device_name) 을 꺼낸다."""
+    device_id = str(body.get("device_id") or header_id or "").strip()
+    device_name = str(body.get("device_name") or header_name or "").strip()
+    return device_id, device_name
+
+
 @router.post("/api/cctv/camera/heartbeat")
 async def cctv_camera_heartbeat(
     request: Request,
     x_cctv_token: Optional[str] = Header(default=None, alias="X-CCTV-Token"),
     legacy_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
+    x_cctv_device_id: Optional[str] = Header(default=None, alias="X-CCTV-Device-Id"),
+    x_cctv_device_name: Optional[str] = Header(default=None, alias="X-CCTV-Device-Name"),
 ):
-    """폰이 3~5초마다 보내는 상태. streaming_wanted 와 제어 명령을 돌려준다."""
+    """폰이 3~5초마다 보내는 상태. 그 기기의 streaming_wanted 와 제어 명령을 돌려준다."""
     require_camera(x_cctv_token, legacy_token)
     try:
         body = await request.json()
     except ValueError:
         body = {}
     body = body if isinstance(body, dict) else {}
+    device_id, device_name = _body_device(body, x_cctv_device_id, x_cctv_device_name)
+    key = _camera_device_key(device_id, device_name)
     with _state.lock:
-        _state.camera_seen = _now()
-        for key in (
+        if not device_id and not device_name:
+            # 예전 앱(기기 정보 없이 보냄)은 지금 기본 기기의 하트비트로 본다.
+            device = _state.pick(None) or _state.ensure("default")
+        else:
+            device = _state.ensure(key, device_id)
+        device.camera_seen = _now()
+        for field in (
             "battery",
             "charging",
             "camera",
@@ -626,25 +863,36 @@ async def cctv_camera_heartbeat(
             "android",
             "sdk",
             "engine",
+            "fps_setting",
         ):
-            if key in body:
-                _state.camera[key] = body[key]
+            if field in body:
+                device.camera[field] = body[field]
+        if device_name:
+            device.camera["device_name"] = device_name
+        if device_id:
+            device.camera["device_id"] = device_id
         if isinstance(body.get("logs"), list):
             _append_logs(
                 body["logs"],
-                device=body.get("device_name") or _state.camera.get("device_name") or "",
-                version=body.get("app_version") or _state.camera.get("app_version") or "",
+                device=device_name or device.name,
+                version=str(body.get("app_version") or device.camera.get("app_version") or ""),
                 source="heartbeat",
+                device_key=device.key,
             )
-        wanted = _viewer_active()
-        commands = _state.commands
-        _state.commands = []
+        wanted = _viewer_active(device)
+        commands = device.commands
+        device.commands = []
+        resolved_name = device.name
+        resolved_key = device.key
     return {
         "ok": True,
+        "device": resolved_key,
+        "device_name": resolved_name,
         "streaming_wanted": wanted,
         "commands": commands,
         "viewer_active": wanted,
         "heartbeat_sec": int(getattr(config, "CCTV_HEARTBEAT_SEC", 4) or 4),
+        "fps_choices": list(FPS_CHOICES),
         "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -652,8 +900,11 @@ async def cctv_camera_heartbeat(
 @router.post("/api/cctv/camera/frame")
 async def cctv_camera_frame(
     request: Request,
+    device: Optional[str] = None,
     x_cctv_token: Optional[str] = Header(default=None, alias="X-CCTV-Token"),
     legacy_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
+    x_cctv_device_id: Optional[str] = Header(default=None, alias="X-CCTV-Device-Id"),
+    x_cctv_device_name: Optional[str] = Header(default=None, alias="X-CCTV-Device-Name"),
 ):
     """폰이 JPEG 한 장을 올린다(raw image/jpeg 또는 multipart 'file')."""
     require_camera(x_cctv_token, legacy_token)
@@ -665,22 +916,36 @@ async def cctv_camera_frame(
         if upload is None or not hasattr(upload, "read"):
             raise HTTPException(status_code=400, detail="file 필드가 필요합니다.")
         data = await upload.read()
+        sent_name = str(form.get("device_name") or "")
+        sent_id = str(form.get("device_id") or "")
     else:
         data = await request.body()
+        sent_name = ""
+        sent_id = ""
     if not data:
         raise HTTPException(status_code=400, detail="빈 프레임입니다.")
     if len(data) > limit:
         raise HTTPException(status_code=413, detail="프레임이 너무 큽니다.")
     if not data.startswith(b"\xff\xd8"):
         raise HTTPException(status_code=400, detail="JPEG 파일이 아닙니다.")
+    device_id = sent_id or (x_cctv_device_id or "")
+    device_name = sent_name or (x_cctv_device_name or "")
     with _state.lock:
-        _state.frame = data
-        _state.frame_seq += 1
-        _state.frame_at = _now()
-        _state.frames_from_camera += 1
-        _state.camera_seen = _now()
-        wanted = _viewer_active()
-    return {"ok": True, "streaming_wanted": wanted, "bytes": len(data)}
+        if device_id or device_name:
+            target = _state.ensure(_camera_device_key(device_id, device_name), device_id)
+        else:
+            # 예전 앱(기기 정보 없이 올림)은 지금 기본 기기 슬롯에 넣는다.
+            target = _state.pick(device or None) or _state.ensure("default")
+        target.frame = data
+        target.frame_seq += 1
+        target.frame_at = _now()
+        target.frames_from_camera += 1
+        target.camera_seen = _now()
+        if device_name:
+            target.camera["device_name"] = device_name
+        wanted = _viewer_active(target)
+        target_key = target.key
+    return {"ok": True, "streaming_wanted": wanted, "bytes": len(data), "device": target_key}
 
 
 @router.post("/api/cctv/camera/logs")
@@ -688,6 +953,8 @@ async def cctv_camera_logs(
     request: Request,
     x_cctv_token: Optional[str] = Header(default=None, alias="X-CCTV-Token"),
     legacy_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
+    x_cctv_device_id: Optional[str] = Header(default=None, alias="X-CCTV-Device-Id"),
+    x_cctv_device_name: Optional[str] = Header(default=None, alias="X-CCTV-Device-Name"),
 ):
     """폰이 진단 로그(오류·스택트레이스)를 올린다.
 
@@ -701,40 +968,48 @@ async def cctv_camera_logs(
         body = None
     if isinstance(body, list):
         lines = body
-        device = ""
+        device = x_cctv_device_name or ""
         version = ""
         source = "push"
+        device_id = x_cctv_device_id or ""
     elif isinstance(body, dict):
         lines = body.get("logs", body.get("lines"))
         if lines is None:
             lines = []
         if not isinstance(lines, list):
             raise HTTPException(status_code=400, detail="logs 는 줄 배열이어야 합니다.")
-        device = str(body.get("device_name") or "")
+        device = str(body.get("device_name") or x_cctv_device_name or "")
         version = str(body.get("app_version") or "")
         source = str(body.get("source") or "push")
+        device_id = str(body.get("device_id") or x_cctv_device_id or "")
     else:
         raise HTTPException(status_code=400, detail="로그 본문이 필요합니다.")
-    accepted = _append_logs(lines, device=device, version=version, source=source)
+    key = _camera_device_key(device_id, device) if (device_id or device) else ""
+    accepted = _append_logs(lines, device=device, version=version, source=source, device_key=key)
     with _state.lock:
         total = len(_state.logs)
     if accepted:
         logger.info("CCTV 로그 %s줄 도착(%s), 보관 중 %s줄", accepted, device or "?", total)
-    return {"ok": True, "received": accepted, "total": total, "keep": LOG_MAX_LINES}
+    return {"ok": True, "received": accepted, "total": total, "keep": LOG_MAX_LINES, "device": key}
 
 
 @router.get("/api/cctv/logs")
-def cctv_logs(request: Request, limit: int = LOG_MAX_LINES):
-    """뷰어 로그인 상태에서 카메라 진단 로그를 읽는다(최근 것부터가 아니라 옛것→새것 순)."""
+def cctv_logs(request: Request, limit: int = LOG_MAX_LINES, device: Optional[str] = None):
+    """뷰어 로그인 상태에서 진단 로그를 읽는다(옛것 → 새것 순). device 로 거를 수 있다."""
     require_viewer(request)
     limit = max(1, min(int(limit or LOG_MAX_LINES), LOG_MAX_LINES))
+    wanted = normalize_device_key(device) if device else ""
     with _state.lock:
-        logs = list(_state.logs[-limit:])
+        items = _state.logs
+        if wanted:
+            items = [item for item in items if item.get("device_key") == wanted]
+        logs = list(items[-limit:])
     return {
         "ok": True,
         "count": len(logs),
         "limit": limit,
         "order": "oldest_first",
+        "device": wanted or None,
         "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "logs": logs,
     }
