@@ -749,3 +749,24 @@ def test_stream_selects_device(client):
     devices = {item["device"]: item for item in client.get("/api/cctv/devices").json()["devices"]}
     assert devices["dev-b"]["streaming_wanted"] is True
     assert devices["dev-a"]["streaming_wanted"] is False
+
+
+def test_legacy_name_slot_is_merged_when_device_id_appears(client):
+    """v1.0.3(이름으로만 등록) → v1.0.4(device_id) 로 올려도 같은 폰이 두 탭으로 보이지 않는다."""
+    _password_from_config()
+    _login(client)
+    # v1.0.3: device_id 없이 이름만
+    _heartbeat(client, "", "LENOVO TB371FC", battery=90)
+    assert client.get("/api/cctv/devices").json()["count"] == 1
+    client.post("/api/cctv/command", json={"command": "flash_on"})
+
+    # v1.0.4: 같은 이름 + 고유 ID — 옛 자리를 합치고 명령도 넘겨받는다
+    response = _heartbeat(client, "8f1c-uuid", "LENOVO TB371FC", battery=91)
+    assert response.status_code == 200
+    # 합치면서 옛 자리에 쌓여 있던 명령도 그 하트비트로 전달된다
+    assert response.json()["commands"] == ["flash_on"]
+    data = client.get("/api/cctv/devices").json()
+    assert data["count"] == 1, data
+    assert data["devices"][0]["device"] == "8f1c-uuid"
+    assert data["devices"][0]["battery"] == 91
+    assert _heartbeat(client, "8f1c-uuid", "LENOVO TB371FC").json()["commands"] == []

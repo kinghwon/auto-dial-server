@@ -262,7 +262,7 @@ class _Registry:
         with self.lock:
             return self.devices.get(key)
 
-    def ensure(self, key: str, device_id: str = "") -> _Device:
+    def ensure(self, key: str, device_id: str = "", device_name: str = "") -> _Device:
         with self.lock:
             device = self.devices.get(key)
             if device is None:
@@ -274,6 +274,23 @@ class _Registry:
                     device.commands = list(placeholder.commands)
                     device.viewer_last = placeholder.viewer_last
                     self.devices.pop("default", None)
+                # v1.0.3 처럼 기기 이름으로만 등록되던 옛 자리를 새 기기(device_id)로 합친다.
+                # (업데이트 후 같은 폰이 온라인·오프라인 두 탭으로 보이지 않게)
+                legacy_key = normalize_device_key(device_name)
+                if legacy_key and legacy_key != key:
+                    legacy = self.devices.get(legacy_key)
+                    if legacy is not None and not str(legacy.camera.get("device_id") or ""):
+                        device.frame = legacy.frame or device.frame
+                        device.frame_seq = max(device.frame_seq, legacy.frame_seq)
+                        device.frame_at = legacy.frame_at or device.frame_at
+                        device.camera.update(legacy.camera)
+                        device.camera_seen = legacy.camera_seen
+                        device.commands = list(legacy.commands) + list(device.commands)
+                        device.viewer_last = max(device.viewer_last, legacy.viewer_last)
+                        device.viewer_streams = legacy.viewer_streams
+                        device.frames_from_camera = legacy.frames_from_camera
+                        self.devices.pop(legacy_key, None)
+                        logger.info("CCTV 옛 기기 자리(%s)를 새 기기(%s)로 합쳤습니다.", legacy_key, key)
                 self.devices[key] = device
                 logger.info("CCTV 기기 등록: %s (%s)", key, device.name)
             elif device_id and not device.device_id:
@@ -847,7 +864,7 @@ async def cctv_camera_heartbeat(
             # 예전 앱(기기 정보 없이 보냄)은 지금 기본 기기의 하트비트로 본다.
             device = _state.pick(None) or _state.ensure("default")
         else:
-            device = _state.ensure(key, device_id)
+            device = _state.ensure(key, device_id, device_name)
         device.camera_seen = _now()
         for field in (
             "battery",
@@ -932,7 +949,7 @@ async def cctv_camera_frame(
     device_name = sent_name or (x_cctv_device_name or "")
     with _state.lock:
         if device_id or device_name:
-            target = _state.ensure(_camera_device_key(device_id, device_name), device_id)
+            target = _state.ensure(_camera_device_key(device_id, device_name), device_id, device_name)
         else:
             # 예전 앱(기기 정보 없이 올림)은 지금 기본 기기 슬롯에 넣는다.
             target = _state.pick(device or None) or _state.ensure("default")
