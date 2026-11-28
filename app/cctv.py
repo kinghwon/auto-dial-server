@@ -47,6 +47,12 @@ ALLOWED_COMMANDS = {
 }
 LOGIN_MAX_FAILS = 5
 LOGIN_LOCK_SEC = 10 * 60
+# 앱이 보내는 진단 로그: 디스크에는 쓰지 않고 메모리에 최근 200줄만 들고 있는다.
+LOG_MAX_LINES = 200
+# 한 번의 요청에서 받아 주는 로그 줄 수 상한(앱이 밀린 로그를 몰아 보낼 때 대비)
+LOG_MAX_LINES_PER_POST = 200
+# 로그 한 줄(스택트레이스는 여러 줄) 최대 길이
+LOG_MAX_CHARS = 4000
 
 
 def _now() -> float:
@@ -174,6 +180,7 @@ class _State:
         self.viewer_last = 0.0
         self.viewer_streams = 0
         self.frames_from_camera = 0
+        self.logs: list[dict] = []
 
     def reset(self) -> None:
         with self.lock:
@@ -186,6 +193,7 @@ class _State:
             self.viewer_last = 0.0
             self.viewer_streams = 0
             self.frames_from_camera = 0
+            self.logs = []
 
 
 _state = _State()
@@ -209,6 +217,38 @@ def _viewer_active() -> bool:
 def _touch_viewer() -> None:
     with _state.lock:
         _state.viewer_last = _now()
+
+
+def _append_logs(lines: list, device: str = "", version: str = "", source: str = "") -> int:
+    """폰이 보낸 로그 줄을 메모리에 쌓는다(최근 LOG_MAX_LINES 개만 유지).
+
+    디스크에는 아무것도 쓰지 않는다. 각 항목은 서버가 받은 시각과 함께 남겨
+    스택트레이스가 여러 줄이어도 한 덩어리로 읽을 수 있게 한다.
+    """
+    if not isinstance(lines, list):
+        return 0
+    accepted = 0
+    with _state.lock:
+        for raw in lines[:LOG_MAX_LINES_PER_POST]:
+            text = str(raw if raw is not None else "")
+            if not text.strip():
+                continue
+            if len(text) > LOG_MAX_CHARS:
+                text = text[:LOG_MAX_CHARS] + " …(잘림)"
+            _state.logs.append(
+                {
+                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "at_epoch": round(_now(), 3),
+                    "device": str(device or "")[:80],
+                    "version": str(version or "")[:32],
+                    "source": str(source or "")[:16],
+                    "line": text,
+                }
+            )
+            accepted += 1
+        if len(_state.logs) > LOG_MAX_LINES:
+            del _state.logs[: len(_state.logs) - LOG_MAX_LINES]
+    return accepted
 
 
 # --------------------------------------------------------------------------
@@ -427,11 +467,16 @@ def cctv_status(request: Request):
         "quality": camera.get("quality"),
         "device_name": camera.get("device_name"),
         "app_version": camera.get("app_version"),
+        "model": camera.get("model"),
+        "android": camera.get("android"),
+        "sdk": camera.get("sdk"),
+        "engine": camera.get("engine"),
         "screen_on": camera.get("screen_on"),
         "fps": camera.get("fps"),
         "last_seen_sec_ago": round(_now() - camera_seen) if camera_seen else None,
         "last_frame_sec_ago": round(_now() - frame_at) if frame_at else None,
         "frame_seq": frame_seq,
+        "log_lines": len(_state.logs),
         "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "camera_token_hint": data["camera_token"][:4] + "…" + data["camera_token"][-4:],
         "username": data.get("username", "admin"),
@@ -571,9 +616,20 @@ async def cctv_camera_heartbeat(
             "app_version",
             "screen_on",
             "fps",
+            "model",
+            "android",
+            "sdk",
+            "engine",
         ):
             if key in body:
                 _state.camera[key] = body[key]
+        if isinstance(body.get("logs"), list):
+            _append_logs(
+                body["logs"],
+                device=body.get("device_name") or _state.camera.get("device_name") or "",
+                version=body.get("app_version") or _state.camera.get("app_version") or "",
+                source="heartbeat",
+            )
         wanted = _viewer_active()
         commands = _state.commands
         _state.commands = []
@@ -619,6 +675,63 @@ async def cctv_camera_frame(
         _state.camera_seen = _now()
         wanted = _viewer_active()
     return {"ok": True, "streaming_wanted": wanted, "bytes": len(data)}
+
+
+@router.post("/api/cctv/camera/logs")
+async def cctv_camera_logs(
+    request: Request,
+    x_cctv_token: Optional[str] = Header(default=None, alias="X-CCTV-Token"),
+    legacy_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
+):
+    """폰이 진단 로그(오류·스택트레이스)를 올린다.
+
+    본문은 {"logs": [...], "device_name": ..., "app_version": ...} 또는 줄 배열 그대로다.
+    메모리에 최근 LOG_MAX_LINES 줄만 남기고 디스크에는 저장하지 않는다.
+    """
+    require_camera(x_cctv_token, legacy_token)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if isinstance(body, list):
+        lines = body
+        device = ""
+        version = ""
+        source = "push"
+    elif isinstance(body, dict):
+        lines = body.get("logs", body.get("lines"))
+        if lines is None:
+            lines = []
+        if not isinstance(lines, list):
+            raise HTTPException(status_code=400, detail="logs 는 줄 배열이어야 합니다.")
+        device = str(body.get("device_name") or "")
+        version = str(body.get("app_version") or "")
+        source = str(body.get("source") or "push")
+    else:
+        raise HTTPException(status_code=400, detail="로그 본문이 필요합니다.")
+    accepted = _append_logs(lines, device=device, version=version, source=source)
+    with _state.lock:
+        total = len(_state.logs)
+    if accepted:
+        logger.info("CCTV 로그 %s줄 도착(%s), 보관 중 %s줄", accepted, device or "?", total)
+    return {"ok": True, "received": accepted, "total": total, "keep": LOG_MAX_LINES}
+
+
+@router.get("/api/cctv/logs")
+def cctv_logs(request: Request, limit: int = LOG_MAX_LINES):
+    """뷰어 로그인 상태에서 카메라 진단 로그를 읽는다(최근 것부터가 아니라 옛것→새것 순)."""
+    require_viewer(request)
+    limit = max(1, min(int(limit or LOG_MAX_LINES), LOG_MAX_LINES))
+    with _state.lock:
+        logs = list(_state.logs[-limit:])
+    return {
+        "ok": True,
+        "count": len(logs),
+        "limit": limit,
+        "order": "oldest_first",
+        "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "logs": logs,
+    }
 
 
 @router.get("/api/cctv/camera/config")

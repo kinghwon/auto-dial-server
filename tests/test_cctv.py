@@ -344,3 +344,97 @@ def test_cctv_appears_in_apps_list(client, tmp_path):
     assert apps["cctv"]["display_name"] == "초경량 CCTV"
     page = client.get("/apps")
     assert "초경량 CCTV" in page.text
+
+
+# --- 진단 로그 (앱 오류·스택트레이스 서버 보관) --------------------------------
+def test_camera_logs_need_camera_token(client):
+    cctv.load_config()
+    body = {"logs": ["hello"]}
+    assert client.post("/api/cctv/camera/logs", json=body).status_code == 401
+    assert client.post("/api/cctv/camera/logs", json=body, headers={"X-CCTV-Token": "nope"}).status_code == 401
+    ok = client.post("/api/cctv/camera/logs", json=body, headers=_camera_headers())
+    assert ok.status_code == 200
+    assert ok.json()["received"] == 1
+
+
+def test_viewer_logs_need_login(client):
+    _password_from_config()
+    assert client.get("/api/cctv/logs").status_code == 401
+    _login(client)
+    response = client.get("/api/cctv/logs")
+    assert response.status_code == 200
+    assert response.json()["logs"] == []
+
+
+def test_camera_logs_are_kept_newest_two_hundred(client):
+    cctv.load_config()
+    lines = ["줄 {}".format(i) for i in range(250)]
+    response = client.post(
+        "/api/cctv/camera/logs",
+        json={"logs": lines, "device_name": "TB371FC", "app_version": "1.0.2"},
+        headers=_camera_headers(),
+    )
+    assert response.status_code == 200
+    assert response.json()["received"] == 200  # 한 번에 받는 상한
+    assert response.json()["total"] == 200
+
+    _password_from_config()
+    _login(client)
+    logs = client.get("/api/cctv/logs").json()["logs"]
+    assert len(logs) == 200
+    assert logs[-1]["line"] == "줄 199"
+    assert logs[0]["line"] == "줄 0"
+    assert logs[-1]["device"] == "TB371FC"
+    assert logs[-1]["version"] == "1.0.2"
+    assert logs[-1]["source"] == "push"
+    assert logs[-1]["at"]
+
+    # 더 보내면 오래된 것부터 밀려난다
+    client.post("/api/cctv/camera/logs", json={"logs": ["새 줄"]}, headers=_camera_headers())
+    logs = client.get("/api/cctv/logs").json()["logs"]
+    assert len(logs) == 200
+    assert logs[-1]["line"] == "새 줄"
+    assert logs[0]["line"] == "줄 1"
+    assert client.get("/api/cctv/logs?limit=5").json()["logs"][-1]["line"] == "새 줄"
+    assert len(client.get("/api/cctv/logs?limit=5").json()["logs"]) == 5
+
+
+def test_heartbeat_carries_logs(client):
+    _password_from_config()
+    _login(client)
+    stack = "java.lang.RuntimeException: Fail to connect to camera service\n\tat android.hardware.Camera.native_setup(Native Method)"
+    response = client.post(
+        "/api/cctv/camera/heartbeat",
+        json={
+            "battery": 60,
+            "device_name": "TB371FC",
+            "app_version": "1.0.2",
+            "logs": ["[카메라 열기 실패] " + stack],
+        },
+        headers=_camera_headers(),
+    )
+    assert response.status_code == 200
+    logs = client.get("/api/cctv/logs").json()["logs"]
+    assert len(logs) == 1
+    assert "RuntimeException" in logs[0]["line"]
+    assert "\n" in logs[0]["line"]  # 스택트레이스는 한 덩어리로 보존
+    assert logs[0]["source"] == "heartbeat"
+    assert logs[0]["device"] == "TB371FC"
+    assert client.get("/api/cctv/status").json()["log_lines"] == 1
+
+
+def test_camera_logs_validate_payload_and_trim(client):
+    cctv.load_config()
+    assert client.post("/api/cctv/camera/logs", json=["a", "b"], headers=_camera_headers()).json()["received"] == 2
+    bad = client.post("/api/cctv/camera/logs", json={"logs": "한 줄"}, headers=_camera_headers())
+    assert bad.status_code == 400
+    empty = client.post("/api/cctv/camera/logs", json={}, headers=_camera_headers())
+    assert empty.status_code == 200
+    long_line = "x" * 5000
+    client.post("/api/cctv/camera/logs", json={"logs": [long_line, "   "]}, headers=_camera_headers())
+    _password_from_config()
+    _login(client)
+    logs = client.get("/api/cctv/logs").json()["logs"]
+    assert len(logs) == 3  # 빈 줄은 버린다
+    assert len(logs[-1]["line"]) < 5000
+    assert logs[-1]["line"].endswith("(잘림)")
