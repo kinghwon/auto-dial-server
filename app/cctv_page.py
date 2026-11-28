@@ -82,6 +82,7 @@ VIEWER_HTML = """<!DOCTYPE html>
   header {
     display: flex; align-items: center; gap: 10px; padding: 12px 14px;
     background: #12151c; border-bottom: 1px solid #212734; flex-wrap: wrap;
+    flex: 0 0 auto;            /* 본문이 길어도 헤더·탭 줄이 찌그러지지 않게 */
   }
   header h1 { font-size: 15px; margin: 0; font-weight: 700; letter-spacing: -.3px; white-space: nowrap; }
   .pill {
@@ -102,7 +103,7 @@ VIEWER_HTML = """<!DOCTYPE html>
   /* 기기 선택 탭 */
   .tabs {
     display: flex; gap: 8px; padding: 10px 12px 0; overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
+    -webkit-overflow-scrolling: touch; flex: 0 0 auto; min-height: 40px;
   }
   .tabs::-webkit-scrollbar { display: none; }
   .tab {
@@ -113,7 +114,7 @@ VIEWER_HTML = """<!DOCTYPE html>
   .tab.on { background: #1b2b4d; border-color: #3b6bd6; color: #eaf1ff; }
   .tab.gridbtn { border-style: dashed; }
 
-  main { flex: 1; display: flex; flex-direction: column; gap: 10px; padding: 10px 12px 18px; }
+  main { flex: 1 0 auto; display: flex; flex-direction: column; gap: 10px; padding: 10px 12px 18px; }
   .stage {
     position: relative; width: 100%; background: #000; border-radius: 14px; overflow: hidden;
     border: 1px solid #1c2230; min-height: 220px;
@@ -319,19 +320,15 @@ VIEWER_HTML = """<!DOCTYPE html>
         + (d.fps ? ' · ' + esc(d.fps) + 'fps' : '')
         + '</button>';
     }
-    if (devices.length > 1) {
-      html += '<button type="button" class="tab gridbtn' + (gridMode ? ' on' : '') + '" id="tabGrid">▦ 한눈에 보기</button>';
-    }
+    // 헤더의 '한눈에 보기' 버튼은 기기가 2대 이상일 때만 보여 준다.
+    $('btnGrid').style.display = devices.length > 1 ? '' : 'none';
     box.innerHTML = html;
     Array.prototype.forEach.call(box.querySelectorAll('.tab'), function (btn) {
       btn.addEventListener('click', function () {
         var key = btn.getAttribute('data-device');
-        if (key) {
-          setGrid(false);
-          selectDevice(key);
-        } else {
-          setGrid(!gridMode);
-        }
+        if (!key) return;
+        setGrid(false);
+        selectDevice(key);
       });
     });
     $('btnGrid').className = 'linkbtn' + (gridMode ? ' on' : '');
