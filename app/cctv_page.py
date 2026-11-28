@@ -308,8 +308,21 @@ VIEWER_HTML = """<!DOCTYPE html>
     return '/api/cctv/stream' + (key ? ('?device=' + encodeURIComponent(key) + '&t=') : '?t=') + Date.now();
   }
 
+  var tabsSignature = '';
+
   function renderTabs() {
     var box = $('devTabs');
+    // 3초마다 새로 그리면 탭을 누르려는 순간 DOM 이 바뀐다 — 보이는 내용이 그대로면 다시 그리지 않는다.
+    var signature = devices.map(function (d) {
+      return [d.device, d.online ? 1 : 0, deviceLabel(d), d.fps || 0].join(':');
+    }).join('|') + '#' + selected + '#' + (gridMode ? 1 : 0);
+    if (signature === tabsSignature && box.childNodes.length) {
+      $('btnGrid').style.display = devices.length > 1 ? '' : 'none';
+      $('btnGrid').className = 'linkbtn' + (gridMode ? ' on' : '');
+      $('btnGrid').textContent = gridMode ? '▣ 한 대만 보기' : '▦ 한눈에 보기';
+      return;
+    }
+    tabsSignature = signature;
     var html = '';
     for (var i = 0; i < devices.length; i++) {
       var d = devices[i];
