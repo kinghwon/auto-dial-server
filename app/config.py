@@ -46,6 +46,17 @@ MAX_MACRO_BACKUPS = int(os.getenv("MAX_MACRO_BACKUPS", "200"))
 # 업로드 허용 APK 최대 크기(바이트)
 MAX_APK_BYTES = int(os.getenv("MAX_APK_BYTES", str(300 * 1024 * 1024)))
 
+# 초경량 CCTV: 비밀번호·카메라 토큰·세션 키를 보관하는 설정 파일
+CCTV_CONFIG_PATH = Path(os.getenv("CCTV_CONFIG_PATH") or (DATA_DIR / "cctv_config.json"))
+# 뷰어가 이 시간(초) 안에 프레임을 요청한 적이 있어야 폰에 전송을 요청한다
+CCTV_VIEWER_ACTIVE_SEC = int(os.getenv("CCTV_VIEWER_ACTIVE_SEC", "10"))
+# 뷰어 로그인 세션 유지 시간(시간)
+CCTV_SESSION_HOURS = int(os.getenv("CCTV_SESSION_HOURS", "72"))
+# 카메라가 올리는 JPEG 한 장의 최대 크기(바이트)
+CCTV_MAX_FRAME_BYTES = int(os.getenv("CCTV_MAX_FRAME_BYTES", str(4 * 1024 * 1024)))
+# 폰 앱에 알려 주는 하트비트 주기(초)
+CCTV_HEARTBEAT_SEC = int(os.getenv("CCTV_HEARTBEAT_SEC", "4"))
+
 TZ_NAME = os.getenv("APP_TZ", "Asia/Seoul")
 TZ = ZoneInfo(TZ_NAME)
 

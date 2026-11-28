@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import apps_page, config, db, macro_store, scheduler
+from . import apps_page, cctv, config, db, macro_store, scheduler
 from .db import json_list
 from .models import (
     ArchiveRestore,
@@ -2832,13 +2832,15 @@ def app_apk_latest(app_id: str, request: Request):
 APP_DISPLAY_NAMES = {
     "auto-dialer": "자동 발신",
     "auto-touch": "자동 터치",
+    "cctv": "초경량 CCTV",
 }
 APP_DESCRIPTIONS = {
     "auto-dialer": "서버가 예약한 전화·문자를 이 폰에서 자동으로 실행합니다.",
     "auto-touch": "화면 터치를 기록해 반복 실행하는 매크로 앱입니다.",
+    "cctv": "안드로이드 4.4 폰을 CCTV 카메라로 만들어 서버를 통해 밖에서 봅니다.",
 }
 # 목록에서 먼저 보여 줄 순서(그 밖의 앱은 app_id 알파벳순으로 뒤에 붙는다)
-APP_LIST_ORDER = ("auto-dialer", "auto-touch")
+APP_LIST_ORDER = ("auto-dialer", "auto-touch", "cctv")
 
 
 def _app_apk_available(folder: Path, meta: dict) -> bool:
@@ -3102,6 +3104,7 @@ def app_macros_delete(app_id: str, backup_id: str):
     return {"ok": True, "app_id": cleaned, "deleted": backup_id.strip()}
 
 
+app.include_router(cctv.router)
 app.include_router(apps)
 app.include_router(api)
 if STATIC_DIR.exists():
