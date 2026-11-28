@@ -205,6 +205,7 @@ def render_apps_page(
 
     <div class="actions">
       <button type="button" onclick="location.reload()">🔄 새로고침</button>
+      <a href="/cctv">📷 CCTV 뷰어 열기</a>
       <a href="{html.escape(admin_url, quote=True)}">관리 대시보드</a>
     </div>
     <div class="foot">APK 는 서버에서 직접 전송됩니다 · 내려받은 파일의 SHA-256 은 각 앱의 업데이트 정보와 같습니다</div>
