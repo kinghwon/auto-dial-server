@@ -73,6 +73,35 @@ def test_viewer_page_requires_login(client):
     assert response.status_code == 401
     assert "비밀번호" in response.text
     assert "/api/cctv/stream" not in response.text
+    assert "btnRotate" not in response.text
+
+
+def test_viewer_page_has_rotation_button_and_remembers_it(client):
+    """뷰어에 90도씩 회전하는 버튼이 있고, 각도를 localStorage 에 기억한다."""
+    _password_from_config()
+    _login(client)
+    response = client.get("/cctv")
+    assert response.status_code == 200
+    html = response.text
+    assert 'id="btnRotate"' in html
+    assert "회전" in html
+    assert "cctv-rotation" in html           # localStorage 키
+    assert "localStorage" in html
+    assert "rotateBlob" in html             # 스냅샷도 회전해서 저장
+    assert "layoutVideo" in html            # 90°/270° 에서 크기 재배치
+
+
+def test_viewer_reconnects_stream_when_tab_comes_back(client):
+    """모바일 브라우저가 백그라운드에서 스트림을 끊어도 돌아오면 다시 붙는다."""
+    _password_from_config()
+    _login(client)
+    html = client.get("/cctv").text
+    assert "visibilitychange" in html
+    assert "pageshow" in html
+    assert "connectStream" in html
+    assert "pauseStream" in html
+    assert "/api/cctv/stream?t=" in html
+    assert "frame_seq" in html            # 프레임이 멈춘 것을 상태로 확인
 
 
 def test_viewer_apis_require_login(client):

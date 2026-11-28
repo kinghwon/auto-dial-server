@@ -102,7 +102,8 @@ VIEWER_HTML = """<!DOCTYPE html>
     border: 1px solid #1c2230; min-height: 220px;
     display: flex; align-items: center; justify-content: center;
   }
-  .stage img { width: 100%; height: auto; display: block; }
+  /* 회전(90°/270°)에서도 잘리지 않게 JS 가 폭·높이(px)와 stage 높이를 맞춰 준다. */
+  .stage img { display: block; transform-origin: center center; transition: transform .18s ease; }
   .stage .hint {
     position: absolute; inset: 0; display: flex; flex-direction: column; gap: 8px;
     align-items: center; justify-content: center; text-align: center; padding: 20px;
@@ -139,7 +140,7 @@ VIEWER_HTML = """<!DOCTYPE html>
   .msg.err { color: #ff9aa8; }
   details summary { cursor: pointer; font-size: 13px; color: #cfd6e2; font-weight: 600; }
   body.fullscreen .stage { position: fixed; inset: 0; z-index: 50; border-radius: 0; border: 0; }
-  body.fullscreen .stage img { height: 100%; object-fit: contain; }
+  body.fullscreen .stage img { height: auto; object-fit: contain; }
   body.fullscreen .stage .hint { background: #000; }
 </style>
 </head>
@@ -166,8 +167,7 @@ VIEWER_HTML = """<!DOCTYPE html>
   <div class="controls">
     <button data-cmd="front" id="btnFront">🤳 전면</button>
     <button data-cmd="back" id="btnBack">📷 후면</button>
-    <button data-cmd="flash_on" id="btnFlashOn">🔦 플래시 켜기</button>
-    <button data-cmd="flash_off" id="btnFlashOff">🌙 플래시 끄기</button>
+    <button id="btnFlash" title="플래시 켜기/끄기">🔦 플래시 꺼짐</button>
     <button id="btnSnap">💾 스냅샷</button>
     <button id="btnFull">⛶ 크게 보기</button>
   </div>
@@ -175,6 +175,7 @@ VIEWER_HTML = """<!DOCTYPE html>
     <button data-cmd="quality_low" id="btnQLow">화질 낮음</button>
     <button data-cmd="quality_mid" id="btnQMid">화질 중간</button>
     <button data-cmd="quality_high" id="btnQHigh">화질 높음</button>
+    <button id="btnRotate" title="누를 때마다 시계 방향으로 90도 회전">🔄 회전 0°</button>
   </div>
 
   <div class="row card">
@@ -212,12 +213,151 @@ VIEWER_HTML = """<!DOCTYPE html>
   var streamImg = $('video'), hint = $('hint');
   var qualityText = { low: '낮음', mid: '중간', high: '높음' };
 
-  function restartStream() {
-    streamImg.src = '/api/cctv/stream?t=' + Date.now();
+  // ---- 스트림 자동 재연결 -------------------------------------------------
+  // 모바일 브라우저는 화면을 벗어나면 MJPEG 연결을 끊어 버린다. 돌아왔을 때
+  // 멈춘 화면이 남지 않도록 다시 붙이고, 안 보이는 동안에는 연결을 닫아
+  // 데이터·배터리를 아낀다.
+  var RECONNECT_COOLDOWN_MS = 1500;   // 너무 자주 새로 붙지 않게
+  var STALL_LIMIT_MS = 12000;         // 카메라는 켜졌는데 화면이 이만큼 안 바뀌면 다시 연결
+  var lastConnectAt = 0;
+  var lastFrameSeq = -1;
+  var lastFrameSeqAt = 0;
+  var streamPaused = false;
+  var wasHidden = false;
+
+  function streamUrl() {
+    return '/api/cctv/stream?t=' + Date.now();
   }
 
-  streamImg.addEventListener('load', function () {});
-  streamImg.addEventListener('error', function () { setTimeout(restartStream, 2500); });
+  function connectStream(force) {
+    if (streamPaused) return;
+    var now = Date.now();
+    if (!force && now - lastConnectAt < RECONNECT_COOLDOWN_MS) return;
+    lastConnectAt = now;
+    lastFrameSeqAt = now;
+    streamImg.src = streamUrl();
+  }
+
+  function pauseStream() {
+    streamPaused = true;
+    try { streamImg.removeAttribute('src'); } catch (e) {}
+  }
+
+  function resumeStream() {
+    streamPaused = false;
+    connectStream(true);
+    refresh();
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') {
+      wasHidden = true;
+      pauseStream();
+    } else if (wasHidden || streamPaused) {
+      wasHidden = false;
+      resumeStream();
+    }
+  });
+
+  window.addEventListener('focus', function () {
+    if (document.visibilityState !== 'hidden' && (wasHidden || streamPaused)) {
+      wasHidden = false;
+      resumeStream();
+    }
+  });
+
+  // 뒤로 가기로 되살아난 페이지(bfcache)에서는 끊긴 스트림이 그대로 남는다.
+  window.addEventListener('pageshow', function (event) {
+    if (document.visibilityState === 'hidden') return;
+    if (event && event.persisted) {
+      streamPaused = false;
+      connectStream(true);
+    } else {
+      connectStream(false);
+    }
+  });
+
+  // ---- 영상 회전: 0° → 90° → 180° → 270° (localStorage 에 기억) ----------
+  var ROT_KEY = 'cctv-rotation';
+  var rot = 0;
+  try {
+    var savedRot = parseInt(localStorage.getItem(ROT_KEY), 10);
+    if (!isNaN(savedRot) && savedRot % 90 === 0) rot = ((savedRot % 360) + 360) % 360;
+  } catch (e) { rot = 0; }
+  var ratioCache = 0;
+
+  function videoRatio() {
+    var w = streamImg.naturalWidth || 0, h = streamImg.naturalHeight || 0;
+    if (w > 0 && h > 0) return w / h;
+    return 4 / 3;   // 기본 화질(mid) 촬영 비율
+  }
+
+  function isFullscreen() { return document.body.classList.contains('fullscreen'); }
+
+  /** 회전 각도에 맞춰 영상 크기와 stage 높이를 다시 잡는다(90°/270° 에서도 안 잘리게). */
+  function layoutVideo() {
+    var stage = $('stage');
+    var full = isFullscreen();
+    var cw = stage.clientWidth || Math.max(240, window.innerWidth - 24);
+    var maxH = full
+      ? (stage.clientHeight || window.innerHeight)
+      : Math.max(200, Math.min(Math.round(window.innerHeight * 0.66), 720));
+    var r = videoRatio();
+    var hImg, wImg, boxH;
+    if (rot % 180 === 0) {
+      // 그대로 보일 때: 영상 높이가 stage 높이
+      hImg = Math.min(cw / r, maxH);
+      wImg = hImg * r;
+      boxH = hImg;
+    } else {
+      // 90°/270°: 회전한 상자의 폭이 영상 높이, 높이가 영상 폭이 된다
+      hImg = Math.min(cw, maxH / r) - 1;
+      wImg = hImg * r;
+      boxH = wImg;
+    }
+    hImg = Math.max(60, Math.floor(hImg));
+    wImg = Math.max(60, Math.floor(wImg));
+    boxH = Math.max(60, Math.floor(boxH));
+    if (full) {
+      stage.style.height = '';
+    } else {
+      stage.style.height = boxH + 'px';
+    }
+    streamImg.style.width = wImg + 'px';
+    streamImg.style.height = hImg + 'px';
+    streamImg.style.transform = 'rotate(' + rot + 'deg)';
+  }
+
+  function setRotation(deg) {
+    rot = ((deg % 360) + 360) % 360;
+    try { localStorage.setItem(ROT_KEY, String(rot)); } catch (e) {}
+    var btn = $('btnRotate');
+    if (btn) btn.textContent = '🔄 회전 ' + rot + '°';
+    layoutVideo();
+  }
+
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(layoutVideo, 120);
+  });
+
+  $('btnRotate').addEventListener('click', function () {
+    setRotation(rot + 90);
+  });
+
+  streamImg.addEventListener('load', function () {
+    lastFrameSeqAt = Date.now();
+    var r = videoRatio();
+    if (!ratioCache || Math.abs(r - ratioCache) / ratioCache > 0.02) {
+      ratioCache = r;
+      layoutVideo();
+    }
+  });
+  streamImg.addEventListener('error', function () {
+    if (streamPaused) return;
+    setTimeout(function () { connectStream(true); }, 1200);
+  });
 
   function post(path, data) {
     return fetch(path, {
@@ -253,6 +393,7 @@ VIEWER_HTML = """<!DOCTYPE html>
         $('quality').textContent = qualityText[s.quality] || s.quality || '-';
         $('camstat').textContent = s.camera === 'front' ? '전면' : (s.camera === 'back' ? '후면' : '-');
         $('flash').textContent = s.flash ? '켜짐' : '꺼짐';
+        flashOn = !!s.flash;
         $('screen').textContent = s.screen_on === false ? '꺼짐' : (s.screen_on ? '켜짐' : '-');
         $('appv').textContent = s.app_version || '-';
         $('tokenHint').textContent = s.camera_token_hint || '-';
@@ -261,11 +402,20 @@ VIEWER_HTML = """<!DOCTYPE html>
         $('btnQHigh').className = s.quality === 'high' ? 'on' : '';
         $('btnFront').className = s.camera === 'front' ? 'on' : '';
         $('btnBack').className = s.camera === 'back' ? 'on' : '';
-        $('btnFlashOn').className = s.flash ? 'on' : '';
-        $('btnFlashOff').className = s.flash ? '' : 'on';
+        $('btnFlash').textContent = s.flash ? '💡 플래시 켜짐' : '🔦 플래시 꺼짐';
+        $('btnFlash').className = s.flash ? 'on' : '';
         $('streamState').textContent = s.streaming_wanted ? '실시간 전송 중' : '대기(전송 안 함)';
 
         var fresh = s.last_frame_sec_ago !== null && s.last_frame_sec_ago <= 8;
+        // 상태는 도는데 이 화면의 프레임만 안 바뀌면 스트림을 다시 붙인다.
+        var seq = (s.frame_seq === undefined || s.frame_seq === null) ? -1 : s.frame_seq;
+        var nowMs = Date.now();
+        if (seq !== lastFrameSeq) {
+          lastFrameSeq = seq;
+          lastFrameSeqAt = nowMs;
+        } else if (s.camera_online && !streamPaused && lastFrameSeqAt && nowMs - lastFrameSeqAt > STALL_LIMIT_MS) {
+          connectStream(false);
+        }
         if (fresh) {
           hint.style.display = 'none';
         } else {
@@ -290,12 +440,61 @@ VIEWER_HTML = """<!DOCTYPE html>
     });
   });
 
+  // 플래시 켜기/끄기는 한 버튼으로: 지금 상태의 반대를 보낸다.
+  var flashOn = false;
+  $('btnFlash').addEventListener('click', function () {
+    var next = !flashOn;
+    flashOn = next;
+    $('btnFlash').textContent = next ? '💡 플래시 켜짐' : '🔦 플래시 꺼짐';
+    $('btnFlash').className = next ? 'on' : '';
+    post('/api/cctv/command', { command: next ? 'flash_on' : 'flash_off' })
+      .then(function () { setTimeout(refresh, 600); })
+      .catch(function (e) { alert(e.message); refresh(); });
+  });
+
+  /** 지금 고른 회전 각도대로 캔버스에서 돌려 JPEG 로 만든다(0° 는 원본 그대로). */
+  function rotateBlob(blob, deg) {
+    if (deg % 360 === 0) return Promise.resolve(blob);
+    return new Promise(function (resolve, reject) {
+      var url = URL.createObjectURL(blob);
+      var img = new Image();
+      img.onload = function () {
+        try {
+          var w = img.naturalWidth || img.width;
+          var h = img.naturalHeight || img.height;
+          var swap = deg % 180 !== 0;
+          var canvas = document.createElement('canvas');
+          canvas.width = swap ? h : w;
+          canvas.height = swap ? w : h;
+          var ctx = canvas.getContext('2d');
+          ctx.translate(canvas.width / 2, canvas.height / 2);
+          ctx.rotate(deg * Math.PI / 180);
+          ctx.drawImage(img, -w / 2, -h / 2, w, h);
+          canvas.toBlob(function (out) {
+            URL.revokeObjectURL(url);
+            if (out) resolve(out); else reject(new Error('이미지를 만들지 못했습니다.'));
+          }, 'image/jpeg', 0.92);
+        } catch (e) {
+          URL.revokeObjectURL(url);
+          reject(e);
+        }
+      };
+      img.onerror = function () {
+        URL.revokeObjectURL(url);
+        reject(new Error('영상을 읽지 못했습니다.'));
+      };
+      img.src = url;
+    });
+  }
+
   $('btnSnap').addEventListener('click', function () {
+    var deg = rot;
     fetch('/api/cctv/frame', { credentials: 'same-origin', cache: 'no-store' })
       .then(function (r) {
         if (!r.ok) throw new Error('아직 저장할 영상이 없습니다.');
         return r.blob();
       })
+      .then(function (blob) { return rotateBlob(blob, deg); })
       .then(function (blob) {
         var d = new Date();
         var p = function (n) { return (n < 10 ? '0' : '') + n; };
@@ -311,16 +510,20 @@ VIEWER_HTML = """<!DOCTYPE html>
       .catch(function (e) { alert(e.message); });
   });
 
-  $('btnFull').addEventListener('click', function () {
+  function toggleFull() {
     document.body.classList.toggle('fullscreen');
-    $('btnFull').textContent = document.body.classList.contains('fullscreen') ? '✕ 닫기' : '⛶ 크게 보기';
+    $('btnFull').textContent = isFullscreen() ? '✕ 닫기' : '⛶ 크게 보기';
+    // 전체 화면으로 바뀐 뒤 화면 크기에 맞춰 다시 배치한다.
+    requestAnimationFrame(function () { layoutVideo(); });
+    setTimeout(layoutVideo, 60);
+  }
+
+  $('btnFull').addEventListener('click', function () {
+    toggleFull();
   });
 
   $('stage').addEventListener('click', function () {
-    if (document.body.classList.contains('fullscreen')) {
-      document.body.classList.remove('fullscreen');
-      $('btnFull').textContent = '⛶ 크게 보기';
-    }
+    if (isFullscreen()) toggleFull();
   });
 
   function setMsg(text, isErr) {
@@ -352,6 +555,8 @@ VIEWER_HTML = """<!DOCTYPE html>
       .catch(function (e) { setMsg(e.message, true); });
   });
 
+  $('btnRotate').textContent = '🔄 회전 ' + rot + '°';
+  layoutVideo();
   refresh();
   setInterval(refresh, 3000);
 })();
