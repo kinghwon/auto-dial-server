@@ -24,6 +24,7 @@ import os
 import secrets
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +59,11 @@ LOG_MAX_CHARS = 4000
 def _now() -> float:
     """현재 시각(초). 테스트에서 monkeypatch 로 바꿔 쓴다."""
     return time.time()
+
+
+def _now_text() -> str:
+    """사람이 읽는 시각(서버 시간대, 기본 Asia/Seoul)."""
+    return datetime.now(config.TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _config_path() -> Path:
@@ -237,7 +243,7 @@ def _append_logs(lines: list, device: str = "", version: str = "", source: str =
                 text = text[:LOG_MAX_CHARS] + " …(잘림)"
             _state.logs.append(
                 {
-                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "at": _now_text(),
                     "at_epoch": round(_now(), 3),
                     "device": str(device or "")[:80],
                     "version": str(version or "")[:32],
