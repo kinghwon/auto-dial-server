@@ -53,7 +53,7 @@ def _password_from_config() -> str:
 
 
 def _camera_headers() -> dict:
-    return {"CCTV_CAMERA_TOKEN": _cfg()["camera_token"]}
+    return {"X-CCTV-Token": _cfg()["camera_token"]}
 
 
 def test_config_file_is_created_with_random_secrets(tmp_path):
@@ -146,9 +146,15 @@ def test_camera_endpoints_need_token(client):
     wrong = client.post(
         "/api/cctv/camera/heartbeat",
         json={"battery": 50},
-        headers={"CCTV_CAMERA_TOKEN": "nope"},
+        headers={"X-CCTV-Token": "nope"},
     )
     assert wrong.status_code == 401
+    legacy = client.post(
+        "/api/cctv/camera/heartbeat",
+        json={"battery": 50},
+        headers={"CCTV_CAMERA_TOKEN": _cfg()["camera_token"]},
+    )
+    assert legacy.status_code == 200
     ok = client.post("/api/cctv/camera/heartbeat", json={"battery": 50}, headers=_camera_headers())
     assert ok.status_code == 200
 
@@ -282,9 +288,9 @@ def test_regenerate_camera_token(client):
     assert response.status_code == 200
     after = response.json()["camera_token"]
     assert after != before
-    old = client.post("/api/cctv/camera/heartbeat", json={}, headers={"CCTV_CAMERA_TOKEN": before})
+    old = client.post("/api/cctv/camera/heartbeat", json={}, headers={"X-CCTV-Token": before})
     assert old.status_code == 401
-    new = client.post("/api/cctv/camera/heartbeat", json={}, headers={"CCTV_CAMERA_TOKEN": after})
+    new = client.post("/api/cctv/camera/heartbeat", json={}, headers={"X-CCTV-Token": after})
     assert new.status_code == 200
 
 

@@ -317,11 +317,17 @@ def _set_cookie(response, request: Request, value: str, max_age: int) -> None:
     )
 
 
-def require_camera(x_cctv_token: Optional[str]) -> None:
-    """카메라 업로드·하트비트 인증(CCTV_CAMERA_TOKEN 헤더)."""
+def require_camera(*tokens: Optional[str]) -> None:
+    """카메라 업로드·하트비트 인증.
+
+    헤더 이름은 `X-CCTV-Token` 을 쓴다. Caddy(Go) 뒤에서는 밑줄이 들어간
+    헤더(`CCTV_CAMERA_TOKEN`)가 전달 과정에서 사라지기 때문에, 예전 이름도
+    함께 받아 준다(직접 8000 포트로 붙을 때 유용).
+    """
     data = load_config()
-    supplied = (x_cctv_token or "").strip()
+    supplied = next((str(t).strip() for t in tokens if t and str(t).strip()), "")
     if not supplied or not hmac.compare_digest(supplied, data["camera_token"]):
+        logger.warning("CCTV 카메라 토큰 불일치(받은 값 길이 %s)", len(supplied))
         raise HTTPException(status_code=401, detail="카메라 토큰이 올바르지 않습니다.")
 
 
@@ -543,10 +549,11 @@ async def cctv_settings(request: Request):
 @router.post("/api/cctv/camera/heartbeat")
 async def cctv_camera_heartbeat(
     request: Request,
-    x_cctv_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
+    x_cctv_token: Optional[str] = Header(default=None, alias="X-CCTV-Token"),
+    legacy_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
 ):
     """폰이 3~5초마다 보내는 상태. streaming_wanted 와 제어 명령을 돌려준다."""
-    require_camera(x_cctv_token)
+    require_camera(x_cctv_token, legacy_token)
     try:
         body = await request.json()
     except ValueError:
@@ -583,10 +590,11 @@ async def cctv_camera_heartbeat(
 @router.post("/api/cctv/camera/frame")
 async def cctv_camera_frame(
     request: Request,
-    x_cctv_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
+    x_cctv_token: Optional[str] = Header(default=None, alias="X-CCTV-Token"),
+    legacy_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
 ):
     """폰이 JPEG 한 장을 올린다(raw image/jpeg 또는 multipart 'file')."""
-    require_camera(x_cctv_token)
+    require_camera(x_cctv_token, legacy_token)
     limit = int(getattr(config, "CCTV_MAX_FRAME_BYTES", 4 * 1024 * 1024) or 4 * 1024 * 1024)
     content_type = (request.headers.get("content-type") or "").lower()
     if "multipart/form-data" in content_type:
@@ -615,10 +623,11 @@ async def cctv_camera_frame(
 
 @router.get("/api/cctv/camera/config")
 def cctv_camera_config(
-    x_cctv_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
+    x_cctv_token: Optional[str] = Header(default=None, alias="X-CCTV-Token"),
+    legacy_token: Optional[str] = Header(default=None, alias="CCTV_CAMERA_TOKEN"),
 ):
     """앱이 처음 켜질 때 확인용(토큰 검사만)."""
-    require_camera(x_cctv_token)
+    require_camera(x_cctv_token, legacy_token)
     return {
         "ok": True,
         "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
